@@ -13,8 +13,8 @@ entry: scope
 
 limits:
   max_steps: 60
-  timeout_seconds: 28800
-  node_timeout_seconds: 7200
+  timeout_seconds: 57600
+  node_timeout_seconds: 10800
   max_result_retries: 2
   max_recovery_attempts: 3
   max_repeat_transitions: 8
