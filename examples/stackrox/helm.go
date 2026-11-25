@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -58,13 +57,17 @@ type valuesOverrides struct {
 // reads: a helm values file can carry secrets (image pull credentials,
 // proxy passwords), so a file that is not a private, caller-owned
 // regular file is refused, not handed to helm — the same refusal the
-// admin password gets. Validating up front fails a bad path before the
-// clusters are touched; only the paths, never the contents, reach argv
-// or the log.
+// admin password gets. Each path must also be one helm loads as
+// exactly that file (see checkHelmValuesPath). Validating up front
+// fails a bad path before the clusters are touched; only the paths,
+// never the contents, reach argv or the log.
 func checkValuesOverrides(central, sensor string) (valuesOverrides, error) {
 	var o valuesOverrides
 	if central != "" {
 		if err := fscheck.CheckPrivateFile(central); err != nil {
+			return o, fmt.Errorf("--central-values: %w", err)
+		}
+		if err := checkHelmValuesPath(central); err != nil {
 			return o, fmt.Errorf("--central-values: %w", err)
 		}
 		o.central = central
@@ -73,37 +76,72 @@ func checkValuesOverrides(central, sensor string) (valuesOverrides, error) {
 		if err := fscheck.CheckPrivateFile(sensor); err != nil {
 			return o, fmt.Errorf("--sensor-values: %w", err)
 		}
+		if err := checkHelmValuesPath(sensor); err != nil {
+			return o, fmt.Errorf("--sensor-values: %w", err)
+		}
 		o.sensor = sensor
 	}
 	return o, nil
 }
 
+// checkHelmValuesPath refuses a values path that helm would not load
+// as exactly the one checked file: helm parses each -f argument as a
+// comma-separated list (verified against helm v4.3.1 — a path "a,b" is
+// loaded as the two files a and b), so a pathname containing a comma
+// makes helm load different, unchecked files or fail on fragments that
+// do not exist. The example checks exactly one private file per
+// values flag; refusing the ambiguous pathname is what keeps that
+// check meaningful all the way into helm.
+func checkHelmValuesPath(path string) error {
+	if strings.Contains(path, ",") {
+		return fmt.Errorf("the path %q contains a comma, which helm's -f treats as a separator between files — "+
+			"move or rename the file (or a directory in its path) so the path carries none", path)
+	}
+	return nil
+}
+
 // upgradeInstall runs `helm upgrade --install` for one release against one
 // cluster's kubeconfig. It is idempotent: re-running the example converges
-// the releases. Output goes to out (the run's stderr) so the evidence log
-// carries helm's own progress; a failure wraps the command error with the
-// tail of that output.
+// the releases.
 //
-// valuesPaths are the -f files in order: helm merges later files over
-// earlier ones, so the generated values file comes first and a
-// user-supplied override (see checkValuesOverrides) wins where the two
-// disagree. Only the paths cross into argv; file contents never reach
-// the command line or the log.
-func (h helmRunner) upgradeInstall(ctx context.Context, out io.Writer, chartDir, kubeconfigPath string, valuesPaths []string, timeout time.Duration) error {
+// generatedValues is the values file the example wrote for this release;
+// overrideValues is the optional user-supplied file (--central-values /
+// --sensor-values) — helm merges the later file over the earlier one, so
+// the override wins where the two disagree. Both are validated before
+// anything runs (the generated files by construction, the override by
+// checkValuesOverrides), and each is passed as its own -f so one flag
+// always means one checked file. Only the paths cross into argv; file
+// contents never reach the command line or the log.
+//
+// helm's own stdout and stderr are discarded, never forwarded: its
+// diagnostics quote values-file content verbatim (a malformed YAML line
+// is echoed back in the error), and the values files carry the admin
+// password and the cluster registration secret. A failure reports the
+// phase, the release, and the exit status, with the full command line —
+// paths only — so the failure is reproducible by hand without the log
+// carrying values content.
+func (h helmRunner) upgradeInstall(ctx context.Context, chartDir, kubeconfigPath, generatedValues, overrideValues string, timeout time.Duration) error {
 	args := []string{
 		"upgrade", "--install", releaseName(chartDir), chartDir,
 		"--namespace", stackroxNamespace, "--create-namespace",
 		"--kubeconfig", kubeconfigPath,
 	}
-	for _, p := range valuesPaths {
+	values := []string{generatedValues}
+	if overrideValues != "" {
+		values = append(values, overrideValues)
+	}
+	for _, p := range values {
+		if err := checkHelmValuesPath(p); err != nil {
+			return err
+		}
 		args = append(args, "-f", p)
 	}
 	args = append(args, "--wait", "--timeout", timeout.String())
+	// Stdout and stderr left unset: exec connects them to /dev/null.
 	cmd := exec.CommandContext(ctx, h.binary, args...)
-	cmd.Stdout = out
-	cmd.Stderr = out
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("helm %s: %w", strings.Join(args, " "), err)
+		return fmt.Errorf("helm %s: %w — helm's own output is suppressed (it can quote the values files, which carry secrets); re-run the command above by hand for its diagnostics",
+			strings.Join(args, " "), err)
 	}
 	return nil
 }

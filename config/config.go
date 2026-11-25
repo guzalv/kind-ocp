@@ -140,9 +140,18 @@ func cloneNode(memo map[*yaml.Node]*yaml.Node, n *yaml.Node) *yaml.Node {
 }
 
 // ClusterNames returns the generated cluster names, <prefix>-1 through
-// <prefix>-N.
+// <prefix>-N. It is the one name generator: create plans with it, and
+// verify's count assertion builds its expected name set with it too
+// (on a Config carrying just the persisted expectation and the prefix),
+// so the assertion can never drift from what create named the clusters.
+// Callers pass a count IsCreatableCount accepted, which bounds the
+// returned set by the cap.
 func (c *Config) ClusterNames() []string {
-	return GeneratedClusterNames(c.Prefix, c.Count)
+	names := make([]string, 0, c.Count)
+	for i := 1; i <= c.Count; i++ {
+		names = append(names, fmt.Sprintf("%s-%d", c.Prefix, i))
+	}
+	return names
 }
 
 // IsCreatableCount reports whether count is one create can set out to
@@ -150,24 +159,12 @@ func (c *Config) ClusterNames() []string {
 // cap). Verify's count assertion classifies a persisted expectation
 // with it, so a value no create could have written is treated as
 // corrupt state — and never handed to name generation, whose sized
-// allocation would follow a corrupt count.
+// allocation would follow a corrupt count. It is exported because the
+// classification must be the same bound create validates with, and the
+// two live in different packages of this module's public surface
+// (config validates, kindocp classifies).
 func IsCreatableCount(count int) bool {
 	return count >= 1 && count <= maxCount
-}
-
-// GeneratedClusterNames returns the cluster names <prefix>-1 through
-// <prefix>-count: the deterministic set create builds and verify's
-// count assertion compares the inventory against. One implementation
-// behind both, so the assertion can never drift from what create named
-// the clusters. Callers pass a count IsCreatableCount accepted (create
-// validates before building; verify classifies corrupt expectations
-// before comparing), which bounds the returned set by the cap.
-func GeneratedClusterNames(prefix string, count int) []string {
-	names := make([]string, 0, count)
-	for i := 1; i <= count; i++ {
-		names = append(names, fmt.Sprintf("%s-%d", prefix, i))
-	}
-	return names
 }
 
 // IsGeneratedClusterName reports whether name is one this prefix generates:

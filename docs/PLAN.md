@@ -168,6 +168,7 @@ UID / builder digest, …). The README documents every default and pin (AC-4.2).
 ```
 ${XDG_STATE_HOME:-$HOME/.local/state}/kind-ocp/<prefix>/
 ├── kind-ocp-state.json            # 0600 — state marker (proves ownership)
+├── expected-clusters              # 0600 — the count the last create set out to build
 ├── cache/<layer>/<pin>/…          # 0600 — layers' fetched-content caches, keyed by content pin (increment 4+)
 ├── clusters/<name>/kubeconfig     # 0600 — cluster-admin credential
 └── clusters/<name>/record.json    # name, context, profile, layers, node image, instance ID, created
@@ -240,15 +241,25 @@ marker (`kind-ocp-state.json`); an existing unmarked directory is adopted
 only when empty, and recursive cleanup (`delete`) only ever removes a
 marked, verified tree — a pre-existing unrelated directory under a custom
 `--state-root` is never deleted, and `delete` checks that before deleting
-any cluster, so a refusal leaves everything in place. The marker also
-carries the expected cluster count (`expectedClusters`): `create`
-persists the number of clusters it is setting out to build, before the
-first cluster is provisioned, and `verify`'s whole-prefix count
-assertion reads exactly that — never a count resolved at verify time
-(§3.3: create-only values are not read outside create). A marker written
-by an older binary carries no such field and verify degrades to a SKIP
-with the remedy, never a false FAIL; rewrites preserve unknown fields,
-so the marker's ignore-don't-interpret rule holds for writers too.
+any cluster, so a refusal leaves everything in place. The marker is
+written once, at root creation, and never rewritten: only its `tool`
+field is interpreted, every other field is ignored whatever shape it
+carries, and nothing kind-ocp writes later can invalidate it. The
+expected cluster count lives in a separate private file beside it
+(`expected-clusters`, the number in decimal): `create` persists the
+number of clusters it is setting out to build, before the first cluster
+is provisioned, replacing the file atomically (written to a private
+temporary file and renamed over the target only after a successful
+write and close), so a failed count write leaves the previous
+expectation and the marker untouched — ownership can never be lost to a
+count update. `verify`'s whole-prefix count assertion reads exactly
+that file — never a count resolved at verify time (§3.3: create-only
+values are not read outside create). A tree written by an older binary
+carries no such file and verify degrades to a SKIP with the remedy,
+never a false FAIL; a present-but-corrupt value (not an integer, or an
+integer no create could have written) is the same SKIP, and it never
+affects the marker's validity or any other check — the count's shape
+and the ownership proof are independent.
 
 Each record carries the cluster's
 **instance ID** (the kube-system namespace UID): create binds it once the
@@ -334,7 +345,8 @@ Before the fan-out, create checks cancellation, then ensures the state root
 once (the discipline `state.walk` prescribes for concurrent creation — and the
 boundary check the host tune runs behind, so a run whose state root is refused
 never changed host settings on its way to failing), records the run's
-cluster count in the state marker (the expectation verify's whole-prefix
+cluster count in the private expectation file beside the state marker
+(the expectation verify's whole-prefix
 count assertion reads — persisted before the first cluster is
 provisioned, so an interrupted create leaves an honest shortfall
 behind), and only then asks the
@@ -375,23 +387,36 @@ FAIL exits non-zero. `verify <name>…` restricts to named clusters.
 
 The whole-prefix form (no names — the audit form) opens with a
 prefix-scoped `cluster-count` line: every cluster the last create set
-out to build, per the expectation create persisted in the state marker,
-must be in the inventory (the union of the provisioner's clusters and
-the state records). This closes the increment-10 finding: a cluster
-whose container and state record both vanished is invisible to `list`
-and to every per-cluster check, and the survivors alone reported
+out to build, per the expectation create persisted beside the state
+marker, must be in the inventory (the union of the provisioner's
+clusters and the state records). This closes the increment-10 finding: a
+cluster whose container and state record both vanished is invisible to
+`list` and to every per-cluster check, and the survivors alone reported
 all-PASS. The assertion reads only the persisted expectation — never a
 verify-time count resolution, so a prefix created with `--count 3`
 verified by a plain `verify` that would resolve count 2 reports the
-create's truth. A state root without an expectation (older binary), a
-marker that cannot be read, or a value no create could have written all
-degrade to a SKIP with reason and remedy — never a false FAIL, never
-blocking the clusters that exist. Corrupt expectations are classified
-against create's own count bound (`config.IsCreatableCount`) before
-any name is generated: a corrupt count can be arbitrarily large, and
-the generated-name set is allocated to match the count, so a huge
-value can neither be reported as dozens of phantom missing clusters
-nor reach the sized allocation. Only a valid expectation with named
+create's truth. It also runs before verify's empty-inventory refusal:
+with every cluster vanished there is nothing for `list` to select, and
+the refusal alone would hide the audit FAIL behind a structural error —
+instead the count line FAILs naming everything missing and the results
+are returned (the CLI exits non-zero on the FAIL); the structural
+error stands only when nothing exists and the assertion could not FAIL
+(a prefix create never wrote an expectation for, or one that cannot be
+asserted). A state root without an expectation (older binary), a
+corrupt count — an integer no create could have written, or a value
+that is not an integer at all (a string, a fraction, an overflow;
+`state.ErrCorruptCount`) — or an unreadable tree all degrade to a
+SKIP with reason and remedy — never a false FAIL, never blocking the
+clusters that exist. The expectation file's shape is deliberately
+independent of the ownership marker: a corrupt count is reported by
+the count line alone, and a marker that does not parse keeps refusing
+the tree (the kubeconfig check FAILs), because ownership and the count
+are validated separately. Corrupt expectations are classified against
+create's own count bound (`config.IsCreatableCount`) before any name
+is generated: a corrupt count can be arbitrarily large, and the
+generated-name set is allocated to match the count, so a huge value
+can neither be reported as dozens of phantom missing clusters nor
+reach the sized allocation. Only a valid expectation with named
 clusters missing from both the provisioner and state FAILs, naming the
 clusters and the recovery (re-run create: present clusters are reused,
 vanished ones are built fresh). Extra prefix-scoped clusters beyond the
@@ -981,41 +1006,63 @@ that pin them, and §3.
   publishing (remote, tags, final module path, clean-machine install
   test) stays with the repository owner.
   Delivered: the count assertion is a prefix-scoped `cluster-count`
-  line the whole-prefix (audit) form runs first. Its expectation is
-  persisted by create in the state marker (`expectedClusters`, written
-  after the state root is ensured and before the first cluster is
-  provisioned, so an interrupted create leaves an honest shortfall) —
-  never a verify-time count resolution, which keeps §3.3's
-  paste-safety property: a prefix created with `--count 3` verified by
-  a plain `verify` that would resolve 2 reports the create's truth.
-  The assertion compares the generated name set against the inventory
-  (the union of provisioner clusters and state records — the exact
-  shape that hid a both-vanished cluster) and FAILs naming the missing
-  clusters and the recovery (re-run create: present clusters are
-  reused, vanished ones are built fresh). Old state (no field), an
-  unreadable marker, or a value no create could have written all
-  degrade to a SKIP with reason and remedy, never a false FAIL and
-  never blocking the clusters that exist — classified against create's
-  own count bound (`config.IsCreatableCount`, the range
-  `ValidateCreate` enforces) before any name is generated, so an
-  arbitrarily large corrupt value can neither be reported as phantom
-  missing clusters nor reach the name generator's sized allocation;
-  extra prefix-scoped clusters beyond the expectation are not a FAIL
+  line the whole-prefix (audit) form runs first — before verify's
+  empty-inventory refusal, so a prefix whose every cluster vanished
+  (no containers, no records) FAILs naming what is missing instead of
+  returning only the structural "no clusters" error (the structural
+  error is preserved for a prefix create never wrote an expectation
+  for, and for one whose expectation cannot be asserted). Its
+  expectation is persisted by create in a private file beside the
+  state marker (`expected-clusters`, written after the state root is
+  ensured and before the first cluster is provisioned, so an
+  interrupted create leaves an honest shortfall) — never a verify-time
+  count resolution, which keeps §3.3's paste-safety property: a prefix
+  created with `--count 3` verified by a plain `verify` that would
+  resolve 2 reports the create's truth. The expectation deliberately
+  does not live in the marker (the review rounds moved it out): the
+  marker is the ownership proof every walk and delete rely on, so the
+  count file is replaced atomically (written to a private temporary
+  file and renamed over the target only after a successful write and
+  close — the live file is never opened for writing, never truncated
+  in place), a failed count write preserves the previous expectation
+  and the marker untouched, and the count's shape can never make the
+  marker unreadable: ownership and the count are validated
+  independently. The assertion compares the generated name set —
+  from `config.Config.ClusterNames`, the same entry point create plans
+  with, on a Config carrying just the prefix and the persisted count —
+  against the inventory (the union of provisioner clusters and state
+  records, the exact shape that hid a both-vanished cluster) and FAILs
+  naming the missing clusters and the recovery (re-run create: present
+  clusters are reused, vanished ones are built fresh). Old state (no
+  expectation file), an unreadable tree, a value no create could have
+  written, or a value that is not an integer at all (a string, a
+  fraction, an overflow — `state.ErrCorruptCount`) all degrade to a
+  SKIP with reason and remedy, never a false FAIL and never blocking
+  the clusters that exist — classified against create's own count
+  bound (`config.IsCreatableCount`, the range `ValidateCreate`
+  enforces) before any name is generated, so an arbitrarily large
+  corrupt value can neither be reported as phantom missing clusters
+  nor reach the name generator's sized allocation; a marker that does
+  not parse keeps refusing the tree (the kubeconfig check FAILs).
+  Extra prefix-scoped clusters beyond the expectation are not a FAIL
   (leftovers from a larger count are supported state and get their own
   lines). The named form runs
   no count assertion — targeted recovery must not fail on a sibling.
-  Marker rewrites preserve unknown fields (the ignore-don't-interpret
-  rule holds for writers), and a foreign or malformed marker is never
-  rewritten. Name generation was unified in
-  `config.GeneratedClusterNames` so the assertion can never drift from
-  what create named the clusters. Unit regressions (Docker-free):
-  vanished-cluster FAIL naming cluster and remedy with the survivor
-  still checked, the drift case (count-3 create, count-2 verify →
-  PASS), old/corrupt-state SKIP table (below 1, above create's cap,
-  and a huge value pinned to return promptly — it must never reach
-  name generation), leftover-beyond-expectation PASS with the
-  leftover's own per-cluster lines, named-form exemption, marker
-  round-trip, unknown-field preservation, foreign-marker refusal.
+  The marker itself is never rewritten after creation, and a foreign or
+  malformed marker is never written into. Unit regressions
+  (Docker-free): vanished-cluster FAIL naming cluster and remedy with
+  the survivor still checked, every-cluster-vanished FAIL with no
+  structural error, the drift case (count-3 create, count-2 verify →
+  PASS), old/corrupt-state SKIP table (below 1, above create's cap, a
+  huge value pinned to return promptly — it must never reach name
+  generation — and the not-an-integer shapes: string, fraction,
+  int-overflow), leftover-beyond-expectation PASS with the
+  leftover's own per-cluster lines, named-form exemption, expectation
+  round-trip, marker-untouched-by-count-write, failed-write
+  preservation (previous expectation and marker intact, tree still
+  removable), atomic replacement (the file's identity changes — never
+  truncated in place), foreign-marker refusal, and the
+  unparseable-marker tree refusal.
   README: a "What is proven" section separates the three proofs (CO
   operator-driven scans, example deployment/registration/health) from
   the unproven Central-driven scan-to-results round trip, and states
@@ -1027,12 +1074,15 @@ that pin them, and §3.
   prerequisites rewritten with the real requirements: Docker client
   and daemon, the buildx CLI plugin for full-profile create, Go 1.27.4+
   (the go.mod minimum), kubectl for the inspection commands, the
-  network endpoints create fetches from (docker.io, the OLM release on
-  github.com, raw.githubusercontent.com at the pinned openshift/api
-  commit), and the macOS pitfalls surfaced from §6.1/§3.4 (the
-  docker.sock symlink and DOCKER_HOST pinning, buildx discoverability
-  together with DOCKER_HOST, CGO_ENABLED=0 failing closed on the ACL
-  checks). A "When something goes wrong" section carries the
+  network endpoints create fetches from (docker.io and quay.io for the
+  pinned images — daemon-cached; the OLM release on github.com
+  redirecting to release-assets.githubusercontent.com and
+  raw.githubusercontent.com at the pinned openshift/api commit —
+  state-root-cached), and the macOS pitfalls surfaced from
+  §6.1/§3.4 (the docker.sock symlink and DOCKER_HOST pinning, buildx
+  discoverability together with DOCKER_HOST, CGO_ENABLED=0 failing
+  closed on the ACL checks). A "When something goes wrong" section
+  carries the
   four-branch recovery decision tree (failed create → re-run, bound
   pending records converge; unbound/replaced → delete and re-create;
   delete is idempotent and retryable; unsafe state refusals name their
@@ -1043,17 +1093,29 @@ that pin them, and §3.
   minimal pair and 89 s three-full from the increment-7 runs; ~17 min
   cold integration suite from increment 8), the per-cluster idle
   budget (~1 GiB RAM, 15–20 % of one CPU per node container, ~1.5 GB
-  volume + ~4 MB layer, node image shared once per daemon), and that
-  N>2 fan-out has no concurrency limit after the first cluster.
+  volume + ~4 MB layer, node image shared once per daemon), the hard
+  count cap (64, enforced by create) distinguished from the missing
+  concurrency limiter after the first cluster (a deliberate scope
+  cut).
   Example: `--central-values` and `--sensor-values` file flags overlay
   user values on the generated ones (one `-f` each, in order, so
   later files win); the files ride the example's privacy rule for
   files it reads (private, caller-owned, regular — a values file can
   carry secrets) and their contents are never logged; the pinned chart
-  fetch and its digest verification are unchanged. The example README
-  documents the worked override (an engineer's own Sensor image via
-  `image.main.fullRef`, the chart's own image override surface,
-  verified against the pinned chart) and a "What this run proves — and
+  fetch and its digest verification are unchanged. Two helm-contract
+  hardenings from the review round: every `-f` path — generated or
+  user-supplied — is refused when it contains a comma (helm parses
+  each `-f` argument as a comma-separated list, verified against helm
+  v4.3.1, so a comma would make it load different, unchecked files),
+  and helm's own stdout/stderr are discarded rather than forwarded
+  (its diagnostics quote values-file content verbatim, and the values
+  files carry the admin password and the registration secret; a failed
+  run reports phase, release, exit status, and the command line —
+  paths only — for reproduction by hand). The example README
+  documents the worked override as a runnable shell block (an
+  engineer's own Sensor image via `image.main.fullRef`, the chart's
+  own image override surface, verified against the pinned chart, with
+  the file created private) and a "What this run proves — and
   what it does not" section matching the root README's honesty.
   Live evidence on the development machine (Docker Desktop 28.1.1):
   cold create 105 s → verify all-PASS including `cluster-count`; the

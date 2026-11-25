@@ -1232,11 +1232,16 @@ func TestVerifyCountAssertionUsesThePersistedExpectationNotTheConfig(t *testing.
 
 // Old and corrupt state degrade to a SKIP, never a false FAIL and never
 // a blocked verify: a state root written by an older binary carries no
-// expectation at all, a marker carrying a value no create could have
-// written is corrupt — below 1 or above create's safety cap, including
-// a huge value whose names would exhaust memory — and so is a marker
-// that does not parse. In every case the clusters that exist are still
-// checked.
+// expectation at all, an expectation carrying a value no create could
+// have written is corrupt — below 1, above create's safety cap
+// (including a huge value whose names would exhaust memory), or not an
+// integer at all (a string, a fraction, an overflow) — and so is a
+// marker that does not parse. In every case the clusters that exist
+// are still checked. The marker that does not parse is the one
+// genuinely invalid ownership marker: it fails the boundary walk
+// behind the kubeconfig check (the tree is refused, never silently
+// skipped over), while every corrupt-expectation shape leaves the
+// tree's ownership intact.
 func TestVerifyCountAssertionDegradesOnOldOrCorruptState(t *testing.T) {
 	// The first count no create could write, derived from the
 	// classifier create validates with, so a cap bump moves this
@@ -1246,49 +1251,65 @@ func TestVerifyCountAssertionDegradesOnOldOrCorruptState(t *testing.T) {
 		firstNonCreatable++
 	}
 	cases := []struct {
-		name          string
-		markerContent string
+		name     string
+		expected string // the sidecar's content; "" writes no sidecar
 		// readyCheck is the check that must have run for p-1: the
-		// first three markers leave a verifiable tree (nodes-ready
-		// runs and passes); a marker that does not parse fails the
-		// boundary walk behind the kubeconfig check — the cluster
-		// is still checked, with that failure, never dropped.
+		// first shapes leave a verifiable tree (nodes-ready runs and
+		// passes); a marker that does not parse fails the boundary
+		// walk behind the kubeconfig check — the cluster is still
+		// checked, with that failure, never dropped.
 		readyCheck string
 		readyWant  CheckStatus
 	}{
 		{
-			name:          "older binary, no field",
-			markerContent: `{"tool":"kind-ocp"}`,
-			readyCheck:    "nodes-ready",
-			readyWant:     StatusPass,
+			name:       "older binary, no expectation",
+			expected:   "",
+			readyCheck: "nodes-ready",
+			readyWant:  StatusPass,
 		},
 		{
-			name:          "count no create could write",
-			markerContent: `{"tool":"kind-ocp","expectedClusters":0}`,
-			readyCheck:    "nodes-ready",
-			readyWant:     StatusPass,
+			name:       "count no create could write",
+			expected:   "0\n",
+			readyCheck: "nodes-ready",
+			readyWant:  StatusPass,
 		},
 		{
-			name:          "count above create's cap",
-			markerContent: fmt.Sprintf(`{"tool":"kind-ocp","expectedClusters":%d}`, firstNonCreatable),
-			readyCheck:    "nodes-ready",
-			readyWant:     StatusPass,
+			name:       "count above create's cap",
+			expected:   fmt.Sprintf("%d\n", firstNonCreatable),
+			readyCheck: "nodes-ready",
+			readyWant:  StatusPass,
 		},
 		{
 			// The corruption the cap classification exists for:
-			// before it, this value reached name generation and
-			// its sized allocation (observed past 3.5 GB of RSS
-			// before a kill) — the row must return promptly.
-			name:          "huge count never reaches name generation",
-			markerContent: `{"tool":"kind-ocp","expectedClusters":999999999}`,
-			readyCheck:    "nodes-ready",
-			readyWant:     StatusPass,
+			// before it, this value reached name generation and its
+			// sized allocation (observed past 3.5 GB of RSS before a
+			// kill) — the row must return promptly.
+			name:       "huge count never reaches name generation",
+			expected:   "999999999\n",
+			readyCheck: "nodes-ready",
+			readyWant:  StatusPass,
 		},
 		{
-			name:          "marker does not parse",
-			markerContent: `not json`,
-			readyCheck:    "kubeconfig",
-			readyWant:     StatusFail,
+			// The shapes the reviewer wrote live: a non-integer
+			// expectation must classify as corrupt state (SKIP with
+			// the remedy) while the tree stays fully usable — the
+			// marker's ownership never depends on the count's shape.
+			name:       "count is a string",
+			expected:   "two\n",
+			readyCheck: "nodes-ready",
+			readyWant:  StatusPass,
+		},
+		{
+			name:       "count is a fraction",
+			expected:   "2.5\n",
+			readyCheck: "nodes-ready",
+			readyWant:  StatusPass,
+		},
+		{
+			name:       "count overflows int",
+			expected:   "99999999999999999999999999999\n",
+			readyCheck: "nodes-ready",
+			readyWant:  StatusPass,
 		},
 	}
 	for _, tc := range cases {
@@ -1303,10 +1324,10 @@ func TestVerifyCountAssertionDegradesOnOldOrCorruptState(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			// The state package's documented marker name.
-			markerPath := filepath.Join(client.StateRoot(), "kind-ocp-state.json")
-			if err := os.WriteFile(markerPath, []byte(tc.markerContent), 0o600); err != nil {
-				t.Fatal(err)
+			if tc.expected != "" {
+				if err := os.WriteFile(filepath.Join(client.StateRoot(), "expected-clusters"), []byte(tc.expected), 0o600); err != nil {
+					t.Fatal(err)
+				}
 			}
 
 			results, err := client.Verify(context.Background(), nil)
@@ -1327,6 +1348,69 @@ func TestVerifyCountAssertionDegradesOnOldOrCorruptState(t *testing.T) {
 					tc.readyCheck, r, tc.readyWant)
 			}
 		})
+	}
+	// A marker that does not parse is refused as ownership-invalid —
+	// the tree fails its walks (kubeconfig FAILs), and the count
+	// assertion SKIPs with the read error instead of a phantom FAIL.
+	t.Run("marker does not parse", func(t *testing.T) {
+		cfg := testConfig(t, 1, "minimal")
+		prov := newFakeProvisioner("p-1")
+		client := newTestClient(t, cfg, layers.NewRegistry(), prov)
+		client.clientset = func(string) (kubernetes.Interface, error) { return readyClientset(), nil }
+		if err := client.store.WriteRecord(state.Record{
+			Name: "p-1", Context: "kind-p-1", Profile: "minimal",
+			Status: state.StatusComplete, InstanceID: testInstanceID,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(client.StateRoot(), "kind-ocp-state.json"), []byte("not json"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		results, err := client.Verify(context.Background(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		count := findResult(results, cfg.Prefix, expectedClustersCheck)
+		if count == nil || count.Status != StatusSkipped {
+			t.Fatalf("cluster-count = %+v, want SKIP with the read error", count)
+		}
+		if r := findResult(results, "p-1", "kubeconfig"); r == nil || r.Status != StatusFail {
+			t.Errorf("p-1 kubeconfig = %+v, want FAIL — an unparseable marker must keep refusing the tree", r)
+		}
+	})
+}
+
+// The empty-inventory case the reviewer found live: with a valid
+// expectation of 2 and every cluster vanished (no containers, no
+// records), verify must return the count FAIL naming what is missing —
+// not the bare "no clusters with prefix" structural error, which is
+// reserved for a prefix create never wrote an expectation for.
+func TestVerifyFailsWhenEveryClusterVanished(t *testing.T) {
+	cfg := testConfig(t, 2, "minimal")
+	prov := newFakeProvisioner()
+	client := newTestClient(t, cfg, layers.NewRegistry(), prov)
+	client.clientset = func(string) (kubernetes.Interface, error) { return readyClientset(), nil }
+	if _, err := client.Create(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	vanishCluster(t, client, prov, "p-1")
+	vanishCluster(t, client, prov, "p-2")
+
+	results, err := client.Verify(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("verify with every cluster vanished = %v, want the count FAIL as the result", err)
+	}
+	count := findResult(results, cfg.Prefix, expectedClustersCheck)
+	if count == nil {
+		t.Fatalf("no cluster-count result in %v", results)
+	}
+	if count.Status != StatusFail {
+		t.Fatalf("cluster-count = %s (%s), want FAIL", count.Status, count.Detail)
+	}
+	for _, want := range []string{"p-1", "p-2", "re-run create"} {
+		if !strings.Contains(count.Detail, want) {
+			t.Errorf("cluster-count detail %q does not name %q", count.Detail, want)
+		}
 	}
 }
 

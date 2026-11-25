@@ -106,12 +106,18 @@ a Sensor off an unmerged branch, say — pass a values file instead of
 editing the repo:
 
 ```sh
-# my-sensor.yaml — point the Sensor at an engineer-built image.
-# The chart composes every component image; `image.main` is the one
-# Sensor, Admission Control, and Compliance run.
+# Create the values file private: it can carry secrets (image pull
+# credentials, proxy passwords), and the example refuses a file other
+# local users could read. umask 077 makes the shell write it 0600.
+umask 077
+cat > my-sensor.yaml <<'EOF'
+# Point the Sensor at an engineer-built image. The chart composes every
+# component image; `image.main` is the one Sensor, Admission Control,
+# and Compliance run.
 image:
   main:
     fullRef: my-registry.example.com/stackrox/main:my-branch
+EOF
 go run ./examples/stackrox --sensor-values my-sensor.yaml
 ```
 
@@ -122,7 +128,11 @@ secret, the shrunk resource requests, the disabled collector) stays.
 flags accept one file each; the file must be a private, caller-owned
 regular file (a values file can carry secrets, so the example refuses a
 symlinked or world-readable one), its contents are never logged, and
-your images must be pullable from every cluster (kind nodes have no
+the path to it — like the example's own generated values paths — must
+not contain a comma: helm treats a comma in a `-f` argument as a
+separator between files, so a comma in the path would make helm load
+different, unchecked files (the example refuses such a path up front).
+Your images must be pullable from every cluster (kind nodes have no
 registry access beyond what the daemon and the network allow).
 
 ## Pins and determinism
@@ -176,6 +186,13 @@ StackRox version and should stay on the same appVersion.
 - The cluster registration secret rides in the Sensor values files,
   written `0600` and passed to helm with `-f` — never through argv,
   which other local users could read.
+- helm's own output is discarded, not forwarded to the run's log: its
+  diagnostics quote values-file content verbatim (a malformed YAML line
+  is echoed back in the error), and those files carry the admin
+  password and the registration secret. A failed helm run reports the
+  phase, the release, the exit status, and the full command line
+  (paths only); re-running that command by hand reproduces helm's
+  diagnostics without the log carrying values content.
 - The example's own API calls to Central authenticate it before any
   credential is sent: the TLS peer must present the certificate the
   chart's CA issued — the CA is read from the `central-tls` secret

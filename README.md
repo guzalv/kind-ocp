@@ -95,10 +95,15 @@ kind network.
 - **`kubectl`** for the inspection commands the quickstart itself shows
   (kind-ocp does not need or use it).
 - **Network access** for the endpoints `create` fetches from on first
-  use (all cached under the state root afterwards): `docker.io` (the
-  pinned kind node image and the scc-admission builder image), the OLM
-  release on `github.com` / `objects.githubusercontent.com`, and
-  `raw.githubusercontent.com` at the pinned `openshift/api` commit.
+  use: `docker.io` and `quay.io` (the pinned kind node image, the
+  scc-admission builder image, and the OLM catalog-registry image —
+  image pulls are cached by the Docker daemon after the first pull),
+  `github.com` for the OLM release (the download redirects to
+  `release-assets.githubusercontent.com`), and
+  `raw.githubusercontent.com` at the pinned `openshift/api` commit
+  (the OLM release manifests and the 18 CRDs are cached under the
+  state root after the first fetch, so those fetches happen once per
+  state root, not once per run).
 - Platforms: linux/amd64 and macOS (Docker Desktop). On macOS the
   Linux-only host tunings degrade to notes, never failures.
 - The Compliance Operator proof additionally needs network access to pull
@@ -340,10 +345,13 @@ into the cluster) plus a **~4 MB** container layer; the pinned node
 image (~1.3 GB) is pulled once and shared by every cluster on the
 daemon, as is the ~15 MB scc-admission image.
 
-`--count` above 2 has **no concurrency limit** after the first cluster:
-clusters 2..N are created simultaneously, so N is bounded by the
-daemon's capacity (CPU, RAM, and the per-cluster budget above), not by
-kind-ocp. Adding a limiter is deliberately out of scope.
+`--count` is **hard-capped at 64**: create refuses a larger count
+up front. Within the cap, clusters 2..N are created concurrently with
+**no concurrency limiter** after the first cluster, so the practical
+bound is the daemon's capacity (CPU, RAM, and the per-cluster budget
+above), not kind-ocp. The two are different statements: the cap is a
+refusal kind-ocp enforces, the missing limiter is a deliberate scope
+cut (adding one is out of scope).
 
 ## Known limitations
 

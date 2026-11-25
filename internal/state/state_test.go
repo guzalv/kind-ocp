@@ -84,9 +84,9 @@ func TestRecordRoundtrip(t *testing.T) {
 }
 
 // The expected-cluster count create persists round-trips through the
-// marker, and a tree that never carried one (an older binary's, or a
-// missing tree) reports its absence instead of an error — verify
-// degrades to a SKIP on that, never a false FAIL.
+// sidecar file beside the marker, and a tree that never carried one
+// (an older binary's, or a missing tree) reports its absence instead
+// of an error — verify degrades to a SKIP on that, never a false FAIL.
 func TestExpectedClustersRoundTrip(t *testing.T) {
 	store := Open(filepath.Join(t.TempDir(), "state"))
 	if _, err := store.EnsureRoot(); err != nil {
@@ -109,11 +109,11 @@ func TestExpectedClustersRoundTrip(t *testing.T) {
 	}
 }
 
-// setMarkerField preserves fields this binary does not know: the
-// marker's compatibility rule (unknown fields are ignored, not
-// interpreted) must hold for writers as well as readers, so a rewrite
-// by an older binary drops nothing a newer one recorded.
-func TestSetExpectedClustersPreservesUnknownMarkerFields(t *testing.T) {
+// The count write never touches the marker: the marker is the
+// ownership proof delete and every walk rely on, so recording an
+// expectation must leave it byte-for-byte as it was (the count lives
+// in its own file), and the sidecar it writes is private.
+func TestSetExpectedClustersDoesNotTouchTheMarker(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "state")
 	store := Open(root)
 	if _, err := store.EnsureRoot(); err != nil {
@@ -123,38 +123,31 @@ func TestSetExpectedClustersPreservesUnknownMarkerFields(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"tool":"kind-ocp","futureField":"keep me"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.SetExpectedClusters(3); err != nil {
-		t.Fatal(err)
-	}
-	b, err := os.ReadFile(path)
+	before, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var doc map[string]any
-	if err := json.Unmarshal(b, &doc); err != nil {
+	if err := store.SetExpectedClusters(3); err != nil {
 		t.Fatal(err)
 	}
-	if doc["futureField"] != "keep me" {
-		t.Errorf("the unknown field did not survive the rewrite: %s", b)
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if doc["expectedClusters"] != float64(3) {
-		t.Errorf("expectedClusters = %v, want 3", doc["expectedClusters"])
+	if string(before) != string(after) {
+		t.Errorf("the marker changed across the count write:\nbefore %s\nafter  %s", before, after)
 	}
-	if doc["tool"] != "kind-ocp" {
-		t.Errorf("tool = %v, want kind-ocp", doc["tool"])
+	if got, found, err := store.ExpectedClusters(); err != nil || !found || got != 3 {
+		t.Fatalf("ExpectedClusters after SetExpectedClusters(3) = (%d, %v, %v), want (3, true, nil)", got, found, err)
 	}
-	// The marker is still 0600 and still validates.
-	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0o600 {
-		t.Errorf("marker mode after rewrite = %v err %v, want 0600", info, err)
-	}
-	if _, found, err := readMarker(root); err != nil || !found {
-		t.Errorf("readMarker after rewrite = (%v, %v), want (true, nil)", found, err)
+	if info, err := os.Stat(filepath.Join(root, expectedName)); err != nil || info.Mode().Perm() != 0o600 {
+		t.Errorf("the expectation file mode = %v err %v, want 0600", info, err)
 	}
 }
 
-// A tree whose marker does not identify kind-ocp is never written into:
-// the walk refuses it before setMarkerField runs, and the marker is
-// left exactly as it was.
+// A tree whose marker does not identify kind-ocp is never written
+// into: the walk refuses it before the count file is touched, and the
+// marker is left exactly as it was.
 func TestSetExpectedClustersRefusesAForeignMarker(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "state")
 	store := Open(root)
@@ -171,6 +164,154 @@ func TestSetExpectedClustersRefusesAForeignMarker(t *testing.T) {
 	}
 	if b, err := os.ReadFile(path); err != nil || string(b) != foreign {
 		t.Errorf("the foreign marker was rewritten: (%q, %v)", b, err)
+	}
+}
+
+// A present-but-unreadable expectation is corrupt state, not an unsafe
+// tree: ExpectedClusters reports it wrapping ErrCorruptCount (verify
+// degrades to a SKIP naming it), while the marker and the rest of the
+// tree still verify — the ownership proof never depends on the count's
+// shape. The old in-marker shape (a string where an older binary wrote
+// its count) is simply an unknown field: ignored, never fatal.
+func TestExpectedClustersClassifiesCorruptCounts(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+	}{
+		{"a string", "two\n"},
+		{"a fractional number", "2.5\n"},
+		{"empty", ""},
+		{"two integers", "2 3\n"},
+		{"a number that overflows int", "99999999999999999999999999999\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "state")
+			store := Open(root)
+			if _, err := store.EnsureRoot(); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(root, expectedName), []byte(tc.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, _, err := store.ExpectedClusters()
+			if err == nil || !errors.Is(err, ErrCorruptCount) {
+				t.Fatalf("ExpectedClusters = %v, want an error wrapping ErrCorruptCount", err)
+			}
+			// The tree is still kind-ocp's: a creating walk (the one
+			// behind verify's kubeconfig check) and a removal (the
+			// one behind delete) both accept it.
+			if _, err := store.KubeconfigPath("c-1"); err != nil {
+				t.Errorf("a corrupt count must not fail the tree's walks: %v", err)
+			}
+			removal, err := store.RemovableRoot()
+			if err != nil {
+				t.Fatalf("a corrupt count must not block removal: %v", err)
+			}
+			if err := removal.Remove(); err != nil {
+				t.Fatalf("removal = %v", err)
+			}
+		})
+	}
+	t.Run("a wrong-typed count field inside the marker is an ignored unknown field", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "state")
+		store := Open(root)
+		if _, err := store.EnsureRoot(); err != nil {
+			t.Fatal(err)
+		}
+		// The shape the reviewer's probe wrote into the marker when
+		// the count lived there: ownership must not depend on it.
+		marker := `{"tool":"kind-ocp","expectedClusters":"two"}`
+		if err := os.WriteFile(filepath.Join(root, markerName), []byte(marker), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, found, err := store.ExpectedClusters(); err != nil || found {
+			t.Fatalf("ExpectedClusters with a foreign count field in the marker = (%v, %v), want (false, nil)", found, err)
+		}
+		if _, err := store.KubeconfigPath("c-1"); err != nil {
+			t.Errorf("an unknown marker field must not fail the tree's walks: %v", err)
+		}
+	})
+}
+
+// A failed count write preserves the tree exactly: the previous
+// expectation stays readable, the marker is untouched, and the tree
+// still verifies as removable — the failure this pins is the one the
+// reviewer forced live, where an in-place truncate left a zero-byte
+// marker and delete refused as unsafe. The update goes through a
+// temporary file and a rename, so the live file is never opened for
+// writing; the forced failure here (a directory parked at the
+// temporary path) fails the update before any rename.
+func TestSetExpectedClustersFailedWritePreservesState(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "state")
+	store := Open(root)
+	if _, err := store.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetExpectedClusters(2); err != nil {
+		t.Fatal(err)
+	}
+	markerPath := filepath.Join(root, markerName)
+	markerBefore, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The forced failure: the temporary file's path is occupied by a
+	// directory, so the preflight refuses it and no write happens.
+	if err := os.Mkdir(filepath.Join(root, expectedName)+".tmp", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetExpectedClusters(3); err == nil {
+		t.Fatal("SetExpectedClusters must fail when its temporary path is occupied")
+	}
+	if got, found, err := store.ExpectedClusters(); err != nil || !found || got != 2 {
+		t.Fatalf("the previous expectation did not survive the failed write: (%d, %v, %v), want (2, true, nil)", got, found, err)
+	}
+	if b, err := os.ReadFile(markerPath); err != nil || string(b) != string(markerBefore) {
+		t.Errorf("the marker changed across the failed write: (%q, %v)", b, err)
+	}
+	// The tree still verifies as kind-ocp's own: delete would run.
+	removal, err := store.RemovableRoot()
+	if err != nil {
+		t.Fatalf("a failed count write must not make the tree unremovable: %v", err)
+	}
+	if err := removal.Remove(); err != nil {
+		t.Fatalf("removal = %v", err)
+	}
+}
+
+// A successful update replaces the expectation file rather than
+// truncating it in place: the file's identity changes (the rename
+// installs the fully written temporary file), no temporary file is
+// left behind, and the content is exactly the new count.
+func TestSetExpectedClustersReplacesTheFileAtomically(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "state")
+	store := Open(root)
+	if _, err := store.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetExpectedClusters(2); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(filepath.Join(root, expectedName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetExpectedClusters(5); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(filepath.Join(root, expectedName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(before, after) {
+		t.Error("the expectation file kept its identity across the update; it was truncated in place, not replaced")
+	}
+	if got, found, err := store.ExpectedClusters(); err != nil || !found || got != 5 {
+		t.Fatalf("ExpectedClusters after SetExpectedClusters(5) = (%d, %v, %v), want (5, true, nil)", got, found, err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, expectedName) + ".tmp"); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the temporary file survived the update: %v", err)
 	}
 }
 
@@ -1784,7 +1925,7 @@ func TestCacheDirFor(t *testing.T) {
 		}
 		// Creating a layer cache is creating state: the root carries the
 		// marker, so a later delete recognizes and removes the tree.
-		if _, _, err := readMarker(root); err != nil {
+		if _, err := readMarker(root); err != nil {
 			t.Errorf("state marker: %v", err)
 		}
 	})

@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"io"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -252,6 +252,27 @@ func TestCheckValuesOverrides(t *testing.T) {
 			t.Errorf("the symlink target changed: (%q, %v)", b, err)
 		}
 	})
+	t.Run("path containing a comma is refused", func(t *testing.T) {
+		dir := t.TempDir()
+		// A directory whose name carries the comma, so the file itself
+		// is a perfectly private regular file and only the path is
+		// ambiguous — exactly the shape helm would split.
+		amb := filepath.Join(dir, "weird,name")
+		if err := os.Mkdir(amb, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(amb, "values.yaml")
+		if err := os.WriteFile(path, []byte("image: {}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := checkValuesOverrides(path, "")
+		if err == nil || !strings.Contains(err.Error(), "comma") {
+			t.Fatalf("checkValuesOverrides = %v, want a comma refusal naming the separator", err)
+		}
+		if !strings.Contains(err.Error(), "--central-values") {
+			t.Fatalf("checkValuesOverrides = %v, want a refusal naming --central-values", err)
+		}
+	})
 }
 
 // helmRunner hands helm one -f per values file, in order: the generated
@@ -274,9 +295,9 @@ func TestUpgradeInstallOrdersValuesFiles(t *testing.T) {
 	generated := filepath.Join(dir, "values-sensor-kind-ocp-2.yaml")
 	override := filepath.Join(dir, "my-sensor.yaml")
 	runner := helmRunner{binary: stub}
-	err := runner.upgradeInstall(context.Background(), io.Discard,
+	err := runner.upgradeInstall(context.Background(),
 		"/work/charts/stackrox-secured-cluster-services", "/state/clusters/kind-ocp-2/kubeconfig",
-		[]string{generated, override}, time.Minute)
+		generated, override, time.Minute)
 	if err != nil {
 		t.Fatalf("upgradeInstall = %v", err)
 	}
@@ -294,6 +315,81 @@ func TestUpgradeInstallOrdersValuesFiles(t *testing.T) {
 	}
 	if !slices.Equal(args, want) {
 		t.Errorf("helm argv = %q, want %q (override after the generated values)", args, want)
+	}
+}
+
+// A values path containing a comma is refused before helm runs: helm
+// parses each -f argument as a comma-separated list (verified against
+// helm v4.3.1), so a single checked pathname like "/tmp/weird,name/x"
+// would make helm load the different, unchecked files "/tmp/weird" and
+// "name/x" — or fail on fragments that do not exist. The guard is what
+// makes the private-file check meaningful inside helm, and the stub
+// never executing is what proves the refusal happened before the
+// handoff, not inside a failed helm run.
+func TestUpgradeInstallRefusesACommaInAValuesPath(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no POSIX sh available")
+	}
+	dir := t.TempDir()
+	argsFile := filepath.Join(dir, "argv")
+	stub := filepath.Join(dir, "helm")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + shellQuote(argsFile) + "\n"
+	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	generated := filepath.Join(dir, "weird,name") + "/values.yaml"
+	runner := helmRunner{binary: stub}
+	err := runner.upgradeInstall(context.Background(),
+		"/work/charts/stackrox-central-services", "/state/clusters/kind-ocp-1/kubeconfig",
+		generated, "", time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "comma") {
+		t.Fatalf("upgradeInstall = %v, want a comma refusal", err)
+	}
+	if _, statErr := os.Lstat(argsFile); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("helm ran despite the refusal (argv file: %v)", statErr)
+	}
+}
+
+// helm's own output is never surfaced: its diagnostics quote
+// values-file content verbatim (a malformed YAML line is echoed back in
+// the error), and the values files carry the admin password and the
+// cluster registration secret. The stub prints a marker that stands for
+// that content on both streams and fails; the returned error must
+// carry the command and the exit, never the marker.
+func TestUpgradeInstallDoesNotSurfaceHelmOutput(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no POSIX sh available")
+	}
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "helm")
+	script := "#!/bin/sh\n" +
+		"echo 'leaked: s3cret-admin-password' \n" +
+		"echo 'leaked: s3cret-admin-password' >&2 \n" +
+		"exit 3\n"
+	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	generated := filepath.Join(dir, "values-central.yaml")
+	if err := os.WriteFile(generated, []byte("central: {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := helmRunner{binary: stub}
+	err := runner.upgradeInstall(context.Background(),
+		"/work/charts/stackrox-central-services", "/state/clusters/kind-ocp-1/kubeconfig",
+		generated, "", time.Minute)
+	if err == nil {
+		t.Fatal("a failing helm must fail the install")
+	}
+	if strings.Contains(err.Error(), "s3cret-admin-password") {
+		t.Fatalf("the failure surfaced helm's output: %v", err)
+	}
+	if !strings.Contains(err.Error(), "exit status 3") {
+		t.Errorf("the failure does not report the exit status: %v", err)
+	}
+	if !strings.Contains(err.Error(), "upgrade --install") {
+		t.Errorf("the failure does not report the phase and command line: %v", err)
 	}
 }
 

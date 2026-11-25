@@ -150,11 +150,7 @@ func deploy(ctx context.Context, cfg *config.Config, log *slog.Logger, overrides
 	if err != nil {
 		return err
 	}
-	centralValues := []string{valuesPath}
-	if overrides.central != "" {
-		centralValues = append(centralValues, overrides.central)
-	}
-	if err := helm.upgradeInstall(ctx, os.Stderr, centralChart.dir, centralKubeconfig, centralValues, helmTimeout); err != nil {
+	if err := helm.upgradeInstall(ctx, centralChart.dir, centralKubeconfig, valuesPath, overrides.central, helmTimeout); err != nil {
 		return fmt.Errorf("deploying Central on %s: %w", centralCluster, err)
 	}
 	log.Info("Central deployed", "cluster", centralCluster)
@@ -220,11 +216,7 @@ func deploy(ctx context.Context, cfg *config.Config, log *slog.Logger, overrides
 		if err != nil {
 			return err
 		}
-		sensorValues := []string{valuesPath}
-		if overrides.sensor != "" {
-			sensorValues = append(sensorValues, overrides.sensor)
-		}
-		if err := helm.upgradeInstall(ctx, os.Stderr, securedChart.dir, kubeconfigs[name], sensorValues, helmTimeout); err != nil {
+		if err := helm.upgradeInstall(ctx, securedChart.dir, kubeconfigs[name], valuesPath, overrides.sensor, helmTimeout); err != nil {
 			return fmt.Errorf("deploying Sensor on %s: %w", name, err)
 		}
 		log.Info("Sensor deployed", "cluster", name)
