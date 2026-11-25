@@ -53,6 +53,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -293,16 +294,20 @@ func (s *Store) EnsureRoot() (string, error) {
 // The expectation deliberately does not live in the marker: the marker
 // is the ownership proof delete and every walk rely on, and a failed
 // count write must never be able to invalidate it. The sidecar is
-// instead replaced atomically — written to a private temporary file in
-// the same directory and renamed over the target only after a
-// successful write and close — so a failed update leaves the previous
-// expectation (and the marker, which is not touched at all) exactly as
-// they were; the live file is never opened for writing, never
-// truncated in place. The boundary checks run before the temporary
-// file is created: a symlink or shared file parked at either path is a
-// refusal, not something the write follows or rewrites through. A
-// marker that does not validate is an error too — the walk refuses the
-// tree before this function writes anything.
+// instead replaced atomically — written to a private temporary file
+// os.CreateTemp stages in the same directory and renamed over the
+// target only after a successful write and close — so a failed update
+// leaves the previous expectation (and the marker, which is not
+// touched at all) exactly as they were; the live file is never opened
+// for writing, never truncated in place. The staging name is unique
+// per writer and the file is created exclusively (0600), so nothing
+// can be parked at it and overlapping updates cannot open, truncate,
+// or rename each other's staging file: whatever reaches the target is
+// always one writer's complete write. The target itself is preflighted
+// (CheckWriteTarget) before anything is staged: a symlink or shared
+// file parked there is a refusal, not something the rename replaces
+// sight unseen. A marker that does not validate is an error too — the
+// walk refuses the tree before this function writes anything.
 func (s *Store) SetExpectedClusters(count int) error {
 	root, err := s.walk(nil, true)
 	if err != nil {
@@ -312,41 +317,41 @@ func (s *Store) SetExpectedClusters(count int) error {
 	if err := fscheck.CheckWriteTarget(path); err != nil {
 		return fmt.Errorf("recording the expected cluster count: %w", err)
 	}
-	tmp := path + ".tmp"
-	if err := fscheck.CheckWriteTarget(tmp); err != nil {
-		return fmt.Errorf("recording the expected cluster count: %w", err)
-	}
 	b := []byte(strconv.Itoa(count) + "\n")
-	if err := writeFileAtomic(tmp, path, b); err != nil {
+	if err := writeFileAtomic(root, path, b); err != nil {
 		return fmt.Errorf("recording the expected cluster count: %w", err)
 	}
 	return nil
 }
 
-// writeFileAtomic replaces path with b through tmp, a private file in
-// the same directory the caller already verified: b is written and
-// closed there first, and only a fully written temporary file is
-// renamed over the target. Any failure leaves the target untouched and
-// removes the temporary file; the target is never opened for writing,
-// so a failure partway through cannot truncate it to nothing.
-func writeFileAtomic(tmp, path string, b []byte) (retErr error) {
-	defer func() {
-		if retErr != nil {
-			_ = os.Remove(tmp)
-		}
-	}()
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+// writeFileAtomic replaces path with b, staged through a private
+// temporary file os.CreateTemp makes in dir — path's own directory, so
+// the rename never crosses a filesystem. The staging name is unique
+// per writer and created exclusively, so concurrent writers stage in
+// distinct files and cannot truncate or rename each other's work; b is
+// written and closed there first, and only a fully written temporary
+// file is renamed over the target. Any failure leaves the target
+// untouched and removes only that writer's temporary file; the target
+// is never opened for writing, so a failure partway through cannot
+// truncate it to nothing.
+func writeFileAtomic(dir, path string, b []byte) (retErr error) {
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write(b); err != nil {
-		_ = f.Close()
+	defer func() {
+		if retErr != nil {
+			_ = os.Remove(tmp.Name())
+		}
+	}()
+	if _, err := tmp.Write(b); err != nil {
+		_ = tmp.Close()
 		return err
 	}
-	if err := f.Close(); err != nil {
+	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	return os.Rename(tmp.Name(), path)
 }
 
 // ExpectedClusters returns the number of clusters the last create set
@@ -360,9 +365,11 @@ func writeFileAtomic(tmp, path string, b []byte) (retErr error) {
 // FAIL. A value that is present but not an integer (a string, a
 // fraction, an overflow) wraps ErrCorruptCount: the same corruption
 // class as an integer outside any range create validates, and like it
-// the caller's to classify (see config.IsCreatableCount). A tree or
-// file that fails the boundary checks is a plain error, reported as
-// itself.
+// the caller's to classify (see config.IsCreatableCount). A file
+// longer than any count create writes is the same class — the read is
+// bounded, so a corrupt file's length never becomes this process's
+// allocation. A tree or file that fails the boundary checks is a plain
+// error, reported as itself.
 func (s *Store) ExpectedClusters() (count int, found bool, err error) {
 	root, err := s.walk(nil, false)
 	if err != nil {
@@ -386,34 +393,66 @@ func (s *Store) ExpectedClusters() (count int, found bool, err error) {
 		}
 		return 0, false, err
 	}
-	b, err := os.ReadFile(path)
+	b, err := readExpectedFile(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return 0, false, nil
+		}
+		if errors.Is(err, errOversizedExpectation) {
+			return 0, false, fmt.Errorf("%w in %s: %v", ErrCorruptCount, path, err)
 		}
 		return 0, false, err
 	}
 	count, err = strconv.Atoi(strings.TrimSpace(string(b)))
 	if err != nil {
 		return 0, false, fmt.Errorf("%w in %s: the file holds %s, not an integer create could have written",
-			ErrCorruptCount, path, countPreview(b))
+			ErrCorruptCount, path, holdPreview(b))
 	}
 	return count, true, nil
 }
 
-// countPreview renders a bounded preview of the expectation file's
-// bytes for an error message: corrupt content can be arbitrarily
-// large, and the message must not carry it wholesale.
-func countPreview(b []byte) string {
-	const limit = 32
-	s := strings.TrimSpace(string(b))
-	if len(s) > limit {
-		s = s[:limit] + "..."
+// holdPreview names what a corrupt expectation file holds, for its
+// error message. The read that produced b is bounded
+// (maxExpectedBytes), so the preview is bounded with it.
+func holdPreview(b []byte) string {
+	if s := strings.TrimSpace(string(b)); s != "" {
+		return strconv.Quote(s)
 	}
-	if s == "" {
-		return "nothing"
+	return "nothing"
+}
+
+// maxExpectedBytes bounds how much of the expectation file is read: a
+// count create writes is at most three bytes ("64\n"), so anything
+// longer cannot be one, and the file's length is on-disk state this
+// run did not write — no read allocates for more of it than a count
+// could occupy.
+const maxExpectedBytes = 32
+
+// errOversizedExpectation marks an expectation file longer than any
+// count create writes: the bounded read stopped at the limit instead
+// of the file's remaining bytes. It classifies as corrupt state (see
+// ErrCorruptCount), never as an unsafe tree.
+var errOversizedExpectation = errors.New("the file is longer than any count create writes")
+
+// readExpectedFile reads the expectation file after the boundary
+// check, bounded by maxExpectedBytes: one byte past the bound
+// distinguishes "at the bound" from "over it" without a stat call — a
+// size read before the open is a bound the file can change after, and
+// the read is the honest one.
+func readExpectedFile(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
 	}
-	return strconv.Quote(s)
+	defer func() { _ = f.Close() }()
+	b, err := io.ReadAll(io.LimitReader(f, maxExpectedBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > maxExpectedBytes {
+		return nil, errOversizedExpectation
+	}
+	return b, nil
 }
 
 // ensureClusterDir creates the cluster's state directory (0700, parents

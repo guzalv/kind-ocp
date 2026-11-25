@@ -7,7 +7,11 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
+	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -189,6 +193,7 @@ func TestExpectedClustersClassifiesCorruptCounts(t *testing.T) {
 		{"empty", ""},
 		{"two integers", "2 3\n"},
 		{"a number that overflows int", "99999999999999999999999999999\n"},
+		{"a file longer than any count create writes", strings.Repeat("9", 100) + "\n"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -246,8 +251,9 @@ func TestExpectedClustersClassifiesCorruptCounts(t *testing.T) {
 // reviewer forced live, where an in-place truncate left a zero-byte
 // marker and delete refused as unsafe. The update goes through a
 // temporary file and a rename, so the live file is never opened for
-// writing; the forced failure here (a directory parked at the
-// temporary path) fails the update before any rename.
+// writing; the forced failure here (a read-only state root — the
+// staging file cannot be created, the exact step before any write)
+// fails the update before the target is touched.
 func TestSetExpectedClustersFailedWritePreservesState(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "state")
 	store := Open(root)
@@ -262,13 +268,16 @@ func TestSetExpectedClustersFailedWritePreservesState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The forced failure: the temporary file's path is occupied by a
-	// directory, so the preflight refuses it and no write happens.
-	if err := os.Mkdir(filepath.Join(root, expectedName)+".tmp", 0o700); err != nil {
+	// The forced failure: the staging file cannot be created in a
+	// directory the owner cannot write. The walk still accepts the
+	// root (0500 carries no group or other bits), so the failure is
+	// the write's own, at the first write step.
+	if err := os.Chmod(root, 0o500); err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = os.Chmod(root, 0o700) }()
 	if err := store.SetExpectedClusters(3); err == nil {
-		t.Fatal("SetExpectedClusters must fail when its temporary path is occupied")
+		t.Fatal("SetExpectedClusters must fail when its staging file cannot be created")
 	}
 	if got, found, err := store.ExpectedClusters(); err != nil || !found || got != 2 {
 		t.Fatalf("the previous expectation did not survive the failed write: (%d, %v, %v), want (2, true, nil)", got, found, err)
@@ -276,7 +285,11 @@ func TestSetExpectedClustersFailedWritePreservesState(t *testing.T) {
 	if b, err := os.ReadFile(markerPath); err != nil || string(b) != string(markerBefore) {
 		t.Errorf("the marker changed across the failed write: (%q, %v)", b, err)
 	}
-	// The tree still verifies as kind-ocp's own: delete would run.
+	// Restore writability, then the tree must still verify as
+	// kind-ocp's own: delete would run.
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	removal, err := store.RemovableRoot()
 	if err != nil {
 		t.Fatalf("a failed count write must not make the tree unremovable: %v", err)
@@ -288,8 +301,9 @@ func TestSetExpectedClustersFailedWritePreservesState(t *testing.T) {
 
 // A successful update replaces the expectation file rather than
 // truncating it in place: the file's identity changes (the rename
-// installs the fully written temporary file), no temporary file is
-// left behind, and the content is exactly the new count.
+// installs the fully written temporary file), the root is left
+// holding exactly the state it should (no staging file survives), and
+// the content is exactly the new count.
 func TestSetExpectedClustersReplacesTheFileAtomically(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "state")
 	store := Open(root)
@@ -316,10 +330,123 @@ func TestSetExpectedClustersReplacesTheFileAtomically(t *testing.T) {
 	if got, found, err := store.ExpectedClusters(); err != nil || !found || got != 5 {
 		t.Fatalf("ExpectedClusters after SetExpectedClusters(5) = (%d, %v, %v), want (5, true, nil)", got, found, err)
 	}
-	if _, err := os.Lstat(filepath.Join(root, expectedName) + ".tmp"); !errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("the temporary file survived the update: %v", err)
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	sort.Strings(names)
+	want := []string{expectedName, markerName}
+	if !slices.Equal(names, want) {
+		t.Errorf("the root holds %q after the update, want exactly %q (no staging file left behind)", names, want)
 	}
 }
+
+// Overlapping updates publish one writer's complete write: each writer
+// stages in its own exclusively created file, so no writer can open,
+// truncate, or rename another's staging file — the published file is
+// always exactly one written count, a concurrent reader never observes
+// a torn value, and no staging file is left behind. The staging name
+// is unique per writer, which is what makes this hold; a shared
+// staging name open with O_TRUNC interleaves writers' bytes and makes
+// the loser's rename fail (observed live by the review).
+func TestSetExpectedClustersConcurrentUpdates(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "state")
+	store := Open(root)
+	if _, err := store.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	const seed = 2
+	if err := store.SetExpectedClusters(seed); err != nil {
+		t.Fatal(err)
+	}
+	const writers = 32
+	written := make(map[int]bool, writers+1)
+	written[seed] = true
+	for i := 1; i <= writers; i++ {
+		written[i] = true
+	}
+
+	// A reader running against the concurrent writers: every value it
+	// observes is the seed or some writer's complete write — never a
+	// torn interleave of two.
+	readStop := make(chan struct{})
+	readErrs := make(chan error, 1)
+	go func() {
+		for {
+			select {
+			case <-readStop:
+				readErrs <- nil
+				return
+			default:
+			}
+			got, found, err := store.ExpectedClusters()
+			if err != nil {
+				readErrs <- fmt.Errorf("a concurrent reader failed: %w", err)
+				return
+			}
+			if found && !written[got] {
+				readErrs <- fmt.Errorf("a concurrent reader observed %d, which no writer wrote", got)
+				return
+			}
+		}
+	}()
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	writeErrs := make(chan error, writers)
+	for i := 1; i <= writers; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			<-start
+			if err := store.SetExpectedClusters(n); err != nil {
+				writeErrs <- err
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(readStop)
+	if err := <-readErrs; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-writeErrs:
+		t.Fatalf("a concurrent writer failed: %v", err)
+	default:
+	}
+
+	// The published result is one writer's complete write, not an
+	// interleave: exactly one integer and one trailing newline.
+	b, err := os.ReadFile(filepath.Join(root, expectedName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !singleCountPattern.Match(b) {
+		t.Errorf("the published expectation is not one complete write: %q", b)
+	}
+	got, found, err := store.ExpectedClusters()
+	if err != nil || !found || !written[got] {
+		t.Fatalf("ExpectedClusters after the concurrent updates = (%d, %v, %v), want one of the written counts", got, found, err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() != markerName && e.Name() != expectedName {
+			t.Errorf("a staging file survived the concurrent updates: %s", e.Name())
+		}
+	}
+}
+
+// singleCountPattern matches exactly one decimal integer and one
+// trailing newline — the complete shape one writer publishes.
+var singleCountPattern = regexp.MustCompile(`^\d+\n$`)
 
 func TestRecordsSortedAndEmpty(t *testing.T) {
 	t.Run("empty store", func(t *testing.T) {

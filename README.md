@@ -21,8 +21,8 @@ without the install.
 
 ## What is proven
 
-Three proofs exist, and each covers a different slice of "deploy and
-work properly":
+Two proofs exist, and each covers a different slice of "deploy and
+work properly"; the round trip between them is proven by neither:
 
 - The **Compliance Operator proof** (integration test) installs a real
   Compliance Operator through OLM on every cluster and drives
@@ -54,6 +54,7 @@ reject pods; the shim cannot.
 # Prerequisites below), Go 1.27.4+, kubectl for inspection.
 # Until the module is published (owner's call), build from a checkout:
 go install ./cmd/kind-ocp
+export PATH="$PATH:$(go env GOPATH)/bin" # go install puts the binary here
 
 kind-ocp create                  # 2 clusters: kind-ocp-1, kind-ocp-2, profile full
 kind-ocp verify                  # per-check PASS/FAIL/SKIP across all clusters
@@ -94,20 +95,33 @@ kind network.
   toolchain, and an older one is refused.
 - **`kubectl`** for the inspection commands the quickstart itself shows
   (kind-ocp does not need or use it).
-- **Network access** for the endpoints `create` fetches from on first
-  use: `docker.io` and `quay.io` (the pinned kind node image, the
-  scc-admission builder image, and the OLM catalog-registry image —
-  image pulls are cached by the Docker daemon after the first pull),
-  `github.com` for the OLM release (the download redirects to
-  `release-assets.githubusercontent.com`), and
-  `raw.githubusercontent.com` at the pinned `openshift/api` commit
-  (the OLM release manifests and the 18 CRDs are cached under the
-  state root after the first fetch, so those fetches happen once per
-  state root, not once per run).
+- **Network access** for the endpoints `create` fetches from. What
+  each endpoint actually serves, and what caches what:
+  - `docker.io` — the pinned kind node image and the scc-admission
+    builder image. Both are pulled through the Docker daemon, which
+    caches them after the first pull.
+  - `quay.io` — the OLM operator image the release's three deployments
+    run (one digest-pinned `quay.io/operator-framework/olm`
+    reference). It is pulled by the kubelet into each cluster node's
+    own containerd, not into the host Docker cache. The release's
+    floating community-catalog image is dropped by the olm layer, and
+    the pinned configmap-registry reference is never pulled at all —
+    nothing kind-ocp runs creates a ConfigMap-based CatalogSource.
+  - `github.com` — the OLM release manifests, on **every** full-profile
+    create (the download redirects to
+    `release-assets.githubusercontent.com`). They are fetched and
+    digest-verified per apply; they are not cached under the state
+    root.
+  - `raw.githubusercontent.com` at the pinned `openshift/api` commit —
+    the 18 OpenShift API CRDs, the one manifest set that is cached
+    under the state root: fetched once per state root, not once per
+    run.
+  - The Compliance Operator proof (an integration test) additionally
+    pulls its pinned images into the nodes' containerd the same way:
+    the operator, content, and scanner images from `quay.io`, and the
+    catalog server from `ghcr.io`.
 - Platforms: linux/amd64 and macOS (Docker Desktop). On macOS the
   Linux-only host tunings degrade to notes, never failures.
-- The Compliance Operator proof additionally needs network access to pull
-  the pinned operator images.
 - **macOS pitfalls** (environment constraints, not kind-ocp defects):
   - `/var/run/docker.sock` is a symlink to the Docker Desktop daemon's
     socket, and that symlink's target has been observed to change (it

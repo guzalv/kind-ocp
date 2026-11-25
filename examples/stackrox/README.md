@@ -125,13 +125,21 @@ helm merges the later file over the example's generated values, so only
 the keys you set change; everything the recipe pins (the registration
 secret, the shrunk resource requests, the disabled collector) stays.
 `--central-values` works the same way for the Central release. Both
-flags accept one file each; the file must be a private, caller-owned
-regular file (a values file can carry secrets, so the example refuses a
-symlinked or world-readable one), its contents are never logged, and
-the path to it — like the example's own generated values paths — must
-not contain a comma: helm treats a comma in a `-f` argument as a
-separator between files, so a comma in the path would make helm load
-different, unchecked files (the example refuses such a path up front).
+flags accept one file each, validated before the clusters are touched:
+the file must be a private, caller-owned regular file (a values file
+can carry secrets, so the example refuses a symlinked or
+world-readable one), and the directory holding it must pass the same
+ancestor policy the example's workspace does — a values file reached
+through a directory other local users can write is refused, because
+the entry could be swapped between the check and the moment helm
+opens it. The path is resolved to its absolute form before helm sees
+it (a relative path — or a file named `-`, which helm reads as stdin —
+would make helm open whatever its own resolution picks), and the
+resolved path must not contain a comma, a double quote, a newline, or
+a carriage return: helm parses each `-f` operand as a CSV record, so
+such a path would make it load a different, unchecked file (the
+example refuses those paths up front). Nothing in the file is ever
+logged.
 Your images must be pullable from every cluster (kind nodes have no
 registry access beyond what the daemon and the network allow).
 
@@ -190,9 +198,12 @@ StackRox version and should stay on the same appVersion.
   diagnostics quote values-file content verbatim (a malformed YAML line
   is echoed back in the error), and those files carry the admin
   password and the registration secret. A failed helm run reports the
-  phase, the release, the exit status, and the full command line
-  (paths only); re-running that command by hand reproduces helm's
-  diagnostics without the log carrying values content.
+  exit status and the full command line, shell-quoted — every argument
+  and the helm binary itself — so copying it into a shell reproduces
+  the run even across paths containing spaces or shell
+  metacharacters. Re-running it by hand prints helm's diagnostics,
+  which can quote values content, to your terminal only — never to the
+  run's log.
 - The example's own API calls to Central authenticate it before any
   credential is sent: the TLS peer must present the certificate the
   chart's CA issued — the CA is read from the `central-tls` secret

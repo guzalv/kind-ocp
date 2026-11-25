@@ -7,10 +7,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/stackrox/kind-ocp/internal/fscheck"
 	"gopkg.in/yaml.v3"
 )
 
@@ -203,7 +205,7 @@ func TestCheckValuesOverrides(t *testing.T) {
 			t.Fatalf("checkValuesOverrides() = (%+v, %v), want empty overrides and no error", o, err)
 		}
 	})
-	t.Run("private files pass", func(t *testing.T) {
+	t.Run("private files pass and come back as their resolved absolute paths", func(t *testing.T) {
 		dir := t.TempDir()
 		central := filepath.Join(dir, "central.yaml")
 		sensor := filepath.Join(dir, "sensor.yaml")
@@ -216,8 +218,54 @@ func TestCheckValuesOverrides(t *testing.T) {
 		if err != nil {
 			t.Fatalf("checkValuesOverrides = %v, want acceptance", err)
 		}
-		if o.central != central || o.sensor != sensor {
-			t.Errorf("overrides = %+v, want the given paths", o)
+		resolved, err := fscheck.ResolveDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if o.central != filepath.Join(resolved, "central.yaml") || o.sensor != filepath.Join(resolved, "sensor.yaml") {
+			t.Errorf("overrides = %+v, want the resolved paths under %s", o, resolved)
+		}
+	})
+	t.Run("a relative path — including a file named -, which helm reads as stdin — resolves to its absolute checked path", func(t *testing.T) {
+		dir := t.TempDir()
+		t.Chdir(dir)
+		dash := filepath.Join(dir, "-")
+		if err := os.WriteFile(dash, []byte("image: {}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		o, err := checkValuesOverrides("-", "")
+		if err != nil {
+			t.Fatalf("checkValuesOverrides(\"-\") = %v, want the dash file resolved, not refused or passed through", err)
+		}
+		resolved, err := fscheck.ResolveDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := filepath.Join(resolved, "-")
+		if o.central != want {
+			t.Errorf("override = %q, want the resolved absolute path %q (a bare \"-\" would make helm read stdin)", o.central, want)
+		}
+	})
+	t.Run("a values file reached through a writable ancestor is refused", func(t *testing.T) {
+		dir := t.TempDir()
+		writable := filepath.Join(dir, "writable")
+		if err := os.Mkdir(writable, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(writable, "values.yaml")
+		if err := os.WriteFile(path, []byte("image: {}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// The leaf stays private; only the parent becomes permissive —
+		// whoever can write the parent can swap the entry between the
+		// check and the moment helm opens it.
+		if err := os.Chmod(writable, 0o0777); err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = os.Chmod(writable, 0o700) }()
+		_, err := checkValuesOverrides(path, "")
+		if err == nil || !strings.Contains(err.Error(), "writable") {
+			t.Fatalf("checkValuesOverrides through a writable ancestor = %v, want a refusal naming the writable directory", err)
 		}
 	})
 	t.Run("missing file is refused", func(t *testing.T) {
@@ -273,6 +321,38 @@ func TestCheckValuesOverrides(t *testing.T) {
 			t.Fatalf("checkValuesOverrides = %v, want a refusal naming --central-values", err)
 		}
 	})
+	t.Run("paths containing a quote a newline or a carriage return are refused", func(t *testing.T) {
+		dir := t.TempDir()
+		for _, tc := range []struct {
+			name string
+			leaf string
+			bad  rune
+		}{
+			// helm v4.3.1 parses each -f operand as a CSV record: a
+			// double quote breaks the field parsing, and a newline or
+			// carriage return ends the record early (verified live:
+			// the quote fails with "bare \" in non-quoted-field", the
+			// newline leaves helm reading only the first line, the
+			// carriage return fails URL parsing).
+			{"quote", `qu"ote.yaml`, '"'},
+			{"newline", "ba\nd.yaml", '\n'},
+			{"carriage return", "cr\rd.yaml", '\r'},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				path := filepath.Join(dir, tc.leaf)
+				if err := os.WriteFile(path, []byte("image: {}\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				_, err := checkValuesOverrides("", path)
+				if err == nil || !strings.Contains(err.Error(), strconv.QuoteRune(tc.bad)) {
+					t.Fatalf("checkValuesOverrides(%q) = %v, want a refusal naming %q", tc.leaf, err, tc.bad)
+				}
+				if !strings.Contains(err.Error(), "--sensor-values") {
+					t.Fatalf("checkValuesOverrides = %v, want a refusal naming --sensor-values", err)
+				}
+			})
+		}
+	})
 }
 
 // helmRunner hands helm one -f per values file, in order: the generated
@@ -294,10 +374,23 @@ func TestUpgradeInstallOrdersValuesFiles(t *testing.T) {
 
 	generated := filepath.Join(dir, "values-sensor-kind-ocp-2.yaml")
 	override := filepath.Join(dir, "my-sensor.yaml")
+	if err := os.WriteFile(override, []byte("image: {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The override goes through the flag validation first: what the
+	// runner receives — and what argv must carry — is the resolved
+	// absolute path, never the raw spelling the user typed.
+	overrides, err := checkValuesOverrides("", override)
+	if err != nil {
+		t.Fatalf("checkValuesOverrides = %v", err)
+	}
+	if !filepath.IsAbs(overrides.sensor) || filepath.Base(overrides.sensor) != "my-sensor.yaml" {
+		t.Fatalf("the override was not resolved to its absolute checked path: %q", overrides.sensor)
+	}
 	runner := helmRunner{binary: stub}
-	err := runner.upgradeInstall(context.Background(),
+	err = runner.upgradeInstall(context.Background(),
 		"/work/charts/stackrox-secured-cluster-services", "/state/clusters/kind-ocp-2/kubeconfig",
-		generated, override, time.Minute)
+		generated, overrides.sensor, time.Minute)
 	if err != nil {
 		t.Fatalf("upgradeInstall = %v", err)
 	}
@@ -310,7 +403,7 @@ func TestUpgradeInstallOrdersValuesFiles(t *testing.T) {
 		"upgrade", "--install", "stackrox-secured-cluster-services", "/work/charts/stackrox-secured-cluster-services",
 		"--namespace", "stackrox", "--create-namespace",
 		"--kubeconfig", "/state/clusters/kind-ocp-2/kubeconfig",
-		"-f", generated, "-f", override,
+		"-f", generated, "-f", overrides.sensor,
 		"--wait", "--timeout", "1m0s",
 	}
 	if !slices.Equal(args, want) {
@@ -388,8 +481,14 @@ func TestUpgradeInstallDoesNotSurfaceHelmOutput(t *testing.T) {
 	if !strings.Contains(err.Error(), "exit status 3") {
 		t.Errorf("the failure does not report the exit status: %v", err)
 	}
-	if !strings.Contains(err.Error(), "upgrade --install") {
-		t.Errorf("the failure does not report the phase and command line: %v", err)
+	// The command line must be copy-safe: every argument and the helm
+	// binary itself shell-quoted, so a path with spaces or shell
+	// metacharacters cannot change what a pasted re-run does.
+	if !strings.Contains(err.Error(), "'upgrade' '--install'") {
+		t.Errorf("the failure does not report the shell-quoted phase and command line: %v", err)
+	}
+	if !strings.Contains(err.Error(), shellQuote(stub)) {
+		t.Errorf("the failure does not report the shell-quoted helm binary: %v", err)
 	}
 }
 

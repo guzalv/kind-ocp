@@ -1021,10 +1021,14 @@ that pin them, and §3.
   resolve 2 reports the create's truth. The expectation deliberately
   does not live in the marker (the review rounds moved it out): the
   marker is the ownership proof every walk and delete rely on, so the
-  count file is replaced atomically (written to a private temporary
-  file and renamed over the target only after a successful write and
-  close — the live file is never opened for writing, never truncated
-  in place), a failed count write preserves the previous expectation
+  count file is replaced atomically (staged in a private temporary
+  file `os.CreateTemp` names uniquely per writer in the same
+  directory, written and closed there, and renamed over the target
+  only after a successful write — the live file is never opened for
+  writing, never truncated in place, and overlapping updates cannot
+  open, truncate, or rename each other's staging file, so the
+  published expectation is always one writer's complete write), a
+  failed count write preserves the previous expectation
   and the marker untouched, and the count's shape can never make the
   marker unreadable: ownership and the count are validated
   independently. The assertion compares the generated name set —
@@ -1049,21 +1053,28 @@ that pin them, and §3.
   lines). The named form runs
   no count assertion — targeted recovery must not fail on a sibling.
   The marker itself is never rewritten after creation, and a foreign or
-  malformed marker is never written into. Unit regressions
+  malformed marker is never written into. The count read is bounded: a
+  file longer than any count create writes is the same corrupt class
+  as a non-integer, and the read never allocates for a corrupt file's
+  length. Unit regressions
   (Docker-free): vanished-cluster FAIL naming cluster and remedy with
   the survivor still checked, every-cluster-vanished FAIL with no
   structural error, the drift case (count-3 create, count-2 verify →
   PASS), old/corrupt-state SKIP table (below 1, above create's cap, a
   huge value pinned to return promptly — it must never reach name
   generation — and the not-an-integer shapes: string, fraction,
-  int-overflow), leftover-beyond-expectation PASS with the
+  int-overflow, plus a file longer than any count create writes),
+  leftover-beyond-expectation PASS with the
   leftover's own per-cluster lines, named-form exemption, expectation
   round-trip, marker-untouched-by-count-write, failed-write
   preservation (previous expectation and marker intact, tree still
   removable), atomic replacement (the file's identity changes — never
-  truncated in place), foreign-marker refusal, and the
+  truncated in place; no staging file survives), concurrent updates
+  (overlapping writers publish one writer's complete write, a
+  concurrent reader never observes a torn value, no writer fails,
+  nothing left behind), foreign-marker refusal, and the
   unparseable-marker tree refusal.
-  README: a "What is proven" section separates the three proofs (CO
+  README: a "What is proven" section separates the two proofs (CO
   operator-driven scans, example deployment/registration/health) from
   the unproven Central-driven scan-to-results round trip, and states
   the SCC shim's exact semantics (defaults `runAsUser`/`runAsGroup`/
@@ -1074,11 +1085,21 @@ that pin them, and §3.
   prerequisites rewritten with the real requirements: Docker client
   and daemon, the buildx CLI plugin for full-profile create, Go 1.27.4+
   (the go.mod minimum), kubectl for the inspection commands, the
-  network endpoints create fetches from (docker.io and quay.io for the
-  pinned images — daemon-cached; the OLM release on github.com
-  redirecting to release-assets.githubusercontent.com and
-  raw.githubusercontent.com at the pinned openshift/api commit —
-  state-root-cached), and the macOS pitfalls surfaced from
+  network endpoints create fetches from — stated per endpoint with
+  what caches what: docker.io for the pinned kind node and
+  scc-admission builder images (pulled through the Docker daemon,
+  which caches them), quay.io for the OLM operator image (pulled by
+  the kubelet into each node's containerd, not the host Docker
+  cache; the pinned configmap-registry reference is never pulled —
+  nothing creates a ConfigMap-based CatalogSource), github.com for
+  the OLM release on every full-profile create (redirecting to
+  release-assets.githubusercontent.com, fetched and digest-verified
+  per apply, not state-root-cached), and raw.githubusercontent.com
+  at the pinned openshift/api commit for the 18 CRDs (the one
+  state-root-cached manifest set); the Compliance Operator proof's
+  image pulls (quay.io and ghcr.io, an integration test's) are listed
+  with it —
+  and the macOS pitfalls surfaced from
   §6.1/§3.4 (the docker.sock symlink and DOCKER_HOST pinning, buildx
   discoverability together with DOCKER_HOST, CGO_ENABLED=0 failing
   closed on the ACL checks). A "When something goes wrong" section
@@ -1102,16 +1123,31 @@ that pin them, and §3.
   later files win); the files ride the example's privacy rule for
   files it reads (private, caller-owned, regular — a values file can
   carry secrets) and their contents are never logged; the pinned chart
-  fetch and its digest verification are unchanged. Two helm-contract
-  hardenings from the review round: every `-f` path — generated or
-  user-supplied — is refused when it contains a comma (helm parses
-  each `-f` argument as a comma-separated list, verified against helm
-  v4.3.1, so a comma would make it load different, unchecked files),
-  and helm's own stdout/stderr are discarded rather than forwarded
+  fetch and its digest verification are unchanged. Three helm-contract
+  hardenings from the review rounds: a user-supplied values path is
+  resolved to its absolute checked form before helm sees it — the
+  parent directory through the same ancestor policy the workspace
+  uses (a values file reached through a writable directory is
+  refused: the entry could be swapped between the check and helm's
+  open), the leaf private at the resolved path, and only the
+  absolute path handed on, so a relative operand or a bare `-`
+  (helm v4.3.1 reads `-` as stdin, silently ignoring a local file of
+  that name; its absolute spelling loads normally — verified live)
+  cannot redirect what helm opens; every `-f` path — generated or
+  user-supplied — is refused when it contains a comma, a double
+  quote, a newline, or a carriage return (helm v4.3.1 parses each
+  `-f` operand as a CSV record, verified live: a comma splits it into
+  several files, a quote breaks the CSV parsing, a newline or CR ends
+  the record early — all leave helm reading something other than the
+  one checked file); and helm's own stdout/stderr are discarded
+  rather than forwarded
   (its diagnostics quote values-file content verbatim, and the values
   files carry the admin password and the registration secret; a failed
-  run reports phase, release, exit status, and the command line —
-  paths only — for reproduction by hand). The example README
+  run reports the exit status and the full command line, shell-quoted
+  — every argument and the helm binary itself, so a copy-paste
+  reproduces the run across paths with spaces or shell
+  metacharacters — with the warning that re-running it by hand
+  prints diagnostics that can quote values content). The example README
   documents the worked override as a runnable shell block (an
   engineer's own Sensor image via `image.main.fullRef`, the chart's
   own image override surface, verified against the pinned chart, with
@@ -1122,7 +1158,17 @@ that pin them, and §3.
   vanished-cluster smoke — container and record of kind-ocp-2 removed,
   verify FAILs `cluster-count` naming kind-ocp-2 and exits non-zero,
   the re-run create rebuilds it in 45 s and verify returns to
-  all-PASS; delete leaves zero containers.
+  all-PASS; delete leaves zero containers. The second review round's
+  fixes re-verified live on a fresh prefix: create writes the sidecar
+  through the unique staging name (content `2\n`, 0600, no staging
+  leftovers), a `two` sidecar SKIPs with the message shape intact, an
+  oversized (101-byte) sidecar SKIPs promptly via the bounded read,
+  restore returns to all-PASS, delete leaves zero containers; the
+  example binary refuses comma, quote, newline, and
+  writable-ancestor override paths at startup before any cluster work;
+  the helm operand facts behind the CSV refusal were re-verified
+  against real helm v4.3.1; the full integration suite re-run green
+  (ok 802 s).
 ## 6. Testing strategy
 
 - Unit (no Docker): config resolution and precedence, per-cluster overrides,
