@@ -165,6 +165,12 @@ func TestSetExpectedClustersRefusesAForeignMarker(t *testing.T) {
 	if b, err := os.ReadFile(path); err != nil || string(b) != foreign {
 		t.Errorf("the foreign marker was rewritten: (%q, %v)", b, err)
 	}
+	// The same refusal gates the read: a tree whose marker does not
+	// validate is not kind-ocp's to read an expectation from, and the
+	// error is the marker's own.
+	if _, _, err := store.ExpectedClusters(); err == nil || !strings.Contains(err.Error(), "does not identify kind-ocp state") {
+		t.Fatalf("ExpectedClusters on a foreign marker = %v, want the marker's own refusal", err)
+	}
 }
 
 // A present-but-unreadable expectation is corrupt state, not an unsafe

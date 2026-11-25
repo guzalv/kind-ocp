@@ -351,20 +351,32 @@ func writeFileAtomic(tmp, path string, b []byte) (retErr error) {
 
 // ExpectedClusters returns the number of clusters the last create set
 // out to build for this prefix, from the private file create wrote
-// beside the marker. found is false when the tree carries no such
-// value — a state root written by an older binary — and that is not an
-// error: verify degrades to a SKIP, never a false FAIL. A value that
-// is present but not an integer (a string, a fraction, an overflow)
-// wraps ErrCorruptCount: the same corruption class as an integer
-// outside any range create validates, and like it the caller's to
-// classify (see config.IsCreatableCount). A tree or file that fails
-// the boundary checks is a plain error, reported as itself.
+// beside the marker. The marker must validate first — ownership is the
+// gate every other read runs behind, and the count read is no
+// exception — but only the marker's own validity: the count's shape
+// never affects it (see ErrCorruptCount). found is false when the tree
+// carries no such value — a state root written by an older binary —
+// and that is not an error: verify degrades to a SKIP, never a false
+// FAIL. A value that is present but not an integer (a string, a
+// fraction, an overflow) wraps ErrCorruptCount: the same corruption
+// class as an integer outside any range create validates, and like it
+// the caller's to classify (see config.IsCreatableCount). A tree or
+// file that fails the boundary checks is a plain error, reported as
+// itself.
 func (s *Store) ExpectedClusters() (count int, found bool, err error) {
 	root, err := s.walk(nil, false)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return 0, false, nil
 		}
+		return 0, false, err
+	}
+	// A tree whose marker does not validate is not kind-ocp's to read
+	// an expectation from: the error is the marker's own, reported as
+	// a read failure (the same refusal every walk-backed read makes).
+	// A valid marker with unknown fields — including a count field an
+	// older binary wrote, in whatever shape — passes untouched.
+	if found, err := readMarker(root); err != nil || !found {
 		return 0, false, err
 	}
 	path := filepath.Join(root, expectedName)

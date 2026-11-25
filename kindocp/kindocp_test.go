@@ -1374,6 +1374,9 @@ func TestVerifyCountAssertionDegradesOnOldOrCorruptState(t *testing.T) {
 		if count == nil || count.Status != StatusSkipped {
 			t.Fatalf("cluster-count = %+v, want SKIP with the read error", count)
 		}
+		if !strings.Contains(count.Detail, "reading the persisted cluster expectation") {
+			t.Errorf("cluster-count detail %q does not report the read failure — an unparseable marker must not be mistaken for old state", count.Detail)
+		}
 		if r := findResult(results, "p-1", "kubeconfig"); r == nil || r.Status != StatusFail {
 			t.Errorf("p-1 kubeconfig = %+v, want FAIL — an unparseable marker must keep refusing the tree", r)
 		}
