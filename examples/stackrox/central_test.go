@@ -11,15 +11,23 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // discardLogger keeps the wait functions' progress logging out of test
@@ -40,40 +48,40 @@ data:
   crs: RklYTUU=
 `
 
-// mintCentralCert mints a CA and a serving certificate carrying the
-// chart's SAN (central.stackrox.svc) under it — the shape the chart's
-// install hook writes into the central-tls secret. The CA PEM is what a
-// centralAPI trusts; the certificate is what a test Central serves.
-// Minting a second, independent pair is how a test builds a peer the
-// client must not trust: same name, different issuer.
-func mintCentralCert(t *testing.T) (caPEM []byte, cert tls.Certificate) {
+// mintCentralCA mints the CA half of the chart-shaped pair: the CA
+// PEM is what a centralAPI trusts.
+func mintCentralCA(t *testing.T) (caPEM []byte, ca *x509.Certificate, caKey *ecdsa.PrivateKey) {
 	t.Helper()
-	mint := func() ([]byte, *x509.Certificate, *ecdsa.PrivateKey) {
-		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		if err != nil {
-			t.Fatal(err)
-		}
-		tmpl := &x509.Certificate{
-			SerialNumber:          big.NewInt(1),
-			Subject:               pkix.Name{CommonName: "test-ca"},
-			NotBefore:             time.Now().Add(-time.Hour),
-			NotAfter:              time.Now().Add(time.Hour),
-			IsCA:                  true,
-			KeyUsage:              x509.KeyUsageCertSign,
-			BasicConstraintsValid: true,
-		}
-		der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-		if err != nil {
-			t.Fatal(err)
-		}
-		parsed, err := x509.ParseCertificate(der)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), parsed, key
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
 	}
-	caPEM, ca, caKey := mint()
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), parsed, key
+}
 
+// mintCentralLeafUnder mints a serving certificate carrying the chart's
+// SAN (central.stackrox.svc) under the given CA — the shape the chart's
+// install hook writes into the central-tls secret. The certificate is
+// what a test Central serves.
+func mintCentralLeafUnder(t *testing.T, ca *x509.Certificate, caKey *ecdsa.PrivateKey) tls.Certificate {
+	t.Helper()
 	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -91,7 +99,16 @@ func mintCentralCert(t *testing.T) (caPEM []byte, cert tls.Certificate) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return caPEM, tls.Certificate{Certificate: [][]byte{leafDER}, PrivateKey: leafKey}
+	return tls.Certificate{Certificate: [][]byte{leafDER}, PrivateKey: leafKey}
+}
+
+// mintCentralCert mints a CA and a serving certificate under it. Minting
+// a second, independent pair is how a test builds a peer the client
+// must not trust: same name, different issuer.
+func mintCentralCert(t *testing.T) (caPEM []byte, cert tls.Certificate) {
+	t.Helper()
+	caPEM, ca, caKey := mintCentralCA(t)
+	return caPEM, mintCentralLeafUnder(t, ca, caKey)
 }
 
 // startCentralTLSServer serves h over TLS with a freshly minted
@@ -100,12 +117,21 @@ func mintCentralCert(t *testing.T) (caPEM []byte, cert tls.Certificate) {
 // gets from the central-tls secret and the forwarded pod.
 func startCentralTLSServer(t *testing.T, h http.Handler) (baseURL string, caPEM []byte) {
 	t.Helper()
-	ca, cert := mintCentralCert(t)
+	caPEM, ca, caKey := mintCentralCA(t)
+	return startCentralTLSServerUnderCA(t, ca, caKey, h), caPEM
+}
+
+// startCentralTLSServerUnderCA serves h over TLS with a certificate the
+// given CA issued — a peer a client trusting that CA fully verifies, so
+// a test can prove the client never dialed it (rather than dialed it
+// and failed the handshake).
+func startCentralTLSServerUnderCA(t *testing.T, ca *x509.Certificate, caKey *ecdsa.PrivateKey, h http.Handler) string {
+	t.Helper()
 	server := httptest.NewUnstartedServer(h)
-	server.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+	server.TLS = &tls.Config{Certificates: []tls.Certificate{mintCentralLeafUnder(t, ca, caKey)}}
 	server.StartTLS()
 	t.Cleanup(server.Close)
-	return server.URL, ca
+	return server.URL
 }
 
 // newTestCentralAPI builds a centralAPI a test can drive: verified TLS
@@ -498,10 +524,15 @@ func TestCentralClientSendsNoAuthenticatedRequestToAnUnexpectedTLSPeer(t *testin
 // across port changes on the same hostname — a redirect answer would be
 // a second, unverified destination for the admin password. The client
 // refuses to follow one, so the redirect target never sees a request.
+// The target here is signed by the same trusted CA as the redirecting
+// server, so its TLS would verify if dialed: zero requests on it prove
+// the client never dialed it (the redirect refusal), not that a dial
+// happened to fail the handshake.
 func TestCentralClientRefusesToFollowARedirect(t *testing.T) {
 	var redirectedTo atomic.Int64
 	rec := &authRecorder{}
-	targetBase, _ := startCentralTLSServer(t, rec.wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	caPEM, ca, caKey := mintCentralCA(t)
+	targetBase := startCentralTLSServerUnderCA(t, ca, caKey, rec.wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		redirectedTo.Add(1)
 		w.WriteHeader(http.StatusOK)
 	})))
@@ -511,9 +542,9 @@ func TestCentralClientRefusesToFollowARedirect(t *testing.T) {
 		w.Header().Set("Location", targetBase+"/v1/cluster-init/crs")
 		w.WriteHeader(http.StatusFound)
 	})
-	base, ca := startCentralTLSServer(t, mux)
+	base := startCentralTLSServerUnderCA(t, ca, caKey, mux)
 
-	api := newTestCentralAPI(t, base, "test-password", ca)
+	api := newTestCentralAPI(t, base, "test-password", caPEM)
 	_, err := api.generateCRS(context.Background(), "redirected-crs", discardLogger())
 	if err == nil {
 		t.Fatal("generateCRS followed a redirect answer")
@@ -532,6 +563,151 @@ func TestCentralClientRefusesToFollowARedirect(t *testing.T) {
 func TestNewCentralAPIRefusesABaseThatIsNotHTTPS(t *testing.T) {
 	if _, err := newCentralAPI("http://127.0.0.1:8443", "pw", nil); err == nil || !strings.Contains(err.Error(), "https") {
 		t.Fatalf("newCentralAPI on a plain-http base = %v, want a refusal — credentials do not travel in the clear", err)
+	}
+}
+
+// forwardResult is what startCentralPortForward returns, delivered
+// through a channel so a test can act on the forward while it starts.
+type forwardResult struct {
+	pf   *centralPortForward
+	base string
+	ctx  context.Context
+	err  error
+}
+
+// startForward runs startCentralPortForward under parent and delivers
+// its result on the returned channel.
+func startForward(parent context.Context, kubeconfig string) <-chan forwardResult {
+	ch := make(chan forwardResult, 1)
+	go func() {
+		pf, base, ctx, err := startCentralPortForward(parent, kubeconfig)
+		ch <- forwardResult{pf: pf, base: base, ctx: ctx, err: err}
+	}()
+	return ch
+}
+
+// portForwardAPIServer serves the two requests startCentralPortForward
+// makes around the tunnel: the Central pod list that finds the pod, and
+// the pod's portforward endpoint the SPDY dialer POSTs to. The
+// portforward request is held from the moment it arrives until the
+// returned release function runs, and is then answered with a plain 404
+// — never an upgrade — so ForwardPorts fails while starting. Holding
+// the request is what makes the forward observably "starting": the
+// dial is in flight, ForwardPorts has not returned, and the test can
+// act in that window. The returned kubeconfig points at the server the
+// way a kind kubeconfig points at a cluster.
+func portForwardAPIServer(t *testing.T) (kubeconfigPath string, arrived <-chan struct{}, release func()) {
+	t.Helper()
+	var arrivedOnce sync.Once
+	arrivedCh := make(chan struct{})
+	releaseCh := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/namespaces/stackrox/pods", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		list := corev1.PodList{
+			TypeMeta: metav1.TypeMeta{Kind: "PodList", APIVersion: "v1"},
+			Items:    []corev1.Pod{*centralPod("central-7f9c", corev1.PodRunning)},
+		}
+		_ = json.NewEncoder(w).Encode(&list)
+	})
+	mux.HandleFunc("POST /api/v1/namespaces/stackrox/pods/central-7f9c/portforward", func(w http.ResponseWriter, r *http.Request) {
+		arrivedOnce.Do(func() { close(arrivedCh) })
+		<-releaseCh
+		w.WriteHeader(http.StatusNotFound)
+	})
+	server := httptest.NewUnstartedServer(mux)
+	server.StartTLS()
+	t.Cleanup(server.Close)
+
+	kubeconfig := filepath.Join(t.TempDir(), "kubeconfig")
+	content := fmt.Sprintf(`apiVersion: v1
+kind: Config
+clusters:
+- name: test
+  cluster:
+    server: %s
+    insecure-skip-tls-verify: true
+contexts:
+- name: test
+  context:
+    cluster: test
+    user: test
+current-context: test
+users:
+- name: test
+  user: {}
+`, server.URL)
+	if err := os.WriteFile(kubeconfig, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return kubeconfig, arrivedCh, func() { close(releaseCh) }
+}
+
+// A tunnel that dies on its own while starting reports its failure as
+// the startup result: the failure is published as the lifetime
+// context's cause, and the selector reads it back from there. Receiving
+// the result proves the publication completed — the answer is ordered
+// after the cause by the context's own synchronization.
+func TestStartCentralPortForwardReportsATunnelThatDiesWhileStarting(t *testing.T) {
+	kubeconfig, arrived, release := portForwardAPIServer(t)
+	done := startForward(context.Background(), kubeconfig)
+	<-arrived
+	release()
+
+	select {
+	case r := <-done:
+		if r.err == nil {
+			t.Fatal("startCentralPortForward succeeded although the API server refused the upgrade")
+		}
+		for _, want := range []string{"before becoming ready", "upgrading connection"} {
+			if !strings.Contains(r.err.Error(), want) {
+				t.Errorf("the error %q does not name %q — the tunnel's own failure must be the startup result", r.err.Error(), want)
+			}
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("startCentralPortForward did not return after the dial failed")
+	}
+}
+
+// The parent's cancellation while the forward is starting must surface
+// as the startup result with no synchronization on the tunnel's own
+// outcome: the tunnel's goroutine publishes its error through the
+// context cause (WithCancelCause), never through shared state the
+// selector could read while it is still being written.
+//
+// The result is received only after the held dial has failed on
+// purpose. The selector's answer races the goroutine's publication, and
+// receiving the buffered result first would order the two through the
+// result channel; the interleaving this test exists for is the one
+// where the parent's cancellation is answered while ForwardPorts is
+// still returning, and the publication lands afterwards. Under -race
+// that pair is exactly the unsynchronized read-and-write the cause
+// mechanism replaced.
+func TestStartCentralPortForwardReportsParentCancellationWhileStarting(t *testing.T) {
+	kubeconfig, arrived, release := portForwardAPIServer(t)
+	parent, cancelParent := context.WithCancel(context.Background())
+	done := startForward(parent, kubeconfig)
+	<-arrived
+
+	// The selector answers here: the parent's cancellation closes the
+	// lifetime while the dial is still parked in the server.
+	cancelParent()
+
+	// Let the held dial fail and the forward's goroutine publish its
+	// outcome while the selector's answer is already decided: release
+	// the server's refusal and give the client the moment loopback
+	// needs to finish the request. The result stays buffered in the
+	// channel meanwhile.
+	release()
+	time.Sleep(150 * time.Millisecond)
+
+	select {
+	case r := <-done:
+		if r.err == nil || !errors.Is(r.err, context.Canceled) {
+			t.Fatalf("startCentralPortForward under parent cancellation = %v, want context.Canceled", r.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("startCentralPortForward did not return after the parent was cancelled")
 	}
 }
 

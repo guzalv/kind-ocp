@@ -32,14 +32,15 @@ import (
 // talks to the pod the way `kubectl port-forward` does — through the same
 // client-go machinery.
 type centralPortForward struct {
-	cancel context.CancelFunc
+	cancel context.CancelCauseFunc
 }
 
 // close tears the tunnel down and fails every call running under its
 // context. It is safe to call more than once: context cancellation is
-// idempotent.
+// idempotent. It cancels without a cause — a deliberate close is not a
+// failure, so the context reports plain cancellation, not an error.
 func (p *centralPortForward) close() {
-	p.cancel()
+	p.cancel(nil)
 }
 
 // startCentralPortForward locates the running Central pod on the Central
@@ -99,45 +100,57 @@ func startCentralPortForward(ctx context.Context, kubeconfigPath string) (*centr
 	// are part of the evidence, and a tunnel that never comes up should
 	// say so where the run can see it. Ports are "local:remote" pairs;
 	// local 0 makes the forwarder bind and report the port itself.
-	pfCtx, cancel := context.WithCancel(ctx)
+	//
+	// The lifetime is a cause-carrying context: the tunnel's own
+	// failure is published as the context's cause in the same
+	// synchronized step that closes it (context.WithCancelCause), so a
+	// parent cancellation racing the startup reads either the fully
+	// published cause or none — never a half-written shared variable.
+	pfCtx, cancel := context.WithCancelCause(ctx)
 	fw, err := portforward.NewOnAddressesWithContext(pfCtx, dialer, []string{"127.0.0.1"},
 		[]string{fmt.Sprintf("0:%d", centralPodPort)}, ready, os.Stderr, os.Stderr)
 	if err != nil {
-		cancel()
+		cancel(nil)
 		return nil, "", nil, fmt.Errorf("building the port-forward: %w", err)
 	}
 
-	// forwardErr is published before the cancel that wakes the selector
-	// below, so a tunnel that died on its own reports why.
-	var forwardErr error
 	go func() {
-		defer cancel()
-		forwardErr = fw.ForwardPorts()
+		// The deferred cancel keeps the lifetime bounded even if
+		// ForwardPorts panics; the first cause wins, so a failure
+		// published in the body survives the deferred nil.
+		defer cancel(nil)
+		if err := fw.ForwardPorts(); err != nil {
+			cancel(err)
+		}
 	}()
 
 	select {
 	case <-ready:
 		ports, err := fw.GetPorts()
 		if err != nil {
-			cancel()
+			cancel(nil)
 			return nil, "", nil, fmt.Errorf("reading the forwarded local port: %w", err)
 		}
 		if len(ports) != 1 {
-			cancel()
+			cancel(nil)
 			return nil, "", nil, fmt.Errorf("the port-forward reported %d local ports, want 1", len(ports))
 		}
 		return &centralPortForward{cancel: cancel},
 			fmt.Sprintf("https://127.0.0.1:%d", ports[0].Local), pfCtx, nil
 	case <-pfCtx.Done():
-		// Either the parent was cancelled, or the forward exited on its
-		// own and its goroutine cancelled the lifetime with the error
-		// already published.
-		if forwardErr != nil {
-			return nil, "", nil, fmt.Errorf("the Central port-forward exited before becoming ready: %v", forwardErr)
+		// The cause says which side ended the lifetime: the tunnel's
+		// goroutine published its failure as the cause, while a plain
+		// Canceled means no failure was published — the parent
+		// cancelled, or the forward stopped without reporting why.
+		if cause := context.Cause(pfCtx); !errors.Is(cause, context.Canceled) {
+			return nil, "", nil, fmt.Errorf("the Central port-forward exited before becoming ready: %w", cause)
 		}
-		return nil, "", nil, ctx.Err()
+		if err := ctx.Err(); err != nil {
+			return nil, "", nil, err
+		}
+		return nil, "", nil, errors.New("the Central port-forward stopped before becoming ready")
 	case <-time.After(30 * time.Second):
-		cancel()
+		cancel(nil)
 		return nil, "", nil, errors.New("the Central port-forward did not become ready within 30s")
 	}
 }

@@ -830,21 +830,30 @@ that pin them, and §3.
   listen-close-use window, and ready can no longer mean an IPv6 bind
   whose IPv4 twin was taken), and every authenticated API call runs
   under a context cancelled the moment the forward exits.
-  The review round after that closed two P1s. First, the workspace can
-  no longer coincide with the state tree for any state root: it is
-  derived from the *resolved* state base (fscheck gained `ResolveDir` —
-  the look-before-you-manage companion to `OpenManagedDir`, an
-  existence-requiring, alias-resolving, non-writing walk) as a sibling
-  named after the state root itself (`<resolved state
-  base>-stackrox-example/<prefix>`; the default state root keeps the
-  documented `kind-ocp-stackrox-example` location), so a
-  `--state-root` ending in the workspace's own name derives a distinct
-  sibling instead of landing on the per-prefix state directory.
-  Resolved overlap in either direction — a workspace alias pointing
-  into the state tree (which would put the credentials where
-  `kind-ocp delete` removes them), or a state root inside the workspace
-  — is refused before anything is created, and the final resolved
-  workspace is held to the same rule again. Second, the Central client
+  The review rounds after that hardened both boundaries further. The
+  workspace can no longer meet the state tree for any state root or
+  any spelling of one: it is derived from the *resolved* state base
+  (fscheck gained `ResolveDir` — the look-before-you-manage companion
+  to `OpenManagedDir`, an existence-requiring, alias-resolving,
+  non-writing walk) as a sibling named after the state root itself
+  (`<resolved state base>-stackrox-example/<prefix>`; the default
+  state root keeps the documented `kind-ocp-stackrox-example`
+  location), and it is opened through a second fscheck entry point,
+  `OpenDerivedDir`, which walks the whole chain with alias following
+  disabled: a symlink at the derived base or leaf is refused wherever
+  it points, and the anchor components are re-verified as the
+  symlink-free chain the resolution returned. Disjointness holds by
+  construction, with no path comparison left to fool — on a
+  case-insensitive volume (macOS, a supported platform) `State` and
+  `state` are one directory while remaining two strings, which is
+  exactly the shape that let a workspace-base alias naming the state
+  root in the other case pass every lexical overlap check while
+  pointing the credentials into the tree `kind-ocp delete` removes.
+  A `--state-root` ending in the workspace's own name derives a
+  distinct sibling (the suffix stacks). Regression tests pin both
+  spellings: the exact-case alias into the state tree and the
+  case-colliding one are refused without writes, the case-specific
+  fixture skipping volumes that resolve names case-sensitively. Second, the Central client
   authenticates Central before any credential is sent: the TLS peer
   must present a certificate chaining to the CA the chart's install
   hook wrote into the `central-tls` secret — read through the
@@ -858,16 +867,29 @@ that pin them, and §3.
   `ForwardPorts` releases its listener in a defer before the wrapper's
   context cancellation lands, and a local process rebinding the port in
   that window cannot present Central's certificate, so the handshake
-  fails before any credential is sent. The forward's lifecycle collapsed
-  to one cancel function (`NewOnAddressesWithContext`): a single
-  context is the forward's stop signal, the lifetime every API call
-  runs under, and the thing the goroutine cancels the moment
-  `ForwardPorts` returns. Regression tests pin the boundary: an
-  untrusted TLS peer (right name, different issuer — everything a local
-  squatter can forge) receives no request at all, a redirect target
-  receives no request and no Authorization header, the colliding state
-  root basename derives a distinct sibling, and both alias-overlap
-  shapes are refused without writes. The README documents that
+  fails before any credential is sent. The forward's lifecycle
+  collapsed to one cancel function (`NewOnAddressesWithContext`): a
+  single context is the forward's stop signal, the lifetime every API
+  call runs under, and the thing the goroutine cancels the moment
+  `ForwardPorts` returns. That context is cause-carrying
+  (`context.WithCancelCause`): the tunnel's own failure is published
+  as the context's cause in the same synchronized step that closes it,
+  so a parent cancellation racing the startup reads either the fully
+  published cause or none — never a shared variable the forward's
+  goroutine might still be writing (the selector's earlier direct read
+  of that variable raced the parent's cancellation while
+  `ForwardPorts` was still returning; the startup regression pins
+  exactly that interleaving — the parent cancels while the dial is
+  parked in the API server, and the race detector reports the old
+  shape's unsynchronized pair while the cause mechanism stays clean).
+  Regression tests pin the boundary: an untrusted TLS peer (right
+  name, different issuer — everything a local squatter can forge)
+  receives no request at all, a redirect target receives no request
+  and no Authorization header — signed by the same trusted CA as the
+  redirecting server, so zero requests prove the client never dialed
+  it rather than failed a handshake — the colliding state root
+  basename derives a distinct sibling, and both alias-overlap shapes
+  are refused without writes. The README documents that
   `kind-ocp delete` leaves the work directory and how to remove it.
 ## 6. Testing strategy
 

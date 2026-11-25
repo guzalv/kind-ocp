@@ -4,12 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"log/slog"
 	"net/netip"
 	"net/url"
 	"path/filepath"
-	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -76,78 +74,41 @@ func ensureClusters(ctx context.Context, cfg *config.Config, log *slog.Logger) (
 // predictable path there has parents another local user can substitute,
 // and tmp reaping would silently invalidate the reused admin password).
 //
-// The location is derived from the resolved state base, not the
-// configured spelling: the state root is resolved through kind-ocp's own
-// walk (fscheck.ResolveDir — it exists by now; the clusters were created
-// first), and the workspace is its sibling named after the state root
-// itself. Deriving from the resolved base makes the workspace a distinct
-// sibling by construction: no state root spelling — not even one ending
-// in the workspace's own name — can make the two trees coincide, and
-// aliases in the configured spelling cannot move one inside the other.
-// What an alias of the workspace itself could still do is resolved and
-// refused: before anything is created, an existing workspace base is
-// resolved and held disjoint from the state root, and the final resolved
-// workspace is checked against the same rule again — the invariant holds
-// for the exact path the run writes through.
+// The two trees cannot overlap, and no comparison enforces that — the
+// construction does. The state root is resolved first (fscheck.ResolveDir
+// — it exists by now; the clusters were created first), and the
+// workspace is then *derived* from that resolved base through
+// fscheck.OpenDerivedDir: the resolved state base's own sibling, named
+// after the state root itself, holding one per-prefix directory. The
+// derivation follows no alias anywhere below the resolved anchor: a
+// symlink at the workspace base or leaf is refused outright, wherever
+// it points. That closes the case-insensitive hole a spelling check
+// cannot — on macOS volumes, `State` and `state` are one directory
+// while remaining two strings, so an alias planted at the workspace
+// base naming the state root in the other case passed every lexical
+// overlap check while pointing the credentials straight into the tree
+// `kind-ocp delete` removes. The refusal happens before anything is
+// created; the workspace the run writes through is exactly the sibling
+// the derivation named.
 //
 // The directory is opened through kind-ocp's own filesystem boundary
 // (internal/fscheck — the same policy the state tree walks; the example
 // ships in the same module, so it reuses the implementation instead of
 // forking it): every ancestor is verified before it is trusted,
-// substitutable ancestors and symlinks are refused, and the directory
-// itself is created 0700 or verified caller-owned and private. The
-// resolved path it returns is the one the run writes through — never
-// the alias it started from.
+// substitutable ancestors are refused, and the derived tree is created
+// 0700 or verified caller-owned and private. The resolved path it
+// returns is the one the run writes through — never an alias.
 func openWorkDir(cfg *config.Config) (string, error) {
 	stateBase, err := fscheck.ResolveDir(cfg.StateRoot)
 	if err != nil {
 		return "", fmt.Errorf("resolving the kind-ocp state root %s: %w", cfg.StateRoot, err)
 	}
-	workBase := filepath.Join(filepath.Dir(stateBase), filepath.Base(stateBase)+workDirSuffix)
-
-	// An existing workspace base may be an alias — including one into
-	// the state tree. Resolve and refuse that before anything is
-	// created below it; a missing base is the one shape that cannot
-	// hide an alias (nothing is there to point anywhere), and it is
-	// left to the creating walk below.
-	if resolved, err := fscheck.ResolveDir(workBase); err == nil {
-		if err := refuseTreeOverlap(resolved, stateBase); err != nil {
-			return "", err
-		}
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return "", fmt.Errorf("resolving the work directory base %s: %w", workBase, err)
-	}
-
-	dir := filepath.Join(workBase, cfg.Prefix)
-	resolved, err := fscheck.OpenManagedDir(dir)
+	resolved, err := fscheck.OpenDerivedDir(filepath.Dir(stateBase),
+		[]string{filepath.Base(stateBase) + workDirSuffix, cfg.Prefix})
 	if err != nil {
-		return "", fmt.Errorf("preparing the work directory %s: %w", dir, err)
-	}
-	if err := refuseTreeOverlap(resolved, stateBase); err != nil {
-		return "", err
+		return "", fmt.Errorf("preparing the work directory beside the state root %s: %w", stateBase, err)
 	}
 	return resolved, nil
-}
-
-// refuseTreeOverlap reports an error when the credential workspace and
-// the kind-ocp state tree are not disjoint. Both paths arrive fully
-// resolved, so the rule holds for the trees as the run will actually
-// write them. A workspace inside the state root would have its
-// credentials removed by `kind-ocp delete`; a state root inside the
-// workspace would sweep kind-ocp's state through the credential
-// directory. Either way the run stops before any credential exists.
-func refuseTreeOverlap(work, stateBase string) error {
-	if work == stateBase || strings.HasPrefix(work, stateBase+string(filepath.Separator)) {
-		return fmt.Errorf(
-			"the work directory %s resolves inside the kind-ocp state root %s — the workspace must stay outside it (kind-ocp delete removes the state tree, credentials included); point the state root or the workspace elsewhere",
-			work, stateBase)
-	}
-	if strings.HasPrefix(stateBase, work+string(filepath.Separator)) {
-		return fmt.Errorf(
-			"the kind-ocp state root %s resolves inside the work directory %s — the two trees must stay disjoint; point the state root or the workspace elsewhere",
-			stateBase, work)
-	}
-	return nil
 }
 
 // workDirSuffix names the workspace beside the state root: the resolved

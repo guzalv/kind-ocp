@@ -144,19 +144,19 @@ func TestOpenWorkDirRefusesASymlinkedWorkspace(t *testing.T) {
 	}
 }
 
-// The workspace's ancestors are verified, not assumed: a directory
-// another local user can write (group- or world-writable, no sticky bit)
-// can substitute the workspace entries below it, so the parent of the
-// per-prefix directory is held to the ancestor policy too.
+// The workspace's ancestors are the state root's ancestors — the
+// workspace is derived from the *resolved* state base, so the chain is
+// verified during that resolution, before the workspace is derived at
+// all. A directory another local user can write (group- or
+// world-writable, no sticky bit) can substitute everything below it,
+// so a substitutable ancestor refuses the run at the resolution step.
 func TestOpenWorkDirRefusesASubstitutableAncestor(t *testing.T) {
 	base := t.TempDir()
 	cfg := mustWorkConfig(t, base, "substituted-test")
-	if err := os.MkdirAll(filepath.Join(base, "kind-ocp"+workDirSuffix), 0o700); err != nil {
+	if err := os.Chmod(base, 0o777); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(filepath.Join(base, "kind-ocp"+workDirSuffix), 0o777); err != nil {
-		t.Fatal(err)
-	}
+	defer func() { _ = os.Chmod(base, 0o700) }()
 	if _, err := openWorkDir(cfg); err == nil || !strings.Contains(err.Error(), "writable") {
 		t.Fatalf("openWorkDir = %v, want a substitutable-ancestor rejection", err)
 	}
@@ -195,10 +195,11 @@ func TestOpenWorkDirStaysOutsideAStateRootNamedLikeTheWorkspace(t *testing.T) {
 }
 
 // A workspace base that aliases into the state tree: the derivation
-// itself cannot nest the trees, but a symlink at the workspace's name
-// could point anywhere. The overlap is refused before anything is
-// created, so the refusal leaves no directory behind inside the state
-// tree.
+// itself cannot nest the trees (the workspace is a sibling of the
+// resolved state base), but a symlink at the workspace's name could
+// point anywhere. The derived chain follows no aliases, so the symlink
+// is refused at the base whatever its target — and the refusal leaves
+// no directory behind inside the state tree.
 func TestOpenWorkDirRefusesAWorkspaceAliasedIntoTheStateTree(t *testing.T) {
 	base := t.TempDir()
 	cfg := mustWorkConfig(t, base, "alias-test")
@@ -210,8 +211,8 @@ func TestOpenWorkDirRefusesAWorkspaceAliasedIntoTheStateTree(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := openWorkDir(cfg); err == nil || !strings.Contains(err.Error(), "state root") {
-		t.Fatalf("openWorkDir through a workspace aliased into the state tree = %v, want an overlap rejection", err)
+	if _, err := openWorkDir(cfg); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("openWorkDir through a workspace aliased into the state tree = %v, want a symlink rejection", err)
 	}
 	// The refusal happened before any write: nothing was created inside
 	// the state tree.
@@ -221,11 +222,12 @@ func TestOpenWorkDirRefusesAWorkspaceAliasedIntoTheStateTree(t *testing.T) {
 }
 
 // The other direction: an alias at the workspace base that points above
-// the state root makes the per-prefix workspace contain the state tree —
-// kind-ocp's removals would then sweep through the credential
+// the state root would make the per-prefix workspace contain the state
+// tree — kind-ocp's removals would then sweep through the credential
 // directory's own tree. The derivation alone cannot produce this shape
 // (the workspace base is a sibling of the resolved state root), so what
-// produces it is an alias, and the resolved comparison refuses it.
+// produces it is an alias, and the derived chain refuses the alias
+// itself rather than comparing where it resolves.
 func TestOpenWorkDirRefusesAStateRootInsideTheWorkspace(t *testing.T) {
 	base := t.TempDir()
 	resolved, err := filepath.EvalSymlinks(base)
@@ -237,15 +239,63 @@ func TestOpenWorkDirRefusesAStateRootInsideTheWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 	// … whose derived workspace base is an alias to the temp dir itself:
-	// the per-prefix workspace then resolves to <base>/nested, which
+	// the per-prefix workspace would then resolve to <base>/nested, which
 	// contains the state root.
 	if err := os.Symlink(resolved, filepath.Join(base, "nested", "kind-ocp"+workDirSuffix)); err != nil {
 		t.Fatal(err)
 	}
 	cfg := mustConfig(t, "nested", filepath.Join(base, "nested", "kind-ocp"))
 
-	if _, err := openWorkDir(cfg); err == nil || !strings.Contains(err.Error(), "disjoint") {
-		t.Fatalf("openWorkDir with the state root inside the workspace = %v, want an overlap rejection", err)
+	if _, err := openWorkDir(cfg); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("openWorkDir with the state root inside the workspace = %v, want a symlink rejection", err)
+	}
+}
+
+// caseInsensitiveVolume reports whether dir's filesystem resolves names
+// that differ only by case to the same entry — macOS's default APFS and
+// HFS+ do. On such a volume a state base named State and a path naming
+// state are one directory while remaining two strings, which is exactly
+// the shape no lexical comparison can tell apart.
+func caseInsensitiveVolume(t *testing.T, dir string) bool {
+	t.Helper()
+	if err := os.Mkdir(filepath.Join(dir, "CaseProbe"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_, err := os.Lstat(filepath.Join(dir, "caseprobe"))
+	return err == nil
+}
+
+// The spelling collision on a case-insensitive volume: an alias planted
+// at the derived workspace base that names the state root in the other
+// case points the credentials at the very tree `kind-ocp delete`
+// removes, while every lexical comparison of the two spellings says
+// they differ. The derived chain never follows the alias — it is
+// refused at the base before anything is created — so the case
+// collision never gets the chance to matter. The fixture only denotes
+// one directory on a case-insensitive volume; elsewhere it is a
+// dangling alias, and the same refusal is already pinned by the
+// exact-spelling tests above.
+func TestOpenWorkDirRefusesAWorkspaceAliasedByCase(t *testing.T) {
+	base := t.TempDir()
+	if !caseInsensitiveVolume(t, base) {
+		t.Skip("the volume resolves names case-sensitively; a case-colliding alias cannot denote one directory here")
+	}
+	cfg := mustConfig(t, "case-test", filepath.Join(base, "State"))
+	if err := os.MkdirAll(cfg.StateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// The workspace base names the state root in the other case: on
+	// this volume the alias resolves into the state tree itself.
+	if err := os.Symlink(filepath.Join(base, "state"), filepath.Join(base, "State"+workDirSuffix)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := openWorkDir(cfg); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("openWorkDir through a case-colliding workspace alias = %v, want a symlink rejection", err)
+	}
+	// The refusal wrote nothing into the state tree the alias named.
+	if entries, err := os.ReadDir(cfg.StateRoot); err != nil || len(entries) != 0 {
+		t.Errorf("the state root holds %v (%v) after the refusal, want nothing — refusals do not write", entries, err)
 	}
 }
 

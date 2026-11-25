@@ -102,17 +102,21 @@ StackRox version and should stay on the same appVersion.
   system temporary directory: it holds persistent credentials, and a
   predictable temp path has parents another local user could substitute.
   Its name is derived from the *resolved* state root — the state root's
-  own name plus `-stackrox-example` — so the workspace is a distinct
-  sibling whatever the state root is called (a state root ending in the
-  workspace's own name cannot make the two coincide), and a resolved
-  overlap in either direction — a workspace alias pointing into the
-  state tree, or a state root inside the workspace — is refused before
-  anything is written, because `kind-ocp delete` removes the state tree.
+  own name plus `-stackrox-example` — and the derived location is
+  opened with alias following disabled, because `kind-ocp delete`
+  removes the state tree: a symlink at the workspace's base or leaf is
+  refused wherever it points, so no alias can point the credentials
+  into the state tree. The refusal, not a path comparison, is what
+  keeps the trees apart — on a case-insensitive filesystem (macOS's
+  default) `State` and `state` are one directory while remaining two
+  strings, so no lexical overlap check could tell an alias naming the
+  state root in the other case from any other alias.
 - The directory is opened through kind-ocp's own filesystem boundary:
   every ancestor is verified before it is trusted (substitutable
-  ancestors, symlinks, and permissive directories are refused), and the
-  directory itself is created `0700` or verified caller-owned and
-  private. The run writes through the resolved path the walk returned.
+  ancestors and permissive directories are refused), and the workspace
+  tree — its base and the per-prefix directory alike — is created
+  `0700` or verified caller-owned and private. The run writes through
+  the resolved path the walk returned.
 - The Central admin password is generated once (crypto/rand), stored
   `0600` in the work directory, reused across runs, and never printed or
   logged. Every credential file — the password and the Sensor values
