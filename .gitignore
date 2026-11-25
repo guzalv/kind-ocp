@@ -2,3 +2,5 @@ bin/
 dist/
 *.test
 *.out
+# go build ./examples/stackrox writes this executable into the repo root
+/stackrox
