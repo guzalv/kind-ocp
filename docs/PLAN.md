@@ -689,10 +689,10 @@ that pin them, and §3.
   credential environment (private workspace, empty Docker config,
   allowlisted child environment) owned end-to-end by the tool's run
   function. The bundle entry embeds the manifests inline and carries no
-  image at all; the staged pod runs the pinned image's own `/bin/opm
-  serve` with the shape OLM's own catalog pods ride (subPath-mounted file,
-  restricted PodSecurity, `olm.catalogSource` label); a staging wait fails
-  fast before any OLM object is applied. The one external image the
+  image at all; the proof's catalog pod runs the pinned image's own
+  `/bin/opm serve` with the shape OLM's own catalog pods ride
+  (subPath-mounted file, restricted PodSecurity, `olm.catalogSource`
+  label); a staging wait fails fast before any OLM object is applied. The one external image the
   resolution still depends on is the pinned catalog image itself
   (DefaultCatalogServerImage). The catalog README records the pin table,
   the bump procedure, and the GO-2026-6865 advisory at the crane pin
@@ -717,7 +717,7 @@ that pin them, and §3.
   the full uncached suite (including the CO proof's per-cluster image
   pulls) runs in ~17–18 minutes against the Makefile's 60m go test budget
   and the CI job's 90m.
-- [ ] **9. StackRox example + docs + release readiness.** `examples/stackrox`
+- [x] **9. StackRox example + docs + release readiness.** `examples/stackrox`
   recipe: Central on cluster 1, Sensor on 2..N over NodePort on the shared
   network, released public images, collector disabled. The recipe is a
   `package main` (structurally unimportable — the create path can never
@@ -784,22 +784,20 @@ that pin them, and §3.
   deliverables and design decisions; the git history was squashed into a
   single commit describing the software, as the release-readiness
   requirement demands.
-  The CI workflow move (`docs/ci-workflow.yaml` →
-  `.github/workflows/ci.yaml`) was attempted and refused by the
-  workflow-node sandbox: `.github/` is a protected configuration path for
-  every tool in these sessions, the same policy increment 8 recorded.
-  DONE since the last pass: an authorized normal session moved the file
-  (commit `63e1d13`) — AC-6.7 is satisfied. Remove the staged-move
-  instructions and the restriction narrative from the consumer-facing
-  docs in this pass.
-  Outstanding from the last review (P1, must fix before release):
-  `examples/stackrox/central.go` CRS conflict handling collects and
-  revokes every same-named match, then verifies batch coverage — no
-  requirement needs batch revocation, and Central's `IssueCRS`
-  `store.Add` rejects duplicate active names. Resolve exactly one named
-  ID, reject zero or ambiguous matches before PATCH, and check the one
-  returned ID while preserving the response-error check. Keep the 409
-  re-run regression passing.
+  The CI workflow is active at `.github/workflows/ci.yaml`
+  (commit `63e1d13`): lint + unit on every PR, the Docker-gated
+  integration suite behind the `integration` label, on manual dispatch,
+  and nightly — the design increment 8 recorded.
+  The CRS name conflict resolves exactly one ID: on the 409, the recipe
+  lists Central's CRSs and selects the entries by exact name, and a
+  revoke request is sent only when exactly one entry holds it. Central's
+  cluster-init store (`central/clusterinit/store`) rejects adding a
+  second non-revoked init bundle or CRS under a held name, and the
+  listing omits revoked entries, so a consistent Central lists at most
+  one active CRS per name. A listing with no entry under the name means
+  the conflict is not a revocable CRS; several entries mean a state a
+  consistent Central cannot produce. Both are surfaced as errors before
+  any revoke request is sent.
   Carried gate findings folded in: the failed-build regression's fake `go`
   emits a unique stderr marker and the test asserts it in the returned
   error (proving the fake ran, not that go failed to start);

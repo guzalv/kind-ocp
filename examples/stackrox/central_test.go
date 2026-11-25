@@ -245,12 +245,17 @@ type crsCalls struct {
 // newCRSConflictServer serves Central's CRS surface as a re-run of the
 // recipe meets it: a CRS with the requested name already exists, so
 // POST /v1/cluster-init/crs answers 409 until that CRS is revoked through
-// PATCH /v1/cluster-init/crs/revoke. listBody and revokeBody override the
+// PATCH /v1/cluster-init/crs/revoke. The default listing also carries an
+// unrelated CRS, so the revoke selection is pinned to the name, not to
+// being the only listed entry. listBody and revokeBody override the
 // default listing and revoke answers, so tests can break the flow.
 func newCRSConflictServer(t *testing.T, listBody, revokeBody string) (*centralAPI, *crsCalls) {
 	t.Helper()
 	if listBody == "" {
-		listBody = `{"items":[{"id":"crs-1","name":"kind-ocp-example-test"}]}`
+		listBody = `{"items":[
+			{"id":"crs-9","name":"someone-elses"},
+			{"id":"crs-1","name":"kind-ocp-example-test"}
+		]}`
 	}
 	if revokeBody == "" {
 		revokeBody = `{"revokedIds":["crs-1"]}`
@@ -323,6 +328,25 @@ func TestGenerateCRSFailsWhenTheConflictingNameIsNotARevocableCRS(t *testing.T) 
 	}
 	if len(calls.revokeBodies) != 0 {
 		t.Errorf("revoke was called %d times, want 0 — there is no matching CRS to revoke", len(calls.revokeBodies))
+	}
+}
+
+func TestGenerateCRSFailsWhenTheNameIsAmbiguous(t *testing.T) {
+	api, calls := newCRSConflictServer(t, `{"items":[
+		{"id":"crs-1","name":"kind-ocp-example-test"},
+		{"id":"crs-2","name":"kind-ocp-example-test"}
+	]}`, "")
+	_, err := api.generateCRS(context.Background(), "kind-ocp-example-test", discardLogger())
+	if err == nil {
+		t.Fatal("generateCRS succeeded although the name is held by two listed CRSs")
+	}
+	for _, want := range []string{"kind-ocp-example-test", "crs-1", "crs-2"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error %q does not name %q", err.Error(), want)
+		}
+	}
+	if len(calls.revokeBodies) != 0 {
+		t.Errorf("revoke was called %d times, want 0 — an ambiguous listing must not be revoked", len(calls.revokeBodies))
 	}
 }
 

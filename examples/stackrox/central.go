@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -326,7 +327,7 @@ func (a *centralAPI) generateCRSConverging(ctx context.Context, name string, log
 		return "", err
 	}
 	log.Info("a cluster registration secret with this name already exists; revoking and regenerating it", "name", name)
-	if err := a.revokeCRSsNamed(ctx, name); err != nil {
+	if err := a.revokeCRSNamed(ctx, name); err != nil {
 		return "", fmt.Errorf("revoking the cluster registration secret of the previous run: %w", err)
 	}
 	return a.generateCRSOnce(ctx, name)
@@ -397,13 +398,21 @@ func (a *centralAPI) listCRSs(ctx context.Context) ([]crsSummary, error) {
 	return resp.Items, nil
 }
 
-// revokeCRSsNamed revokes every cluster registration secret Central holds
+// revokeCRSNamed revokes the one cluster registration secret Central holds
 // under the name, so the name is free for a fresh one (Central refuses a
 // name held by a non-revoked init bundle or CRS). Central reports a
 // failing revocation inside a 200 answer, not through the status code, so
-// the reported errors and the coverage of the revoked ids are both
+// the reported errors and the coverage of the revoked id are both
 // checked.
-func (a *centralAPI) revokeCRSsNamed(ctx context.Context, name string) error {
+//
+// The listing must hold exactly one entry under the name: Central's
+// cluster-init store (central/clusterinit/store) rejects adding a second
+// non-revoked init bundle or CRS under a name it already holds, and the
+// listing omits revoked entries — so a consistent Central lists at most
+// one active CRS per name. An ambiguous listing means a state this recipe
+// does not understand; the ambiguity is refused instead of revoking on a
+// guess.
+func (a *centralAPI) revokeCRSNamed(ctx context.Context, name string) error {
 	summaries, err := a.listCRSs(ctx)
 	if err != nil {
 		return err
@@ -416,6 +425,9 @@ func (a *centralAPI) revokeCRSsNamed(ctx context.Context, name string) error {
 	}
 	if len(ids) == 0 {
 		return fmt.Errorf("central lists no cluster registration secret named %q, so the recipe cannot free the name — the conflicting object must be removed in Central, or the run needs a different prefix", name)
+	}
+	if len(ids) > 1 {
+		return fmt.Errorf("central lists %d cluster registration secrets named %q (%s), so the recipe cannot pick which to revoke — remove the extras in Central or use a different prefix", len(ids), name, strings.Join(ids, ", "))
 	}
 	var resp struct {
 		RevokedIDs []string `json:"revokedIds"`
@@ -434,14 +446,8 @@ func (a *centralAPI) revokeCRSsNamed(ctx context.Context, name string) error {
 		}
 		return fmt.Errorf("central refused the revocation (%s)", strings.Join(refusals, "; "))
 	}
-	revoked := make(map[string]bool, len(resp.RevokedIDs))
-	for _, id := range resp.RevokedIDs {
-		revoked[id] = true
-	}
-	for _, id := range ids {
-		if !revoked[id] {
-			return fmt.Errorf("central's answer does not report %q as revoked", id)
-		}
+	if !slices.Contains(resp.RevokedIDs, ids[0]) {
+		return fmt.Errorf("central's answer does not report %q as revoked", ids[0])
 	}
 	return nil
 }

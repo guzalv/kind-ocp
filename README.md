@@ -214,12 +214,7 @@ create/verify plus the Compliance Operator proof) on PRs carrying the
 `integration` label, on manual dispatch, and nightly — the nightly run is
 the determinism signal for the pinned external inputs on a cold runner.
 Actions are SHA-pinned, permissions are `contents: read`, no secrets. The
-workflow is complete at `docs/ci-workflow.yaml` and staged for its
-operative path: automated development sessions cannot write `.github/`
-(a protected path), so moving it in place
-(`mkdir -p .github/workflows && git mv docs/ci-workflow.yaml
-.github/workflows/ci.yaml`) is the one manual step recorded in
-[docs/PLAN.md](docs/PLAN.md)'s increment-9 entry.
+workflow lives at `.github/workflows/ci.yaml`.
 
 ## Known limitations
 
