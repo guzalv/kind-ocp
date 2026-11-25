@@ -1,0 +1,108 @@
+# kind-ocp CI (BRIEF §10.3): lint + unit on every PR for fast
+# feedback; the Docker-gated integration suite (multi-cluster create,
+# verify, and the Compliance Operator fitness proof, ~30-60 min) only
+# where its cost is justified — PRs carrying the `integration` label,
+# manual dispatch, and a nightly run on the default branch whose
+# result is the determinism signal for the pinned external inputs
+# (node image, OLM release, CO catalog).
+#
+# Security posture, fixed by review:
+#   - Every action is SHA-pinned to the commit the version comment
+#     names; a floating tag cannot change what runs here.
+#   - The workflow-level permission grant is `contents: read` and no
+#     job grants more. The integration job runs PR code, so it must
+#     never hold a write token or a secret.
+#   - PR builds use plain `pull_request` — never `pull_request_target`,
+#     which would run the untrusted PR's code against the default
+#     branch's trusted context. The `labeled` activity type is
+#     included so adding the `integration` label re-evaluates the
+#     gate on an open PR.
+#   - Runners are GitHub-hosted and therefore ephemeral; the
+#     integration job needs nothing from this repository beyond its
+#     code.
+#
+# STAGED FILE — this is the complete workflow, byte-for-byte, but it
+# does not live at its operative path yet: the automated sessions that
+# develop this repo run under a sandbox that refuses writes to `.github/`
+# (a protected configuration path there), and evading that refusal is
+# not an option. The increment-9 release-readiness pass attempted the
+# move and was refused by the same policy. Move it into place from a
+# normal (non-automated) session —
+#
+#   mkdir -p .github/workflows
+#   git mv docs/ci-workflow.yaml .github/workflows/ci.yaml
+#
+# — and delete this paragraph. Until the repository is published the
+# file has no runner to execute it either way; the move is recorded as
+# the one remaining release-readiness action item in docs/PLAN.md's
+# increment-9 record.
+name: ci
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+  schedule:
+    # Nightly at 04:17 UTC: a quiet, arbitrary minute.
+    - cron: "17 4 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  lint-unit:
+    name: lint and unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing after the checkout needs the token; leaving it out
+          # keeps it off the runner and out of the job's git config.
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - name: Build and unit-test
+        run: make build test
+      - name: Lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          # Keep in step with the version the Makefile documents and
+          # local development uses; the config (.golangci.yml) is the
+          # committed one.
+          version: v2.15.0
+
+  integration:
+    name: integration (Docker)
+    # Label-gated on PRs (the label's addition re-runs this gate via
+    # the `labeled` activity type); always on dispatch and nightly.
+    # This job executes the PR's own code against a real Docker
+    # daemon: no secrets, no write token, ephemeral runner.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      contains(github.event.pull_request.labels.*.name, 'integration')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing after the checkout needs the token; leaving it out
+          # keeps it off the runner and out of the job's git config.
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      # The suite's Docker gate is environment-aware: locally it skips
+      # with a clear message when no daemon answers, but every CI
+      # runner sets CI=true and there the same condition fails the
+      # suite — a green run that skipped every test would be a false
+      # pass. The suite includes the CO fitness proof, which pulls the
+      # pinned node, OLM, and CO images per cluster.
+      - name: Run the integration suite
+        run: make integration
