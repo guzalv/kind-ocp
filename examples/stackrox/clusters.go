@@ -77,34 +77,29 @@ func ensureClusters(ctx context.Context, cfg *config.Config, log *slog.Logger) (
 // The two trees cannot overlap, and no comparison enforces that — the
 // construction does. The state root is resolved first (fscheck.ResolveDir
 // — it exists by now; the clusters were created first), and the
-// workspace is then *derived* from that resolved base through
-// fscheck.OpenDerivedDir: the resolved state base's own sibling, named
-// after the state root itself, holding one per-prefix directory. The
-// derivation follows no alias anywhere below the resolved anchor: a
-// symlink at the workspace base or leaf is refused outright, wherever
-// it points. That closes the case-insensitive hole a spelling check
-// cannot — on macOS volumes, `State` and `state` are one directory
-// while remaining two strings, so an alias planted at the workspace
-// base naming the state root in the other case passed every lexical
-// overlap check while pointing the credentials straight into the tree
-// `kind-ocp delete` removes. The refusal happens before anything is
-// created; the workspace the run writes through is exactly the sibling
-// the derivation named.
-//
-// The directory is opened through kind-ocp's own filesystem boundary
-// (internal/fscheck — the same policy the state tree walks; the example
-// ships in the same module, so it reuses the implementation instead of
-// forking it): every ancestor is verified before it is trusted,
-// substitutable ancestors are refused, and the derived tree is created
-// 0700 or verified caller-owned and private. The resolved path it
-// returns is the one the run writes through — never an alias.
+// workspace is then *derived* from that resolved base: the resolved
+// state base's own sibling, named after the state root itself, holding
+// one per-prefix directory. The derivation is entered through the same
+// walk the state store uses (fscheck.WalkDirNames) with the resolved
+// base's parent as the anchor and alias following disabled: the anchor's
+// components keep the ancestor policy, the two derived components get
+// the managed policy, and a symlink at the workspace base or leaf is
+// refused outright, wherever it points. That closes the
+// case-insensitive hole a spelling check cannot — on macOS volumes,
+// `State` and `state` are one directory while remaining two strings, so
+// an alias planted at the workspace base naming the state root in the
+// other case passed every lexical overlap check while pointing the
+// credentials straight into the tree `kind-ocp delete` removes. The
+// refusal happens before anything is created; the workspace the run
+// writes through is exactly the sibling the derivation named.
 func openWorkDir(cfg *config.Config) (string, error) {
 	stateBase, err := fscheck.ResolveDir(cfg.StateRoot)
 	if err != nil {
 		return "", fmt.Errorf("resolving the kind-ocp state root %s: %w", cfg.StateRoot, err)
 	}
-	resolved, err := fscheck.OpenDerivedDir(filepath.Dir(stateBase),
-		[]string{filepath.Base(stateBase) + workDirSuffix, cfg.Prefix})
+	anchorNames := fscheck.PathNames(filepath.Dir(stateBase))
+	names := append(anchorNames, filepath.Base(stateBase)+workDirSuffix, cfg.Prefix)
+	resolved, err := fscheck.WalkDirNames(names, len(anchorNames), fscheck.WalkOptions{Create: true})
 	if err != nil {
 		return "", fmt.Errorf("preparing the work directory beside the state root %s: %w", stateBase, err)
 	}

@@ -566,36 +566,60 @@ func TestNewCentralAPIRefusesABaseThatIsNotHTTPS(t *testing.T) {
 	}
 }
 
-// forwardResult is what startCentralPortForward returns, delivered
-// through a channel so a test can act on the forward while it starts.
-type forwardResult struct {
-	pf   *centralPortForward
-	base string
-	ctx  context.Context
-	err  error
-}
-
-// startForward runs startCentralPortForward under parent and delivers
-// its result on the returned channel.
-func startForward(parent context.Context, kubeconfig string) <-chan forwardResult {
-	ch := make(chan forwardResult, 1)
+// awaitForward runs the forward's readiness await in the background and
+// delivers its outcome, so a test can act on the forward — release the
+// dial, cancel the caller — while the startup is being awaited.
+func awaitForward(pf *centralPortForward) <-chan error {
+	ch := make(chan error, 1)
 	go func() {
-		pf, base, ctx, err := startCentralPortForward(parent, kubeconfig)
-		ch <- forwardResult{pf: pf, base: base, ctx: ctx, err: err}
+		_, _, err := pf.awaitReady()
+		ch <- err
 	}()
 	return ch
 }
 
-// portForwardAPIServer serves the two requests startCentralPortForward
-// makes around the tunnel: the Central pod list that finds the pod, and
-// the pod's portforward endpoint the SPDY dialer POSTs to. The
-// portforward request is held from the moment it arrives until the
-// returned release function runs, and is then answered with a plain 404
-// — never an upgrade — so ForwardPorts fails while starting. Holding
-// the request is what makes the forward observably "starting": the
-// dial is in flight, ForwardPorts has not returned, and the test can
-// act in that window. The returned kubeconfig points at the server the
-// way a kind kubeconfig points at a cluster.
+// waitArrived waits, bounded, for the forward's dial to reach the fake
+// API server — the point from which the startup is observably in
+// flight. Without the bound, a fixture that never serves the request
+// would wait out the whole package timeout instead of failing with the
+// thing that never happened named.
+func waitArrived(t *testing.T, arrived <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-arrived:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the port-forward request never reached the API server")
+	}
+}
+
+// waitForwardExit waits, bounded, for the tunnel's goroutine to exit:
+// the forward's completion signal, which fires only after any failure
+// of its own was published as the lifetime's cause.
+func waitForwardExit(t *testing.T, pf *centralPortForward) {
+	t.Helper()
+	select {
+	case <-pf.done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the port-forward's goroutine did not exit after the dial failed")
+	}
+}
+
+// portForwardAPIServer serves the two requests the forward makes around
+// the tunnel: the Central pod list that finds the pod, and the pod's
+// portforward endpoint the SPDY dialer POSTs to. The portforward
+// request is held from the moment it arrives until the returned release
+// function runs, and is then answered with a plain 404 — never an
+// upgrade — so ForwardPorts fails while starting. Holding the request
+// is what makes the forward observably "starting": the dial is in
+// flight, ForwardPorts has not returned, and the test can act in that
+// window. The returned kubeconfig points at the server the way a kind
+// kubeconfig points at a cluster.
+//
+// release is idempotent and registered for cleanup: the server's Close
+// waits for outstanding handlers, so a test that ends while the request
+// is still held — a failed assertion, a bounded wait that fired — would
+// otherwise hang the binary at cleanup instead of failing. Cleanups run
+// last-registered-first, so the release runs before that Close.
 func portForwardAPIServer(t *testing.T) (kubeconfigPath string, arrived <-chan struct{}, release func()) {
 	t.Helper()
 	var arrivedOnce sync.Once
@@ -640,74 +664,96 @@ users:
 	if err := os.WriteFile(kubeconfig, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return kubeconfig, arrivedCh, func() { close(releaseCh) }
+	release = sync.OnceFunc(func() { close(releaseCh) })
+	t.Cleanup(release)
+	return kubeconfig, arrivedCh, release
 }
 
 // A tunnel that dies on its own while starting reports its failure as
 // the startup result: the failure is published as the lifetime
-// context's cause, and the selector reads it back from there. Receiving
-// the result proves the publication completed — the answer is ordered
-// after the cause by the context's own synchronization.
-func TestStartCentralPortForwardReportsATunnelThatDiesWhileStarting(t *testing.T) {
+// context's cause, and the readiness await reads it back from there.
+// Receiving the result proves the publication completed — the answer is
+// ordered after the cause by the context's own synchronization, so no
+// further signal is needed here.
+func TestAwaitReadyReportsATunnelThatDiesWhileStarting(t *testing.T) {
 	kubeconfig, arrived, release := portForwardAPIServer(t)
-	done := startForward(context.Background(), kubeconfig)
-	<-arrived
+	pf, err := startCentralPortForward(context.Background(), kubeconfig)
+	if err != nil {
+		t.Fatalf("startCentralPortForward = %v", err)
+	}
+	defer pf.close()
+	startup := awaitForward(pf)
+
+	waitArrived(t, arrived)
 	release()
 
 	select {
-	case r := <-done:
-		if r.err == nil {
-			t.Fatal("startCentralPortForward succeeded although the API server refused the upgrade")
+	case err := <-startup:
+		if err == nil {
+			t.Fatal("awaitReady succeeded although the API server refused the upgrade")
 		}
 		for _, want := range []string{"before becoming ready", "upgrading connection"} {
-			if !strings.Contains(r.err.Error(), want) {
-				t.Errorf("the error %q does not name %q — the tunnel's own failure must be the startup result", r.err.Error(), want)
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the error %q does not name %q — the tunnel's own failure must be the startup result", err.Error(), want)
 			}
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("startCentralPortForward did not return after the dial failed")
+		t.Fatal("awaitReady did not return after the dial failed")
 	}
 }
 
-// The parent's cancellation while the forward is starting must surface
+// The caller's cancellation while the forward is starting must surface
 // as the startup result with no synchronization on the tunnel's own
 // outcome: the tunnel's goroutine publishes its error through the
 // context cause (WithCancelCause), never through shared state the
-// selector could read while it is still being written.
+// readiness await could read while it is still being written.
 //
-// The result is received only after the held dial has failed on
-// purpose. The selector's answer races the goroutine's publication, and
-// receiving the buffered result first would order the two through the
-// result channel; the interleaving this test exists for is the one
-// where the parent's cancellation is answered while ForwardPorts is
-// still returning, and the publication lands afterwards. Under -race
-// that pair is exactly the unsynchronized read-and-write the cause
-// mechanism replaced.
-func TestStartCentralPortForwardReportsParentCancellationWhileStarting(t *testing.T) {
+// The interleaving under test: the caller cancels while the dial is
+// still parked in the server, the await answers context.Canceled, and
+// the goroutine's publication only lands afterwards — the exact
+// read-and-write pair that, as a shared variable, the cause mechanism
+// replaced. The test releases the dial before receiving the startup
+// result, so the scenario stays the one being pinned: the publication
+// lands while the answer is already decided. That it landed is observed
+// through the forward's own completion signal — the goroutine's exit,
+// which happens only after the publication — and not through the
+// startup result, so nothing about the receive orders the two. Under
+// -race the pair above is the unsynchronized read-and-write the cause
+// mechanism removed.
+func TestAwaitReadyReportsParentCancellationWhileStarting(t *testing.T) {
 	kubeconfig, arrived, release := portForwardAPIServer(t)
 	parent, cancelParent := context.WithCancel(context.Background())
-	done := startForward(parent, kubeconfig)
-	<-arrived
+	defer cancelParent()
+	pf, err := startCentralPortForward(parent, kubeconfig)
+	if err != nil {
+		t.Fatalf("startCentralPortForward = %v", err)
+	}
+	defer pf.close()
+	startup := awaitForward(pf)
 
-	// The selector answers here: the parent's cancellation closes the
-	// lifetime while the dial is still parked in the server.
+	// The dial is parked in the server: the startup is observably in
+	// flight, and the caller's cancellation closes the lifetime while it
+	// stays parked — the await answers with the caller's cancellation.
+	waitArrived(t, arrived)
 	cancelParent()
 
-	// Let the held dial fail and the forward's goroutine publish its
-	// outcome while the selector's answer is already decided: release
-	// the server's refusal and give the client the moment loopback
-	// needs to finish the request. The result stays buffered in the
-	// channel meanwhile.
+	// The dial fails on purpose with the await's answer already
+	// decided: the goroutine publishes its failure (a no-op — the first
+	// cause, the caller's cancellation, won) and exits.
 	release()
-	time.Sleep(150 * time.Millisecond)
+
+	// The completion signal, observed before the startup result is
+	// received: the publication is guaranteed to have landed while the
+	// already-decided answer sits buffered in the channel.
+	waitForwardExit(t, pf)
 
 	select {
-	case r := <-done:
-		if r.err == nil || !errors.Is(r.err, context.Canceled) {
-			t.Fatalf("startCentralPortForward under parent cancellation = %v, want context.Canceled", r.err)
+	case err := <-startup:
+		if err == nil || !errors.Is(err, context.Canceled) {
+			t.Fatalf("awaitReady under caller cancellation = %v, want context.Canceled", err)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("startCentralPortForward did not return after the parent was cancelled")
+		t.Fatal("awaitReady did not return after the caller was cancelled")
 	}
 }
 

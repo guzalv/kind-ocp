@@ -196,37 +196,13 @@ func validateNames(names []string) error {
 	return nil
 }
 
-// OpenManagedDir prepares one managed directory at path: every component
-// above the last is held to the ancestor policy (shared system
-// directories are tolerable, substitutable ones are not), trusted
-// ancestor symlinks are resolved hop by hop, and the last component is
-// created 0700 or verified caller-owned, private, and symlink-free. It
-// returns the fully-resolved path — the one to use for everything below
-// the directory; the alias path it started from may resolve elsewhere
-// later.
-//
-// It is the state tree's boundary offered to kind-ocp's in-repo tools
-// that keep credentials outside the state root (the StackRox example's
-// work directory): the same rules, one implementation. A relative path
-// is resolved against the working directory first.
-func OpenManagedDir(path string) (string, error) {
-	if abs, err := filepath.Abs(path); err == nil {
-		path = abs
-	}
-	names := PathNames(path)
-	if len(names) == 0 {
-		return "", fmt.Errorf("%s is the filesystem root; refusing to manage it", path)
-	}
-	return WalkDirNames(names, len(names)-1, WalkOptions{Create: true, FollowAliases: true})
-}
-
 // ResolveDir resolves an existing directory through the ancestor policy:
 // trusted aliases are followed hop by hop, every component of the chain
 // (the target's included) is checked, and nothing is created or written.
 // It returns the fully-resolved path — where the directory really sits,
 // not the alias it was named by.
 //
-// It is the look-before-you-manage companion to OpenManagedDir, for
+// It is the look-before-you-manage companion to a creating walk, for
 // callers that must keep two trees apart by their resolved locations:
 // the StackRox example resolves the kind-ocp state root before deriving
 // its credential workspace beside it, so no alias of either path can
@@ -239,9 +215,9 @@ func OpenManagedDir(path string) (string, error) {
 // case-insensitive filesystem resolves to one directory stay two names
 // after the walk, so callers that must keep the resolved location apart
 // from another tree cannot compare paths as strings — they derive the
-// other tree through OpenDerivedDir instead, which never follows an
-// alias and therefore never lands on a spelling the derivation did not
-// choose.
+// other tree from the resolved location instead, through a WalkDirNames
+// call that follows no alias and therefore never lands on a spelling
+// the derivation did not choose.
 func ResolveDir(path string) (string, error) {
 	if abs, err := filepath.Abs(path); err == nil {
 		path = abs
@@ -251,48 +227,6 @@ func ResolveDir(path string) (string, error) {
 		return "", fmt.Errorf("%s is the filesystem root; refusing to resolve it", path)
 	}
 	return WalkDirNames(names, len(names), WalkOptions{FollowAliases: true})
-}
-
-// OpenDerivedDir opens the managed directory at anchor joined with
-// names, for trees a caller derives beside an existing one. anchor must
-// be a fully-resolved, symlink-free directory — a path a walk returned
-// (ResolveDir's, WalkDirNames' own) or a prefix of one; names are the
-// derived components, plain single names, and the first of them is the
-// root of the new managed tree.
-//
-// The whole chain is walked with alias following disabled. A symlink
-// among anchor's components means an entry was substituted since the
-// chain was resolved, and a symlink among names is redirection, not
-// resolution: the caller chose those components, so the walk refuses
-// the alias wherever it points instead of following it. The derived
-// components are created 0700 or verified caller-owned, private, and
-// symlink-free (the managed policy); anchor's components are held to
-// the ancestor policy. Missing anchor components are created like
-// OpenManagedDir creates them, though a resolved anchor exists by
-// construction. It returns the path the run must use below the
-// directory.
-//
-// Entering a derived chain without following aliases is what keeps two
-// trees apart without comparing spellings: the derived tree's location
-// is fixed by the resolved anchor and the derived names alone, and on a
-// case-insensitive filesystem — where two spellings can name one
-// directory, so lexical comparison of two resolved paths proves
-// nothing — no alias is followed to a spelling the derivation never
-// chose. The StackRox example opens its credential workspace this way,
-// beside the resolved kind-ocp state root: the workspace's base is a
-// sibling named after the state root, and a symlink planted at that
-// base — whatever directory it names, in whatever spelling — is
-// refused before anything is created below it.
-func OpenDerivedDir(anchor string, names []string) (string, error) {
-	if abs, err := filepath.Abs(anchor); err == nil {
-		anchor = abs
-	}
-	if len(names) == 0 {
-		return "", fmt.Errorf("no directory to open below %s", anchor)
-	}
-	anchorNames := PathNames(anchor)
-	all := append(append([]string(nil), anchorNames...), names...)
-	return WalkDirNames(all, len(anchorNames), WalkOptions{Create: true})
 }
 
 // MaxAliasHops is the walk's own work limit: the total number of

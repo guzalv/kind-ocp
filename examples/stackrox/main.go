@@ -169,11 +169,15 @@ func deploy(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("reading Central's serving CA on %s: %w", centralCluster, err)
 	}
-	pf, apiBase, apiCtx, err := startCentralPortForward(ctx, centralKubeconfig)
+	pf, err := startCentralPortForward(ctx, centralKubeconfig)
 	if err != nil {
 		return fmt.Errorf("port-forwarding to Central on %s: %w", centralCluster, err)
 	}
 	defer pf.close()
+	apiBase, apiCtx, err := pf.awaitReady()
+	if err != nil {
+		return fmt.Errorf("port-forwarding to Central on %s: %w", centralCluster, err)
+	}
 
 	api, err := newCentralAPI(apiBase, password, caPEM)
 	if err != nil {

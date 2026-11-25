@@ -819,8 +819,8 @@ that pin them, and §3.
   predictable path there has substitutable parents, and tmp reaping
   would silently invalidate the reused admin password), opened through
   the state tree's walk. The walk loop itself moved from internal/state
-  to `internal/fscheck` (`WalkDirNames`, `OpenManagedDir`) so the store
-  and the example share one implementation; the store keeps its marker
+  to `internal/fscheck` (`WalkDirNames`) so the store and the example
+  share one implementation; the store keeps its marker
   and exclusive-creation semantics through the walk's options. Every
   credential file (admin password, values files) is checked private
   before each read and write — a symlinked or shared file is refused,
@@ -834,15 +834,21 @@ that pin them, and §3.
   workspace can no longer meet the state tree for any state root or
   any spelling of one: it is derived from the *resolved* state base
   (fscheck gained `ResolveDir` — the look-before-you-manage companion
-  to `OpenManagedDir`, an existence-requiring, alias-resolving,
+  to a creating walk, an existence-requiring, alias-resolving,
   non-writing walk) as a sibling named after the state root itself
   (`<resolved state base>-stackrox-example/<prefix>`; the default
   state root keeps the documented `kind-ocp-stackrox-example`
-  location), and it is opened through a second fscheck entry point,
-  `OpenDerivedDir`, which walks the whole chain with alias following
-  disabled: a symlink at the derived base or leaf is refused wherever
-  it points, and the anchor components are re-verified as the
-  symlink-free chain the resolution returned. Disjointness holds by
+  location), and it is opened through the same `WalkDirNames` the
+  store uses, with the resolved base's parent as the anchor
+  (`managedFrom` at the anchor's component count, `Create` only, no
+  alias following anywhere in the chain): a symlink at the derived
+  base or leaf is refused wherever it points, and the anchor
+  components are re-verified as the symlink-free chain the resolution
+  returned. The example therefore adds no fscheck entry point of its
+  own — the wrappers an earlier round carried (`OpenManagedDir`,
+  `OpenDerivedDir`) were folded back into the one walk, their
+  behaviors pinned where their callers live (the state store's walks,
+  and the app-level workspace regressions below). Disjointness holds by
   construction, with no path comparison left to fool — on a
   case-insensitive volume (macOS, a supported platform) `State` and
   `state` are one directory while remaining two strings, which is
@@ -874,14 +880,27 @@ that pin them, and §3.
   `ForwardPorts` returns. That context is cause-carrying
   (`context.WithCancelCause`): the tunnel's own failure is published
   as the context's cause in the same synchronized step that closes it,
-  so a parent cancellation racing the startup reads either the fully
+  so a caller cancellation racing the startup reads either the fully
   published cause or none — never a shared variable the forward's
-  goroutine might still be writing (the selector's earlier direct read
-  of that variable raced the parent's cancellation while
+  goroutine might still be writing (the readiness await's earlier
+  direct read of that variable raced the caller's cancellation while
   `ForwardPorts` was still returning; the startup regression pins
-  exactly that interleaving — the parent cancels while the dial is
-  parked in the API server, and the race detector reports the old
-  shape's unsynchronized pair while the cause mechanism stays clean).
+  exactly that interleaving — the caller cancels while the dial is
+  parked in the API server, and the race detector reports a shared
+  variable reintroduced in that spot three runs out of three while
+  the cause mechanism stays clean). The startup itself is split so
+  the tunnel's exit is observable without synchronizing on its
+  outcome: `startCentralPortForward` returns a handle as soon as the
+  tunnel is starting, `awaitReady` on that handle reports the startup
+  result, and the tunnel's goroutine closes the handle's `done`
+  channel after its cause publication — the completion signal. The
+  startup regressions wait on that signal (bounded, as every wait in
+  the suite is) before receiving the startup result, which is what
+  proves the publication landed while the already-decided answer sat
+  buffered — no sleep, and no reliance on the result channel for
+  ordering. The fixture that holds the dial releases it on cleanup,
+  so a failure anywhere in the test still tears the parked request
+  down.
   Regression tests pin the boundary: an untrusted TLS peer (right
   name, different issuer — everything a local squatter can forge)
   receives no request at all, a redirect target receives no request
