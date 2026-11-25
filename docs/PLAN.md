@@ -717,7 +717,7 @@ that pin them, and §3.
   the full uncached suite (including the CO proof's per-cluster image
   pulls) runs in ~17–18 minutes against the Makefile's 60m go test budget
   and the CI job's 90m.
-- [x] **9. StackRox example + docs + release readiness.** `examples/stackrox`
+- [ ] **9. StackRox example + docs + release readiness.** `examples/stackrox`
   recipe: Central on cluster 1, Sensor on 2..N over NodePort on the shared
   network, released public images, collector disabled. The recipe is a
   `package main` (structurally unimportable — the create path can never
@@ -787,11 +787,19 @@ that pin them, and §3.
   The CI workflow move (`docs/ci-workflow.yaml` →
   `.github/workflows/ci.yaml`) was attempted and refused by the
   workflow-node sandbox: `.github/` is a protected configuration path for
-  every tool in these sessions, the same policy increment 8 recorded. The
-  file remains staged with its one-command move instruction in the header;
-  it must be moved in a normal (non-workflow) session before publishing —
-  until then it has no runner either way, because the repository is not
-  yet published.
+  every tool in these sessions, the same policy increment 8 recorded.
+  DONE since the last pass: an authorized normal session moved the file
+  (commit `63e1d13`) — AC-6.7 is satisfied. Remove the staged-move
+  instructions and the restriction narrative from the consumer-facing
+  docs in this pass.
+  Outstanding from the last review (P1, must fix before release):
+  `examples/stackrox/central.go` CRS conflict handling collects and
+  revokes every same-named match, then verifies batch coverage — no
+  requirement needs batch revocation, and Central's `IssueCRS`
+  `store.Add` rejects duplicate active names. Resolve exactly one named
+  ID, reject zero or ambiguous matches before PATCH, and check the one
+  returned ID while preserving the response-error check. Keep the 409
+  re-run regression passing.
   Carried gate findings folded in: the failed-build regression's fake `go`
   emits a unique stderr marker and the test asserts it in the returned
   error (proving the fake ran, not that go failed to start);
