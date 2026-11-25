@@ -156,16 +156,29 @@ func deploy(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	// localhost port-forward (the Docker network's node addresses are not
 	// reachable from the host on every platform; the Sensors, running in
 	// containers on the shared network, use the endpoint above). Every
-	// authenticated call runs under the forward's own context: it is
-	// cancelled when the tunnel exits, so the admin password never travels
-	// to a local port the forward no longer owns.
+	// authenticated call runs under the forward's own context: one
+	// context is the forward's lifetime, so the tunnel's death or close
+	// fails the calls instead of letting them dial a local port the
+	// forward no longer owns. And the calls authenticate Central itself
+	// before any credential is sent: the client verifies the TLS peer
+	// against the CA read from the central-tls secret through this
+	// cluster's own Kubernetes API, and refuses to follow redirects, so
+	// the admin password only ever reaches a peer that presented the
+	// certificate the chart's CA issued.
+	caPEM, err := centralCAPEM(ctx, centralCS)
+	if err != nil {
+		return fmt.Errorf("reading Central's serving CA on %s: %w", centralCluster, err)
+	}
 	pf, apiBase, apiCtx, err := startCentralPortForward(ctx, centralKubeconfig)
 	if err != nil {
 		return fmt.Errorf("port-forwarding to Central on %s: %w", centralCluster, err)
 	}
 	defer pf.close()
 
-	api := newCentralAPI(apiBase, password)
+	api, err := newCentralAPI(apiBase, password, caPEM)
+	if err != nil {
+		return err
+	}
 	if err := waitForCentral(apiCtx, api, centralReadyTimeout, log); err != nil {
 		return err
 	}

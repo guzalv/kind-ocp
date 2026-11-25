@@ -1,6 +1,8 @@
 package fscheck
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +13,75 @@ import (
 // every test here mirrors a rule the state store's walks pin, through the
 // generic entry point other in-repo tools (the StackRox example's
 // credential workspace) use.
+
+// ResolveDir never writes and never adopts: it answers where an existing
+// directory sits. The three refusals below mirror the walk's ancestor
+// rules — the resolution must not depend on entries another local user
+// can substitute.
+func TestResolveDirResolvesWithoutCreating(t *testing.T) {
+	base := t.TempDir()
+	target := filepath.Join(base, "real-home", "state")
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "alias-home")
+	if err := os.Symlink(filepath.Dir(target), link); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ResolveDir(filepath.Join(link, "state"))
+	if err != nil {
+		t.Fatalf("ResolveDir through an alias = %v", err)
+	}
+	resolved, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != resolved {
+		t.Errorf("ResolveDir = %q, want the resolved target %q", got, resolved)
+	}
+
+	// A missing directory is the one honest "cannot resolve": the
+	// comparison a caller needs cannot be made up for a path that does
+	// not exist.
+	if _, err := ResolveDir(filepath.Join(base, "absent")); err == nil || !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("ResolveDir on a missing dir = %v, want an fs.ErrNotExist error", err)
+	}
+	if _, err := ResolveDir(filepath.Join(base, "alias-home", "absent")); err == nil || !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("ResolveDir through an alias at a missing dir = %v, want an fs.ErrNotExist error", err)
+	}
+
+	// Nothing was created along the way.
+	if _, err := os.Lstat(filepath.Join(base, "absent")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("ResolveDir created %q, want no writes", filepath.Join(base, "absent"))
+	}
+}
+
+func TestResolveDirRefusesUntrustedChains(t *testing.T) {
+	base := t.TempDir()
+	shared := filepath.Join(base, "shared")
+	if err := os.Mkdir(shared, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Chmod, not Mkdir: the mode bits survive the umask this way.
+	if err := os.Chmod(shared, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	t.Run("substitutable target component", func(t *testing.T) {
+		if _, err := ResolveDir(filepath.Join(shared, "dir")); err == nil || !strings.Contains(err.Error(), "writable") {
+			t.Fatalf("ResolveDir below a substitutable dir = %v, want a rejection", err)
+		}
+	})
+	t.Run("not a directory", func(t *testing.T) {
+		file := filepath.Join(base, "plain-file")
+		if err := os.WriteFile(file, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ResolveDir(file); err == nil || !strings.Contains(err.Error(), "not a directory") {
+			t.Fatalf("ResolveDir on a file = %v, want a type rejection", err)
+		}
+	})
+}
 
 func TestOpenManagedDirCreatesAndAdopts(t *testing.T) {
 	base := t.TempDir()

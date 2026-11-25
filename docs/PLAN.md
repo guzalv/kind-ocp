@@ -721,9 +721,13 @@ that pin them, and §3.
   recipe: Central on cluster 1, Sensor on 2..N over NodePort on the shared
   network, released public images, collector disabled. The recipe is a
   `package main` (structurally unimportable — the create path can never
-  reach it) that uses only kind-ocp's public surface (`config.Resolve`,
+  reach it) that uses kind-ocp's public surface (`config.Resolve`,
   `kindocp.New/Create/Kubeconfig`) plus standard client-go, the way an
-  outside consumer would. It pins the two StackRox chart tarballs
+  outside consumer would — with one deliberate exception: its credential
+  workspace is verified through kind-ocp's internal filesystem boundary
+  (`internal/fscheck`), the same policy the state tree walks, reused
+  rather than forked (an outside consumer would keep its credentials
+  under a caller-owned directory it verifies itself). It pins the two StackRox chart tarballs
   (stackrox-central-services and stackrox-secured-cluster-services 500.0.0,
   appVersion 5.0.0 — released public images `quay.io/stackrox-io/main:5.0.0`
   and `central-db:5.0.0`), fetching them once per run from
@@ -826,6 +830,45 @@ that pin them, and §3.
   listen-close-use window, and ready can no longer mean an IPv6 bind
   whose IPv4 twin was taken), and every authenticated API call runs
   under a context cancelled the moment the forward exits.
+  The review round after that closed two P1s. First, the workspace can
+  no longer coincide with the state tree for any state root: it is
+  derived from the *resolved* state base (fscheck gained `ResolveDir` —
+  the look-before-you-manage companion to `OpenManagedDir`, an
+  existence-requiring, alias-resolving, non-writing walk) as a sibling
+  named after the state root itself (`<resolved state
+  base>-stackrox-example/<prefix>`; the default state root keeps the
+  documented `kind-ocp-stackrox-example` location), so a
+  `--state-root` ending in the workspace's own name derives a distinct
+  sibling instead of landing on the per-prefix state directory.
+  Resolved overlap in either direction — a workspace alias pointing
+  into the state tree (which would put the credentials where
+  `kind-ocp delete` removes them), or a state root inside the workspace
+  — is refused before anything is created, and the final resolved
+  workspace is held to the same rule again. Second, the Central client
+  authenticates Central before any credential is sent: the TLS peer
+  must present a certificate chaining to the CA the chart's install
+  hook wrote into the `central-tls` secret — read through the
+  authenticated Kubernetes API, not through the tunnel — and the
+  certificate is verified as `central.stackrox.svc`, the DNS name the
+  chart's generated certificate always carries. Redirect answers are
+  refused (Go's default client follows redirects and preserves the
+  Authorization header across port changes on the same hostname), and a
+  base URL that is not https is refused outright. This is what makes
+  the port-forward's teardown window harmless — inside client-go,
+  `ForwardPorts` releases its listener in a defer before the wrapper's
+  context cancellation lands, and a local process rebinding the port in
+  that window cannot present Central's certificate, so the handshake
+  fails before any credential is sent. The forward's lifecycle collapsed
+  to one cancel function (`NewOnAddressesWithContext`): a single
+  context is the forward's stop signal, the lifetime every API call
+  runs under, and the thing the goroutine cancels the moment
+  `ForwardPorts` returns. Regression tests pin the boundary: an
+  untrusted TLS peer (right name, different issuer — everything a local
+  squatter can forge) receives no request at all, a redirect target
+  receives no request and no Authorization header, the colliding state
+  root basename derives a distinct sibling, and both alias-overlap
+  shapes are refused without writes. The README documents that
+  `kind-ocp delete` leaves the work directory and how to remove it.
 ## 6. Testing strategy
 
 - Unit (no Docker): config resolution and precedence, per-cluster overrides,

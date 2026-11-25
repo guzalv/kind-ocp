@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/netip"
 	"net/url"
 	"path/filepath"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -68,10 +70,25 @@ func ensureClusters(ctx context.Context, cfg *config.Config, log *slog.Logger) (
 // chart archives are extracted and the secret values files are written.
 // It sits beside kind-ocp's state root — the same caller-owned
 // neighborhood — and deliberately neither inside the state root (the
-// store's verified tree holds kind-ocp's own state, not foreign files)
-// nor under the system temporary directory (a predictable path there
-// has parents another local user can substitute, and tmp reaping would
-// silently invalidate the reused admin password).
+// store's verified tree holds kind-ocp's own state, not foreign files;
+// `kind-ocp delete` removes that tree, credentials included, so the two
+// must never overlap) nor under the system temporary directory (a
+// predictable path there has parents another local user can substitute,
+// and tmp reaping would silently invalidate the reused admin password).
+//
+// The location is derived from the resolved state base, not the
+// configured spelling: the state root is resolved through kind-ocp's own
+// walk (fscheck.ResolveDir — it exists by now; the clusters were created
+// first), and the workspace is its sibling named after the state root
+// itself. Deriving from the resolved base makes the workspace a distinct
+// sibling by construction: no state root spelling — not even one ending
+// in the workspace's own name — can make the two trees coincide, and
+// aliases in the configured spelling cannot move one inside the other.
+// What an alias of the workspace itself could still do is resolved and
+// refused: before anything is created, an existing workspace base is
+// resolved and held disjoint from the state root, and the final resolved
+// workspace is checked against the same rule again — the invariant holds
+// for the exact path the run writes through.
 //
 // The directory is opened through kind-ocp's own filesystem boundary
 // (internal/fscheck — the same policy the state tree walks; the example
@@ -82,17 +99,63 @@ func ensureClusters(ctx context.Context, cfg *config.Config, log *slog.Logger) (
 // resolved path it returns is the one the run writes through — never
 // the alias it started from.
 func openWorkDir(cfg *config.Config) (string, error) {
-	dir := filepath.Join(filepath.Dir(cfg.StateRoot), workDirName, cfg.Prefix)
+	stateBase, err := fscheck.ResolveDir(cfg.StateRoot)
+	if err != nil {
+		return "", fmt.Errorf("resolving the kind-ocp state root %s: %w", cfg.StateRoot, err)
+	}
+	workBase := filepath.Join(filepath.Dir(stateBase), filepath.Base(stateBase)+workDirSuffix)
+
+	// An existing workspace base may be an alias — including one into
+	// the state tree. Resolve and refuse that before anything is
+	// created below it; a missing base is the one shape that cannot
+	// hide an alias (nothing is there to point anywhere), and it is
+	// left to the creating walk below.
+	if resolved, err := fscheck.ResolveDir(workBase); err == nil {
+		if err := refuseTreeOverlap(resolved, stateBase); err != nil {
+			return "", err
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return "", fmt.Errorf("resolving the work directory base %s: %w", workBase, err)
+	}
+
+	dir := filepath.Join(workBase, cfg.Prefix)
 	resolved, err := fscheck.OpenManagedDir(dir)
 	if err != nil {
 		return "", fmt.Errorf("preparing the work directory %s: %w", dir, err)
 	}
+	if err := refuseTreeOverlap(resolved, stateBase); err != nil {
+		return "", err
+	}
 	return resolved, nil
 }
 
-// workDirName is the workspace directory beside the state root: a
-// sibling of the state root itself, holding one per-prefix directory.
-const workDirName = "kind-ocp-stackrox-example"
+// refuseTreeOverlap reports an error when the credential workspace and
+// the kind-ocp state tree are not disjoint. Both paths arrive fully
+// resolved, so the rule holds for the trees as the run will actually
+// write them. A workspace inside the state root would have its
+// credentials removed by `kind-ocp delete`; a state root inside the
+// workspace would sweep kind-ocp's state through the credential
+// directory. Either way the run stops before any credential exists.
+func refuseTreeOverlap(work, stateBase string) error {
+	if work == stateBase || strings.HasPrefix(work, stateBase+string(filepath.Separator)) {
+		return fmt.Errorf(
+			"the work directory %s resolves inside the kind-ocp state root %s — the workspace must stay outside it (kind-ocp delete removes the state tree, credentials included); point the state root or the workspace elsewhere",
+			work, stateBase)
+	}
+	if strings.HasPrefix(stateBase, work+string(filepath.Separator)) {
+		return fmt.Errorf(
+			"the kind-ocp state root %s resolves inside the work directory %s — the two trees must stay disjoint; point the state root or the workspace elsewhere",
+			stateBase, work)
+	}
+	return nil
+}
+
+// workDirSuffix names the workspace beside the state root: the resolved
+// state base's own name with this suffix, holding one per-prefix
+// directory. The default state root (…/kind-ocp) therefore keeps the
+// workspace at …/kind-ocp-stackrox-example, and no state root can
+// derive a workspace that coincides with it.
+const workDirSuffix = "-stackrox-example"
 
 // restConfigFor loads a kubeconfig the way an outside consumer does: the
 // explicit path, no ambient context merging. kind-ocp's state kubeconfigs
@@ -127,7 +190,45 @@ const (
 	centralExposureName = "central-loadbalancer"
 	centralPodLabel     = "app=central"
 	centralPodPort      = 8443
+
+	// centralTLSSecretName is the secret the chart's pre-install hook
+	// writes: Central's serving certificate, its private key, and the
+	// CA that signed them (ca.pem). The example reads the CA through
+	// the authenticated Kubernetes API and verifies the port-forwarded
+	// Central with it — the trust the cluster's own admin already
+	// holds, not a leap of faith in whatever answers on the local port.
+	centralTLSSecretName = "central-tls"
+
+	// centralTLSCAKey is the CA entry inside the central-tls secret.
+	centralTLSCAKey = "ca.pem"
+
+	// centralTLSServerName is the DNS name the chart's generated
+	// serving certificate carries (the chart's computeSANs always
+	// includes the fixed `stackrox` namespace and the `central` service
+	// base name). The client dials the forwarded loopback address but
+	// verifies the certificate against this name, so a certificate
+	// without Central's identity does not pass even when the TCP
+	// endpoint is the right one.
+	centralTLSServerName = "central.stackrox.svc"
 )
+
+// centralCAPEM returns the CA that roots Central's serving certificate.
+// It is read through the authenticated Kubernetes API — the same
+// kubeconfig the port-forward itself uses — from the secret the chart's
+// install hook wrote, so the trust in Central's identity is anchored
+// where the cluster's own authentication already is, not in the tunnel.
+func centralCAPEM(ctx context.Context, cs kubernetes.Interface) ([]byte, error) {
+	secret, err := cs.CoreV1().Secrets(stackroxNamespace).Get(ctx, centralTLSSecretName, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("reading secret %s/%s (the chart's install hook writes it; was Central deployed with the central-services chart?): %w",
+			stackroxNamespace, centralTLSSecretName, err)
+	}
+	caPEM := secret.Data[centralTLSCAKey]
+	if len(caPEM) == 0 {
+		return nil, fmt.Errorf("secret %s/%s carries no %q entry", stackroxNamespace, centralTLSSecretName, centralTLSCAKey)
+	}
+	return caPEM, nil
+}
 
 // centralEndpoint resolves the address Sensors use to reach Central: the
 // central cluster's control-plane node address on the shared kind network

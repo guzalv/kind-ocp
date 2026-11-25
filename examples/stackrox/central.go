@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -31,18 +32,13 @@ import (
 // talks to the pod the way `kubectl port-forward` does — through the same
 // client-go machinery.
 type centralPortForward struct {
-	stop   chan struct{}
 	cancel context.CancelFunc
 }
 
-// close tears the tunnel down and cancels the API context with it. It is
-// safe to call more than once.
+// close tears the tunnel down and fails every call running under its
+// context. It is safe to call more than once: context cancellation is
+// idempotent.
 func (p *centralPortForward) close() {
-	select {
-	case <-p.stop:
-	default:
-		close(p.stop)
-	}
 	p.cancel()
 }
 
@@ -50,9 +46,11 @@ func (p *centralPortForward) close() {
 // cluster and forwards a local port to the pod's API port (the service's
 // 443 behind it). It returns the forward — close it when done — the
 // https base URL to talk to, and the context every authenticated call
-// must use: that context is cancelled the moment the forward exits, so a
-// dead tunnel fails the calls instead of letting them dial a local port
-// any process could have rebound.
+// must use: one context is the forward's whole lifetime. ForwardPorts
+// stops when it is cancelled, every API call runs under it, and the
+// goroutine below cancels it the moment ForwardPorts returns — so the
+// tunnel's death, its close, and the parent's cancellation all fail the
+// calls instead of letting them dial a port the forward no longer owns.
 //
 // The listener is bound by client-go itself, on 127.0.0.1 only, with
 // local port 0: the kernel picks the port and the forwarder reports the
@@ -62,6 +60,14 @@ func (p *centralPortForward) close() {
 // "localhost" default also binds ::1 and reports ready when only that
 // side came up, while this client dials 127.0.0.1 and would reach
 // whatever holds the IPv4 port instead.
+//
+// The context being the lifetime closes the intent, not the wire: inside
+// client-go, ForwardPorts closes its listeners in a defer before it
+// returns, so a few instructions can pass between the port's release and
+// this side's cancellation. What actually keeps the admin password off
+// whatever rebinds the port in that window is the client's own
+// authentication of Central (see centralAPI): a request is only sent to
+// a peer that presented the certificate the chart's CA issued.
 func startCentralPortForward(ctx context.Context, kubeconfigPath string) (*centralPortForward, string, context.Context, error) {
 	cs, restConfig, err := clientsetFor(kubeconfigPath)
 	if err != nil {
@@ -88,30 +94,23 @@ func startCentralPortForward(ctx context.Context, kubeconfigPath string) (*centr
 	}
 	dialer := spdy.NewDialer(upgrader, &http.Client{Transport: roundTripper}, http.MethodPost, forwardURL)
 
-	stop := make(chan struct{})
 	ready := make(chan struct{})
 	// The forwarder's own progress messages go to the run's stderr: they
 	// are part of the evidence, and a tunnel that never comes up should
 	// say so where the run can see it. Ports are "local:remote" pairs;
 	// local 0 makes the forwarder bind and report the port itself.
-	fw, err := portforward.NewOnAddresses(dialer, []string{"127.0.0.1"},
-		[]string{fmt.Sprintf("0:%d", centralPodPort)}, stop, ready, os.Stderr, os.Stderr)
+	pfCtx, cancel := context.WithCancel(ctx)
+	fw, err := portforward.NewOnAddressesWithContext(pfCtx, dialer, []string{"127.0.0.1"},
+		[]string{fmt.Sprintf("0:%d", centralPodPort)}, ready, os.Stderr, os.Stderr)
 	if err != nil {
+		cancel()
 		return nil, "", nil, fmt.Errorf("building the port-forward: %w", err)
 	}
 
-	// apiCtx is the forward's lifetime made a context: every API call
-	// through the tunnel runs under it, and it is cancelled when the
-	// tunnel exits — by close, by the parent context, or by the tunnel
-	// dying on its own. Once the listener is gone, the local port is
-	// free for any local process to bind, and a client that kept
-	// dialing it could hand the admin password to whatever answered;
-	// cancelling fails in-flight calls and refuses new ones instead.
-	apiCtx, cancel := context.WithCancel(ctx)
-	exited := make(chan struct{})
+	// forwardErr is published before the cancel that wakes the selector
+	// below, so a tunnel that died on its own reports why.
 	var forwardErr error
 	go func() {
-		defer close(exited)
 		defer cancel()
 		forwardErr = fw.ForwardPorts()
 	}()
@@ -120,52 +119,87 @@ func startCentralPortForward(ctx context.Context, kubeconfigPath string) (*centr
 	case <-ready:
 		ports, err := fw.GetPorts()
 		if err != nil {
-			close(stop)
 			cancel()
 			return nil, "", nil, fmt.Errorf("reading the forwarded local port: %w", err)
 		}
 		if len(ports) != 1 {
-			close(stop)
 			cancel()
 			return nil, "", nil, fmt.Errorf("the port-forward reported %d local ports, want 1", len(ports))
 		}
-		return &centralPortForward{stop: stop, cancel: cancel},
-			fmt.Sprintf("https://127.0.0.1:%d", ports[0].Local), apiCtx, nil
-	case <-exited:
-		return nil, "", nil, fmt.Errorf("the Central port-forward exited before becoming ready: %v", forwardErr)
-	case <-time.After(30 * time.Second):
-		close(stop)
-		return nil, "", nil, errors.New("the Central port-forward did not become ready within 30s")
-	case <-ctx.Done():
-		close(stop)
+		return &centralPortForward{cancel: cancel},
+			fmt.Sprintf("https://127.0.0.1:%d", ports[0].Local), pfCtx, nil
+	case <-pfCtx.Done():
+		// Either the parent was cancelled, or the forward exited on its
+		// own and its goroutine cancelled the lifetime with the error
+		// already published.
+		if forwardErr != nil {
+			return nil, "", nil, fmt.Errorf("the Central port-forward exited before becoming ready: %v", forwardErr)
+		}
 		return nil, "", nil, ctx.Err()
+	case <-time.After(30 * time.Second):
+		cancel()
+		return nil, "", nil, errors.New("the Central port-forward did not become ready within 30s")
 	}
 }
 
 // centralAPI is a minimal Central REST client: basic auth with the admin
-// password, TLS verification skipped because the certificate is the
-// chart-generated self-signed one and the connection is a loopback tunnel
-// to the pod — a listener the forwarder itself bound on 127.0.0.1, under
-// a context that is cancelled the moment the forward exits, so the
-// password never travels to a port the forward does not own. The
-// Sensors' own connection is different in both respects — mTLS with
-// their registration identity over the shared network — and is verified
-// by the readiness wait, not by this client.
+// password, over a TLS connection verified against the CA the chart's
+// install hook wrote into the central-tls secret — read through the
+// authenticated Kubernetes API, not through the tunnel. The client dials
+// the forwarded loopback address but verifies the certificate as
+// central.stackrox.svc, the DNS name the chart's generated certificate
+// carries, so the admin password only ever travels to a peer that
+// presented a certificate the chart's CA issued.
+//
+// That verification is what makes the tunnel's small teardown window
+// harmless: inside client-go, ForwardPorts releases its listener before
+// the lifetime context is cancelled, and a local process that rebinds
+// the port in that window cannot present Central's certificate, so the
+// handshake fails before any credential is sent. Redirects are refused
+// for the same reason — Go's default client follows them and preserves
+// the Authorization header across port changes on the same hostname, so
+// a redirect answer would be a second, unverified destination for the
+// password. The Sensors' own connection is different in both respects —
+// mTLS with their registration identity over the shared network — and
+// is verified by the readiness wait, not by this client.
 type centralAPI struct {
 	base     string
 	password string
 	client   *http.Client
 }
 
-func newCentralAPI(base, password string) *centralAPI {
+// newCentralAPI builds the client for one Central base URL. caPEM is
+// the CA that roots Central's serving certificate (see centralCAPEM); a
+// base that is not https is refused outright — credentials do not
+// travel in the clear.
+func newCentralAPI(base, password string, caPEM []byte) (*centralAPI, error) {
+	if u, err := url.Parse(base); err != nil || u.Scheme != "https" {
+		return nil, fmt.Errorf("the Central API base %q is not an https URL", base)
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(caPEM) {
+		return nil, errors.New("the Central CA from the central-tls secret is not a parseable certificate")
+	}
 	return &centralAPI{
 		base:     base,
 		password: password,
 		client: &http.Client{
-			Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}, //nolint:gosec // see the type comment
-			Timeout:   30 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{
+					RootCAs:    roots,
+					ServerName: centralTLSServerName,
+					MinVersion: tls.VersionTLS12,
+				},
+			},
+			// Credentials reach the peer that was verified, never a
+			// location it named: a redirect answer fails the call
+			// instead of being followed.
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return fmt.Errorf("central answered with a redirect to %s; refusing to follow it", req.URL)
+			},
+			Timeout: 30 * time.Second,
 		},
-	}
+	}, nil
 }
 
 // do performs one authenticated JSON request. body may be nil. A non-200

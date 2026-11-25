@@ -220,6 +220,31 @@ func OpenManagedDir(path string) (string, error) {
 	return WalkDirNames(names, len(names)-1, WalkOptions{Create: true, FollowAliases: true})
 }
 
+// ResolveDir resolves an existing directory through the ancestor policy:
+// trusted aliases are followed hop by hop, every component of the chain
+// (the target's included) is checked, and nothing is created or written.
+// It returns the fully-resolved path — where the directory really sits,
+// not the alias it was named by.
+//
+// It is the look-before-you-manage companion to OpenManagedDir, for
+// callers that must keep two trees apart by their resolved locations:
+// the StackRox example resolves the kind-ocp state root before deriving
+// its credential workspace beside it, so no alias of either path can
+// nest one tree inside the other unnoticed. A missing component fails
+// with an error wrapping fs.ErrNotExist; the walk requires existence
+// because a path that does not resolve cannot be compared. A relative
+// path is resolved against the working directory first.
+func ResolveDir(path string) (string, error) {
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	names := PathNames(path)
+	if len(names) == 0 {
+		return "", fmt.Errorf("%s is the filesystem root; refusing to resolve it", path)
+	}
+	return WalkDirNames(names, len(names), WalkOptions{FollowAliases: true})
+}
+
 // MaxAliasHops is the walk's own work limit: the total number of
 // symlink expansions one walk may perform. It is a bound kind-ocp
 // chose for itself — the walk resolves every hop itself with Lstat and

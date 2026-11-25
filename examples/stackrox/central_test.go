@@ -2,13 +2,22 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"io"
 	"log/slog"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -30,6 +39,86 @@ metadata:
 data:
   crs: RklYTUU=
 `
+
+// mintCentralCert mints a CA and a serving certificate carrying the
+// chart's SAN (central.stackrox.svc) under it — the shape the chart's
+// install hook writes into the central-tls secret. The CA PEM is what a
+// centralAPI trusts; the certificate is what a test Central serves.
+// Minting a second, independent pair is how a test builds a peer the
+// client must not trust: same name, different issuer.
+func mintCentralCert(t *testing.T) (caPEM []byte, cert tls.Certificate) {
+	t.Helper()
+	mint := func() ([]byte, *x509.Certificate, *ecdsa.PrivateKey) {
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tmpl := &x509.Certificate{
+			SerialNumber:          big.NewInt(1),
+			Subject:               pkix.Name{CommonName: "test-ca"},
+			NotBefore:             time.Now().Add(-time.Hour),
+			NotAfter:              time.Now().Add(time.Hour),
+			IsCA:                  true,
+			KeyUsage:              x509.KeyUsageCertSign,
+			BasicConstraintsValid: true,
+		}
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		parsed, err := x509.ParseCertificate(der)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), parsed, key
+	}
+	caPEM, ca, caKey := mint()
+
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "CENTRAL_SERVICE: Central"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		DNSNames:     []string{centralTLSServerName},
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTmpl, ca, &leafKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return caPEM, tls.Certificate{Certificate: [][]byte{leafDER}, PrivateKey: leafKey}
+}
+
+// startCentralTLSServer serves h over TLS with a freshly minted
+// chart-shaped certificate. It returns the https base URL and the CA a
+// client must trust to verify the server — the pair the production flow
+// gets from the central-tls secret and the forwarded pod.
+func startCentralTLSServer(t *testing.T, h http.Handler) (baseURL string, caPEM []byte) {
+	t.Helper()
+	ca, cert := mintCentralCert(t)
+	server := httptest.NewUnstartedServer(h)
+	server.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+	server.StartTLS()
+	t.Cleanup(server.Close)
+	return server.URL, ca
+}
+
+// newTestCentralAPI builds a centralAPI a test can drive: verified TLS
+// against the CA the test server was minted with, exactly the production
+// configuration.
+func newTestCentralAPI(t *testing.T, baseURL, password string, caPEM []byte) *centralAPI {
+	t.Helper()
+	api, err := newCentralAPI(baseURL, password, caPEM)
+	if err != nil {
+		t.Fatalf("newCentralAPI = %v", err)
+	}
+	return api
+}
 
 // newCentralTestServer serves the Central REST surface the example uses,
 // with the authentication it expects.
@@ -57,9 +146,8 @@ func newCentralTestServer(t *testing.T, clustersJSON string) (*centralAPI, *auth
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(clustersJSON))
 	})
-	server := httptest.NewServer(rec.wrap(mux))
-	t.Cleanup(server.Close)
-	return newCentralAPI(server.URL, "test-password"), rec
+	base, ca := startCentralTLSServer(t, rec.wrap(mux))
+	return newTestCentralAPI(t, base, "test-password", ca), rec
 }
 
 // authRecorder asserts the admin basic auth reached the server.
@@ -90,11 +178,10 @@ func TestGenerateCRSDecodesAndValidatesTheManifest(t *testing.T) {
 
 func TestGenerateCRSRefusesAManifestThatIsNotASecret(t *testing.T) {
 	manifest := base64.StdEncoding.EncodeToString([]byte("apiVersion: v1\nkind: ConfigMap\ndata: {}\n"))
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base, ca := startCentralTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"crs": "` + manifest + `"}`))
 	}))
-	defer server.Close()
-	api := newCentralAPI(server.URL, "pw")
+	api := newTestCentralAPI(t, base, "pw", ca)
 	if _, err := api.generateCRS(context.Background(), "x", discardLogger()); err == nil || !strings.Contains(err.Error(), "not a Secret") {
 		t.Fatalf("generateCRS on a ConfigMap = %v, want a shape refusal", err)
 	}
@@ -108,11 +195,10 @@ func TestGenerateCRSRefusesAnEmptyOrUndecodableSecret(t *testing.T) {
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			base, ca := startCentralTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				_, _ = w.Write([]byte(body))
 			}))
-			defer server.Close()
-			api := newCentralAPI(server.URL, "pw")
+			api := newTestCentralAPI(t, base, "pw", ca)
 			if _, err := api.generateCRS(context.Background(), "x", discardLogger()); err == nil {
 				t.Fatalf("generateCRS accepted %q", body)
 			}
@@ -176,11 +262,10 @@ func TestWaitForHealthyClustersTimesOutNamingTheStragglers(t *testing.T) {
 }
 
 func TestWaitForCentralTimesOut(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base, ca := startCentralTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
-	defer server.Close()
-	api := newCentralAPI(server.URL, "pw")
+	api := newTestCentralAPI(t, base, "pw", ca)
 	err := waitForCentral(context.Background(), api, 150*time.Millisecond, discardLogger())
 	if err == nil || !strings.Contains(err.Error(), "/v1/ping") {
 		t.Fatalf("waitForCentral on a failing Central = %v, want a timeout naming the endpoint", err)
@@ -193,7 +278,7 @@ func TestGenerateCRSRetriesThroughTheCredentialReloadWindow(t *testing.T) {
 	defer func() { credentialApplyTimeout, pollInterval = olds, oldPoll }()
 
 	calls := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base, ca := startCentralTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		if calls <= 2 {
 			w.WriteHeader(http.StatusUnauthorized)
@@ -202,9 +287,8 @@ func TestGenerateCRSRetriesThroughTheCredentialReloadWindow(t *testing.T) {
 		}
 		_, _ = w.Write([]byte(`{"crs": "` + base64.StdEncoding.EncodeToString([]byte(testCRSManifest)) + `"}`))
 	}))
-	defer server.Close()
 
-	api := newCentralAPI(server.URL, "pw")
+	api := newTestCentralAPI(t, base, "pw", ca)
 	manifest, err := api.generateCRS(context.Background(), "retry-crs", discardLogger())
 	if err != nil {
 		t.Fatalf("generateCRS through a 401 window = %v, want success after retries", err)
@@ -222,13 +306,12 @@ func TestGenerateCRSFailsAfterTheCredentialWindowWithTheLastError(t *testing.T) 
 	credentialApplyTimeout, pollInterval = 300*time.Millisecond, 100*time.Millisecond
 	defer func() { credentialApplyTimeout, pollInterval = olds, oldPoll }()
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base, ca := startCentralTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 		_, _ = w.Write([]byte(`{"code":16,"message":"credentials not found"}`))
 	}))
-	defer server.Close()
 
-	api := newCentralAPI(server.URL, "wrong-password")
+	api := newTestCentralAPI(t, base, "wrong-password", ca)
 	_, err := api.generateCRS(context.Background(), "x", discardLogger())
 	if err == nil || !strings.Contains(err.Error(), "Unauthorized") {
 		t.Fatalf("generateCRS with a persistently wrong password = %v, want the 401 surfaced", err)
@@ -286,9 +369,8 @@ func newCRSConflictServer(t *testing.T, listBody, revokeBody string) (*centralAP
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(revokeBody))
 	})
-	server := httptest.NewServer(mux)
-	t.Cleanup(server.Close)
-	return newCentralAPI(server.URL, "pw"), calls
+	base, ca := startCentralTLSServer(t, mux)
+	return newTestCentralAPI(t, base, "pw", ca), calls
 }
 
 func TestGenerateCRSRevokesAndRegeneratesWhenTheNameIsTaken(t *testing.T) {
@@ -370,6 +452,99 @@ func TestRevokeSurfacesACentralRefusal(t *testing.T) {
 			// revoked-id coverage, which names the ID too.
 			if name == "refused" && !strings.Contains(err.Error(), "impacted by policy") {
 				t.Errorf("the error %q does not carry Central's refusal text", err.Error())
+			}
+		})
+	}
+}
+
+// The port-forward's teardown releases its listener a few instructions
+// before the lifetime context is cancelled, so a local process can hold
+// the port when a call dials it. That peer must never see the admin
+// password: the client authenticates Central before any credential is
+// sent, and a peer whose certificate chains to a different CA fails the
+// handshake. The attacking server here serves a perfectly formed
+// certificate for the right name — only the issuer differs, which is
+// everything a local squatter can forge.
+func TestCentralClientSendsNoAuthenticatedRequestToAnUnexpectedTLSPeer(t *testing.T) {
+	var requests atomic.Int64
+	rec := &authRecorder{}
+	_, attackerCert := mintCentralCert(t)
+	server := httptest.NewUnstartedServer(rec.wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	})))
+	server.TLS = &tls.Config{Certificates: []tls.Certificate{attackerCert}}
+	server.StartTLS()
+	t.Cleanup(server.Close)
+
+	trustedCA, _ := mintCentralCert(t)
+	api := newTestCentralAPI(t, server.URL, "test-password", trustedCA)
+	_, err := api.generateCRS(context.Background(), "squatted-crs", discardLogger())
+	if err == nil {
+		t.Fatal("generateCRS succeeded against a TLS peer the client does not trust")
+	}
+	if !strings.Contains(err.Error(), "certificate") {
+		t.Fatalf("the error %q is not a certificate verification failure — the call must fail in the TLS handshake, before any credential is sent", err.Error())
+	}
+	if got := requests.Load(); got != 0 {
+		t.Errorf("the untrusted peer served %d requests, want 0 — no authenticated request may reach it", got)
+	}
+	if rec.user != "" || rec.password != "" {
+		t.Errorf("the untrusted peer received basic auth %q:%q, want none", rec.user, rec.password)
+	}
+}
+
+// Go's default redirect handling preserves the Authorization header
+// across port changes on the same hostname — a redirect answer would be
+// a second, unverified destination for the admin password. The client
+// refuses to follow one, so the redirect target never sees a request.
+func TestCentralClientRefusesToFollowARedirect(t *testing.T) {
+	var redirectedTo atomic.Int64
+	rec := &authRecorder{}
+	targetBase, _ := startCentralTLSServer(t, rec.wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirectedTo.Add(1)
+		w.WriteHeader(http.StatusOK)
+	})))
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/cluster-init/crs", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", targetBase+"/v1/cluster-init/crs")
+		w.WriteHeader(http.StatusFound)
+	})
+	base, ca := startCentralTLSServer(t, mux)
+
+	api := newTestCentralAPI(t, base, "test-password", ca)
+	_, err := api.generateCRS(context.Background(), "redirected-crs", discardLogger())
+	if err == nil {
+		t.Fatal("generateCRS followed a redirect answer")
+	}
+	if !strings.Contains(err.Error(), "redirect") {
+		t.Fatalf("the error %q does not name the refused redirect", err.Error())
+	}
+	if got := redirectedTo.Load(); got != 0 {
+		t.Errorf("the redirect target served %d requests, want 0 — credentials never travel to a location the verified peer named", got)
+	}
+	if rec.user != "" || rec.password != "" {
+		t.Errorf("the redirect target received basic auth %q:%q, want none", rec.user, rec.password)
+	}
+}
+
+func TestNewCentralAPIRefusesABaseThatIsNotHTTPS(t *testing.T) {
+	if _, err := newCentralAPI("http://127.0.0.1:8443", "pw", nil); err == nil || !strings.Contains(err.Error(), "https") {
+		t.Fatalf("newCentralAPI on a plain-http base = %v, want a refusal — credentials do not travel in the clear", err)
+	}
+}
+
+func TestNewCentralAPIRefusesUnusableTrust(t *testing.T) {
+	cases := map[string][]byte{
+		"no CA":       nil,
+		"garbage":     []byte("not a certificate"),
+		"empty block": []byte("-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n"),
+	}
+	for name, caPEM := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := newCentralAPI("https://127.0.0.1:8443", "pw", caPEM); err == nil {
+				t.Fatalf("newCentralAPI accepted trust material %q", name)
 			}
 		})
 	}

@@ -62,10 +62,23 @@ func intPtr(i int) *int { return &i }
 
 // mustWorkConfig resolves a config whose state root sits under dir, so
 // the workspace openWorkDir derives from it lands under dir too and the
-// test cleans up with the temp dir.
+// test cleans up with the temp dir. The state root is created the way
+// ensureClusters leaves it — openWorkDir resolves it before deriving the
+// workspace, and a path that does not exist cannot be resolved.
 func mustWorkConfig(t *testing.T, dir, prefix string) *config.Config {
 	t.Helper()
-	return mustConfig(t, prefix, filepath.Join(dir, "kind-ocp"))
+	cfg := mustConfig(t, prefix, filepath.Join(dir, "kind-ocp"))
+	if err := os.MkdirAll(cfg.StateRoot, 0o700); err != nil {
+		t.Fatalf("creating the state root %s: %v", cfg.StateRoot, err)
+	}
+	return cfg
+}
+
+// workDirPath is the workspace path a test expects for a state root
+// named kind-ocp under dir: the resolved state base's sibling, named
+// after it with the work directory suffix.
+func workDirPath(dir, prefix string) string {
+	return filepath.Join(dir, "kind-ocp"+workDirSuffix, prefix)
 }
 
 func TestOpenWorkDirCreatesAPrivatePerPrefixDirectory(t *testing.T) {
@@ -75,7 +88,7 @@ func TestOpenWorkDirCreatesAPrivatePerPrefixDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openWorkDir = %v", err)
 	}
-	if want := filepath.Join(base, "kind-ocp-stackrox-example", "quote-test"); dir != want {
+	if want := workDirPath(base, "quote-test"); dir != want {
 		// The walk resolves ancestor aliases (macOS temp dirs live
 		// under the /var symlink), so compare against the resolved
 		// form of the expected path — the run writes through exactly
@@ -101,7 +114,7 @@ func TestOpenWorkDirCreatesAPrivatePerPrefixDirectory(t *testing.T) {
 func TestOpenWorkDirRefusesAPermissiveExistingDirectory(t *testing.T) {
 	base := t.TempDir()
 	cfg := mustWorkConfig(t, base, "permissive-test")
-	dir := filepath.Join(base, workDirName, "permissive-test")
+	dir := workDirPath(base, "permissive-test")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +130,7 @@ func TestOpenWorkDirRefusesASymlinkedWorkspace(t *testing.T) {
 	if err := os.Mkdir(target, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	parent := filepath.Join(base, workDirName)
+	parent := filepath.Join(base, "kind-ocp"+workDirSuffix)
 	if err := os.Mkdir(parent, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -138,15 +151,136 @@ func TestOpenWorkDirRefusesASymlinkedWorkspace(t *testing.T) {
 func TestOpenWorkDirRefusesASubstitutableAncestor(t *testing.T) {
 	base := t.TempDir()
 	cfg := mustWorkConfig(t, base, "substituted-test")
-	if err := os.MkdirAll(filepath.Join(base, workDirName), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Join(base, "kind-ocp"+workDirSuffix), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(filepath.Join(base, workDirName), 0o777); err != nil {
+	if err := os.Chmod(filepath.Join(base, "kind-ocp"+workDirSuffix), 0o777); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := openWorkDir(cfg); err == nil || !strings.Contains(err.Error(), "writable") {
 		t.Fatalf("openWorkDir = %v, want a substitutable-ancestor rejection", err)
 	}
+}
+
+// The colliding basename: a state root that ends in the workspace's own
+// name used to make the workspace exactly the per-prefix state
+// directory, and `kind-ocp delete` would have removed the credentials
+// with the state. The workspace is derived from the resolved state base,
+// so it is a distinct sibling whatever the state root is called.
+func TestOpenWorkDirStaysOutsideAStateRootNamedLikeTheWorkspace(t *testing.T) {
+	base := t.TempDir()
+	// A state root whose basename is the workspace name the default
+	// state root derives (kind-ocp-stackrox-example).
+	stateRoot := filepath.Join(base, "kind-ocp"+workDirSuffix)
+	cfg := mustConfig(t, "collide-test", stateRoot)
+	if err := os.MkdirAll(stateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	dir, err := openWorkDir(cfg)
+	if err != nil {
+		t.Fatalf("openWorkDir with a colliding state-root basename = %v", err)
+	}
+	resolvedState, err := filepath.EvalSymlinks(stateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dir == resolvedState || strings.HasPrefix(dir, resolvedState+string(filepath.Separator)) {
+		t.Fatalf("the work dir %q resolves inside the state root %q — kind-ocp delete would remove the credentials with the state", dir, resolvedState)
+	}
+	want := filepath.Join(base, "kind-ocp"+workDirSuffix+workDirSuffix, "collide-test")
+	if resolved, err := filepath.EvalSymlinks(want); err != nil || dir != resolved {
+		t.Errorf("the work dir %q is not the distinct sibling %q (resolved %q, %v)", dir, want, resolved, err)
+	}
+}
+
+// A workspace base that aliases into the state tree: the derivation
+// itself cannot nest the trees, but a symlink at the workspace's name
+// could point anywhere. The overlap is refused before anything is
+// created, so the refusal leaves no directory behind inside the state
+// tree.
+func TestOpenWorkDirRefusesAWorkspaceAliasedIntoTheStateTree(t *testing.T) {
+	base := t.TempDir()
+	cfg := mustWorkConfig(t, base, "alias-test")
+	resolvedState, err := filepath.EvalSymlinks(filepath.Join(base, "kind-ocp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(resolvedState, filepath.Join(base, "kind-ocp"+workDirSuffix)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := openWorkDir(cfg); err == nil || !strings.Contains(err.Error(), "state root") {
+		t.Fatalf("openWorkDir through a workspace aliased into the state tree = %v, want an overlap rejection", err)
+	}
+	// The refusal happened before any write: nothing was created inside
+	// the state tree.
+	if entries, err := os.ReadDir(resolvedState); err != nil || len(entries) != 0 {
+		t.Errorf("the state root holds %v (%v) after the refusal, want nothing — refusals do not write", entries, err)
+	}
+}
+
+// The other direction: an alias at the workspace base that points above
+// the state root makes the per-prefix workspace contain the state tree —
+// kind-ocp's removals would then sweep through the credential
+// directory's own tree. The derivation alone cannot produce this shape
+// (the workspace base is a sibling of the resolved state root), so what
+// produces it is an alias, and the resolved comparison refuses it.
+func TestOpenWorkDirRefusesAStateRootInsideTheWorkspace(t *testing.T) {
+	base := t.TempDir()
+	resolved, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A state root at <base>/nested/kind-ocp …
+	if err := os.MkdirAll(filepath.Join(base, "nested", "kind-ocp"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// … whose derived workspace base is an alias to the temp dir itself:
+	// the per-prefix workspace then resolves to <base>/nested, which
+	// contains the state root.
+	if err := os.Symlink(resolved, filepath.Join(base, "nested", "kind-ocp"+workDirSuffix)); err != nil {
+		t.Fatal(err)
+	}
+	cfg := mustConfig(t, "nested", filepath.Join(base, "nested", "kind-ocp"))
+
+	if _, err := openWorkDir(cfg); err == nil || !strings.Contains(err.Error(), "disjoint") {
+		t.Fatalf("openWorkDir with the state root inside the workspace = %v, want an overlap rejection", err)
+	}
+}
+
+func TestCentralCAPEMReadsTheChartSecret(t *testing.T) {
+	caPEM := []byte("-----BEGIN CERTIFICATE-----\ntest-ca\n-----END CERTIFICATE-----\n")
+	cs := fake.NewSimpleClientset(&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: centralTLSSecretName, Namespace: stackroxNamespace},
+		Data:       map[string][]byte{centralTLSCAKey: caPEM},
+	})
+	got, err := centralCAPEM(context.Background(), cs)
+	if err != nil {
+		t.Fatalf("centralCAPEM = %v", err)
+	}
+	if string(got) != string(caPEM) {
+		t.Errorf("centralCAPEM returned %q, want the secret's CA entry verbatim", got)
+	}
+}
+
+func TestCentralCAPEMNamesWhatItCannotRead(t *testing.T) {
+	t.Run("missing secret", func(t *testing.T) {
+		_, err := centralCAPEM(context.Background(), fake.NewSimpleClientset())
+		if err == nil || !strings.Contains(err.Error(), centralTLSSecretName) {
+			t.Fatalf("centralCAPEM without the secret = %v, want the secret named", err)
+		}
+	})
+	t.Run("secret without the CA entry", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: centralTLSSecretName, Namespace: stackroxNamespace},
+			Data:       map[string][]byte{"cert.pem": []byte("leaf")},
+		})
+		_, err := centralCAPEM(context.Background(), cs)
+		if err == nil || !strings.Contains(err.Error(), centralTLSCAKey) {
+			t.Fatalf("centralCAPEM without the CA entry = %v, want the key named", err)
+		}
+	})
 }
 
 func node(name string, labels map[string]string, addresses ...corev1.NodeAddress) *corev1.Node {

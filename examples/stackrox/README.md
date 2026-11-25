@@ -101,6 +101,13 @@ StackRox version and should stay on the same appVersion.
   `~/.local/state/kind-ocp-stackrox-example/<prefix>/`), not under the
   system temporary directory: it holds persistent credentials, and a
   predictable temp path has parents another local user could substitute.
+  Its name is derived from the *resolved* state root — the state root's
+  own name plus `-stackrox-example` — so the workspace is a distinct
+  sibling whatever the state root is called (a state root ending in the
+  workspace's own name cannot make the two coincide), and a resolved
+  overlap in either direction — a workspace alias pointing into the
+  state tree, or a state root inside the workspace — is refused before
+  anything is written, because `kind-ocp delete` removes the state tree.
 - The directory is opened through kind-ocp's own filesystem boundary:
   every ancestor is verified before it is trusted (substitutable
   ancestors, symlinks, and permissive directories are refused), and the
@@ -114,6 +121,28 @@ StackRox version and should stay on the same appVersion.
 - The cluster registration secret rides in the Sensor values files,
   written `0600` and passed to helm with `-f` — never through argv,
   which other local users could read.
+- The example's own API calls to Central authenticate it before any
+  credential is sent: the TLS peer must present the certificate the
+  chart's CA issued — the CA is read from the `central-tls` secret
+  through the cluster's own authenticated Kubernetes API, and the
+  certificate is verified as `central.stackrox.svc`, the name the chart
+  generates. Redirect answers are refused rather than followed (Go's
+  default client would carry the Authorization header to the redirect
+  target), and a base URL that is not https is refused outright. The
+  Sensors' connection is separate — mTLS with their registration
+  identity over the shared network, verified by the readiness wait.
+
+## Cleaning up
+
+`kind-ocp delete` (the command the run prints) removes the clusters and
+kind-ocp's state, but not the example's work directory: the admin
+password and the Sensor values files stay on disk so a later re-run can
+reuse them. When you are done with them, remove the work directory
+itself — by default:
+
+```sh
+rm -rf ~/.local/state/kind-ocp-stackrox-example/<prefix>
+```
 
 ## Why the Sensors do not run in OpenShift mode
 
@@ -129,14 +158,6 @@ that half.
 
 ## Known limitations
 
-- Central's chart generates a self-signed certificate; the example's own
-  API client skips TLS verification for its loopback port-forward. That
-  tunnel is bounded: client-go binds its listener on `127.0.0.1` only,
-  picks the local port itself, and every authenticated call runs under a
-  context cancelled the moment the forward exits — so the admin password
-  never travels to a local port the forward does not own (the Sensors'
-  connection is separate: mTLS with their registration identity over the
-  shared network, verified by the readiness wait).
 - With the collector disabled there is no runtime process-level signal
   collection; that is a deliberate scope cut for a topology example, not a
   supported deployment shape.
