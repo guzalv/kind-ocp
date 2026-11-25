@@ -910,6 +910,35 @@ that pin them, and §3.
   basename derives a distinct sibling, and both alias-overlap shapes
   are refused without writes. The README documents that
   `kind-ocp delete` leaves the work directory and how to remove it.
+- [ ] **10. Usability and honesty pass (pre-publication).** Findings from
+  the final target-user review. Code: `verify` must fail when the
+  expected cluster count and the live inventory disagree — today a
+  cluster whose record and cluster both vanished drops out of the
+  checks and a lone survivor reports all-PASS (`kindocp/kindocp.go`
+  verify path); add the expected-vs-inventory assertion and a
+  regression. Docs: the README headline overstates fidelity — state
+  plainly what the SCC shim does (defaults UID/GID on watched pod
+  creates, never denies, does not evaluate `runAsNonRoot`) and that
+  StackRox's OpenShift mode (SCC and Route paths) is unsupported by
+  the example; nothing yet proves a Central-driven scan-to-results
+  round trip. Quickstart: list the real prerequisites — Docker client
+  and daemon, Buildx for full-profile create, Go 1.27.4 exactly for
+  source builds, `kubectl` for the inspection commands, the macOS
+  socket and no-cgo pitfalls now buried in PLAN, and the network
+  endpoints create fetches from. Add a short recovery decision tree:
+  failed create (retry a bound partial create), unbound or replaced
+  cluster (delete and re-create), delete that stops on first error
+  (retryable), unsafe state blocking cleanup. Document measured
+  cold/warm create and delete times, the Docker CPU/RAM/disk budget
+  per cluster, and that N>2 fan-out is capacity-dependent (no
+  concurrency limit after the first cluster). Example: let engineers
+  point `examples/stackrox` at their own Sensor image and values
+  overrides instead of only released charts, and state what the
+  example run proves versus what still needs real OpenShift.
+  Explicitly out of scope: emulating OAuth, routing, the integrated
+  registry, or MachineConfig reconciliation (document as limits);
+  publishing (remote, tags, final module path, clean-machine install
+  test) stays with the repository owner.
 ## 6. Testing strategy
 
 - Unit (no Docker): config resolution and precedence, per-cluster overrides,
