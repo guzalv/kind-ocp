@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -32,49 +31,60 @@ import (
 // talks to the pod the way `kubectl port-forward` does — through the same
 // client-go machinery.
 type centralPortForward struct {
-	stop chan struct{}
+	stop   chan struct{}
+	cancel context.CancelFunc
 }
 
-// close tears the tunnel down. It is safe to call more than once.
+// close tears the tunnel down and cancels the API context with it. It is
+// safe to call more than once.
 func (p *centralPortForward) close() {
 	select {
 	case <-p.stop:
 	default:
 		close(p.stop)
 	}
+	p.cancel()
 }
 
 // startCentralPortForward locates the running Central pod on the Central
 // cluster and forwards a local port to the pod's API port (the service's
-// 443 behind it). It returns the forward — close it when done — and the
-// https base URL to talk to.
-func startCentralPortForward(ctx context.Context, kubeconfigPath string) (*centralPortForward, string, error) {
+// 443 behind it). It returns the forward — close it when done — the
+// https base URL to talk to, and the context every authenticated call
+// must use: that context is cancelled the moment the forward exits, so a
+// dead tunnel fails the calls instead of letting them dial a local port
+// any process could have rebound.
+//
+// The listener is bound by client-go itself, on 127.0.0.1 only, with
+// local port 0: the kernel picks the port and the forwarder reports the
+// one it bound after readiness. There is no listen-close-use window (the
+// example never picks a port on the forwarder's behalf), and a ready
+// forward always means an IPv4 loopback listener — client-go's
+// "localhost" default also binds ::1 and reports ready when only that
+// side came up, while this client dials 127.0.0.1 and would reach
+// whatever holds the IPv4 port instead.
+func startCentralPortForward(ctx context.Context, kubeconfigPath string) (*centralPortForward, string, context.Context, error) {
 	cs, restConfig, err := clientsetFor(kubeconfigPath)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	podName, err := centralPodName(ctx, cs)
 	if err != nil {
-		return nil, "", err
-	}
-	localPort, err := freeLocalPort()
-	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 
 	serverURL, err := apiServerURL(restConfig)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	forwardURL, err := url.Parse(fmt.Sprintf("%s/api/v1/namespaces/%s/pods/%s/portforward",
 		serverURL.String(), stackroxNamespace, podName))
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 
 	roundTripper, upgrader, err := spdy.RoundTripperFor(restConfig)
 	if err != nil {
-		return nil, "", fmt.Errorf("building the port-forward transport: %w", err)
+		return nil, "", nil, fmt.Errorf("building the port-forward transport: %w", err)
 	}
 	dialer := spdy.NewDialer(upgrader, &http.Client{Transport: roundTripper}, http.MethodPost, forwardURL)
 
@@ -83,49 +93,64 @@ func startCentralPortForward(ctx context.Context, kubeconfigPath string) (*centr
 	// The forwarder's own progress messages go to the run's stderr: they
 	// are part of the evidence, and a tunnel that never comes up should
 	// say so where the run can see it. Ports are "local:remote" pairs;
-	// the forwarder's listen address is localhost.
-	fw, err := portforward.New(dialer, []string{fmt.Sprintf("%d:%d", localPort, centralPodPort)},
-		stop, ready, os.Stderr, os.Stderr)
+	// local 0 makes the forwarder bind and report the port itself.
+	fw, err := portforward.NewOnAddresses(dialer, []string{"127.0.0.1"},
+		[]string{fmt.Sprintf("0:%d", centralPodPort)}, stop, ready, os.Stderr, os.Stderr)
 	if err != nil {
-		return nil, "", fmt.Errorf("building the port-forward: %w", err)
+		return nil, "", nil, fmt.Errorf("building the port-forward: %w", err)
 	}
+
+	// apiCtx is the forward's lifetime made a context: every API call
+	// through the tunnel runs under it, and it is cancelled when the
+	// tunnel exits — by close, by the parent context, or by the tunnel
+	// dying on its own. Once the listener is gone, the local port is
+	// free for any local process to bind, and a client that kept
+	// dialing it could hand the admin password to whatever answered;
+	// cancelling fails in-flight calls and refuses new ones instead.
+	apiCtx, cancel := context.WithCancel(ctx)
+	exited := make(chan struct{})
+	var forwardErr error
 	go func() {
-		// ForwardPorts returns when the stop channel closes; its error
-		// (a tunnel that died mid-run) lands on stderr from inside the
-		// forwarder, and the API calls fail on their own deadlines.
-		_ = fw.ForwardPorts()
+		defer close(exited)
+		defer cancel()
+		forwardErr = fw.ForwardPorts()
 	}()
 
 	select {
 	case <-ready:
-		return &centralPortForward{stop: stop}, fmt.Sprintf("https://127.0.0.1:%d", localPort), nil
+		ports, err := fw.GetPorts()
+		if err != nil {
+			close(stop)
+			cancel()
+			return nil, "", nil, fmt.Errorf("reading the forwarded local port: %w", err)
+		}
+		if len(ports) != 1 {
+			close(stop)
+			cancel()
+			return nil, "", nil, fmt.Errorf("the port-forward reported %d local ports, want 1", len(ports))
+		}
+		return &centralPortForward{stop: stop, cancel: cancel},
+			fmt.Sprintf("https://127.0.0.1:%d", ports[0].Local), apiCtx, nil
+	case <-exited:
+		return nil, "", nil, fmt.Errorf("the Central port-forward exited before becoming ready: %v", forwardErr)
 	case <-time.After(30 * time.Second):
 		close(stop)
-		return nil, "", errors.New("the Central port-forward did not become ready within 30s")
+		return nil, "", nil, errors.New("the Central port-forward did not become ready within 30s")
 	case <-ctx.Done():
 		close(stop)
-		return nil, "", ctx.Err()
+		return nil, "", nil, ctx.Err()
 	}
-}
-
-// freeLocalPort asks the kernel for a free TCP port on the loopback
-// interface. The listen-close-use window is a benign race for a recipe; a
-// loser fails loudly when the forwarder cannot bind.
-func freeLocalPort() (int, error) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, fmt.Errorf("reserving a local port: %w", err)
-	}
-	defer func() { _ = l.Close() }()
-	return l.Addr().(*net.TCPAddr).Port, nil
 }
 
 // centralAPI is a minimal Central REST client: basic auth with the admin
 // password, TLS verification skipped because the certificate is the
 // chart-generated self-signed one and the connection is a loopback tunnel
-// to the pod. The Sensors' own connection is different in both respects —
-// mTLS with their registration identity over the shared network — and is
-// verified by the readiness wait, not by this client.
+// to the pod — a listener the forwarder itself bound on 127.0.0.1, under
+// a context that is cancelled the moment the forward exits, so the
+// password never travels to a port the forward does not own. The
+// Sensors' own connection is different in both respects — mTLS with
+// their registration identity over the shared network — and is verified
+// by the readiness wait, not by this client.
 type centralAPI struct {
 	base     string
 	password string

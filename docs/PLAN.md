@@ -742,13 +742,18 @@ that pin them, and §3.
   and HEALTHY — which is the end-to-end AC-1.4 proof (a
   workload pod on one cluster reaching a NodePort on another) and the
   modern replacement for the PoC's init-bundle flow. Secrets (admin
-  password, CRS) live in 0600 files under a 0700 work directory outside
-  the state root, passed to helm via `-f`, never through argv, never
-  logged. The example's host requirements beyond kind-ocp's own: the helm
+  password, CRS) live in 0600 files under a 0700 work directory — a
+  verified sibling of the state root, opened through kind-ocp's own
+  filesystem boundary — passed to helm via `-f`, never through argv,
+  never logged. The example's host requirements beyond kind-ocp's own:
+  the helm
   CLI. Unit tests (no Docker, no helm, no network): chart fetch
   verification and safe extraction, values rendering, CRS decode and
   validation, Central API client and readiness classification against an
-  httptest server, node/NodePort/pod discovery against fake clientsets.
+  httptest server, node/NodePort/pod discovery against fake clientsets,
+  and the workspace and credential-file boundary (substitutable
+  ancestors, symlinked or permissive files, adoption of the previous
+  run's directory).
   Three behaviors the live runs pinned as regressions: the values
   files and chart roots are full paths (helm -f takes paths, not names,
   and a chart archive carries its own top-level directory — the resolved
@@ -804,6 +809,23 @@ that pin them, and §3.
   `craneWorkspace.root` is removed (assigned, never read — run owns the
   cleanup path); the workspace-creation failure path (unwritable TMPDIR →
   clean instant failure) gained its test.
+  The release-readiness security round moved the example's credential
+  boundary onto kind-ocp's own: the workspace is a per-prefix directory
+  beside the state root (not under the system temporary directory — a
+  predictable path there has substitutable parents, and tmp reaping
+  would silently invalidate the reused admin password), opened through
+  the state tree's walk. The walk loop itself moved from internal/state
+  to `internal/fscheck` (`WalkDirNames`, `OpenManagedDir`) so the store
+  and the example share one implementation; the store keeps its marker
+  and exclusive-creation semantics through the walk's options. Every
+  credential file (admin password, values files) is checked private
+  before each read and write — a symlinked or shared file is refused,
+  not followed — and the charts directory is verified against the same
+  policy. The Central port-forward binds `127.0.0.1` only, with the
+  local port chosen and reported by client-go itself (local port 0: no
+  listen-close-use window, and ready can no longer mean an IPv6 bind
+  whose IPv4 twin was taken), and every authenticated API call runs
+  under a context cancelled the moment the forward exits.
 ## 6. Testing strategy
 
 - Unit (no Docker): config resolution and precedence, per-cluster overrides,

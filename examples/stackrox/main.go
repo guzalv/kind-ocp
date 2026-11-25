@@ -11,9 +11,13 @@
 // The example is deliberately not product functionality (BRIEF §6): kind-ocp
 // creates clusters and applies layers; everything here deploys third-party
 // software on top of them. It lives as a package main so nothing can import
-// it — the create path can never reach it — and it uses only kind-ocp's
-// public surface (config, kindocp) plus the standard Kubernetes Go clients,
-// exactly as an outside consumer would.
+// it — the create path can never reach it — and it drives kind-ocp through
+// its public surface (config, kindocp) plus the standard Kubernetes Go
+// clients, exactly as an outside consumer would. One thing it takes from
+// inside the module: its credential workspace is verified with kind-ocp's
+// internal filesystem boundary (internal/fscheck), the same policy the
+// state tree walks — an outside consumer would keep its credentials under
+// a caller-owned directory it verifies itself.
 //
 // Host requirements beyond kind-ocp's own (Docker): the helm CLI (v3 or
 // newer) for chart installation, and network access to the StackRox chart
@@ -23,9 +27,10 @@
 // 5.0.0), so a chart bump is an image bump — see the pins in charts.go.
 //
 // Secrets handling: the generated Central admin password and the cluster
-// registration secret are written only to 0600 files under a 0700 work
-// directory, passed to helm via values files (never argv, which other
-// local users could read), and never logged.
+// registration secret are written only to 0600 files (checked private
+// before every read and write) under a verified 0700 work directory that
+// sits beside kind-ocp's state root, passed to helm via values files
+// (never argv, which other local users could read), and never logged.
 package main
 
 import (
@@ -97,7 +102,7 @@ func deploy(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		return err
 	}
 
-	work, err := openWorkDir(cfg.Prefix)
+	work, err := openWorkDir(cfg)
 	if err != nil {
 		return err
 	}
@@ -150,19 +155,22 @@ func deploy(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	// Phase 3: a cluster registration secret from Central's own API, via a
 	// localhost port-forward (the Docker network's node addresses are not
 	// reachable from the host on every platform; the Sensors, running in
-	// containers on the shared network, use the endpoint above).
-	pf, apiBase, err := startCentralPortForward(ctx, centralKubeconfig)
+	// containers on the shared network, use the endpoint above). Every
+	// authenticated call runs under the forward's own context: it is
+	// cancelled when the tunnel exits, so the admin password never travels
+	// to a local port the forward no longer owns.
+	pf, apiBase, apiCtx, err := startCentralPortForward(ctx, centralKubeconfig)
 	if err != nil {
 		return fmt.Errorf("port-forwarding to Central on %s: %w", centralCluster, err)
 	}
 	defer pf.close()
 
 	api := newCentralAPI(apiBase, password)
-	if err := waitForCentral(ctx, api, centralReadyTimeout, log); err != nil {
+	if err := waitForCentral(apiCtx, api, centralReadyTimeout, log); err != nil {
 		return err
 	}
 	crsName := "kind-ocp-example-" + cfg.Prefix
-	crsManifest, err := api.generateCRS(ctx, crsName, log)
+	crsManifest, err := api.generateCRS(apiCtx, crsName, log)
 	if err != nil {
 		return fmt.Errorf("generating the cluster registration secret: %w", err)
 	}
@@ -185,7 +193,7 @@ func deploy(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	// Phase 5: the proof — Central reports every Sensor cluster registered
 	// and HEALTHY. A HEALTHY Sensor is a workload pod on cluster N that
 	// reached Central's NodePort on cluster 1 and stays connected.
-	if err := waitForHealthyClusters(ctx, api, sensorClusters, clustersHealthyTimeout, log); err != nil {
+	if err := waitForHealthyClusters(apiCtx, api, sensorClusters, clustersHealthyTimeout, log); err != nil {
 		return err
 	}
 

@@ -16,6 +16,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/stackrox/kind-ocp/config"
+	"github.com/stackrox/kind-ocp/internal/fscheck"
 )
 
 // adminPasswordFile and the values file names, all under the work
@@ -79,9 +80,15 @@ func releaseName(chartDir string) string {
 // loadOrCreateAdminPassword returns the Central admin password, generating
 // and persisting one on first use. The password is reused across runs so a
 // re-run's helm upgrade never invalidates the credentials the example (and
-// the user, through the UI) already has.
+// the user, through the UI) already has. An existing password file is a
+// credential: it must verify as a private, caller-owned regular file
+// before it is read — a symlinked or shared file is refused, not followed
+// (a substituted file could hand the run a password someone else knows).
 func loadOrCreateAdminPassword(work string) (string, error) {
 	path := filepath.Join(work, adminPasswordFile)
+	if err := fscheck.CheckWriteTarget(path); err != nil {
+		return "", fmt.Errorf("the admin password file: %w", err)
+	}
 	if b, err := os.ReadFile(path); err == nil {
 		if password := strings.TrimSpace(string(b)); password != "" {
 			return password, nil
@@ -203,10 +210,12 @@ func writeValuesFile(work, name string, values map[string]any) (string, error) {
 }
 
 // writeSecretFile writes bytes to a 0600 file, refusing an existing
-// non-private file at the path.
+// file that is not a private, caller-owned regular file (a symlinked or
+// shared file is refused, not written through — kind-ocp's own boundary
+// policy, reused from internal/fscheck).
 func writeSecretFile(path string, b []byte) error {
-	if info, err := os.Stat(path); err == nil && info.Mode().Perm()&0o077 != 0 {
-		return fmt.Errorf("%s exists with permissive mode %o", path, info.Mode().Perm())
+	if err := fscheck.CheckWriteTarget(path); err != nil {
+		return err
 	}
 	return os.WriteFile(path, b, 0o600)
 }

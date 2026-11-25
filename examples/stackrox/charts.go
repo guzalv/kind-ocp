@@ -14,6 +14,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/stackrox/kind-ocp/internal/fscheck"
 )
 
 // The StackRox chart pins. The chart tarballs are the pinned unit: each is
@@ -55,11 +57,17 @@ type chartPin struct {
 
 // fetchCharts fetches and verifies both pinned charts into the work
 // directory and returns their extracted directories. Nothing is extracted
-// unless the downloaded bytes hash to the recorded digest.
+// unless the downloaded bytes hash to the recorded digest. The charts
+// directory is verified against kind-ocp's boundary policy (the work
+// directory is opened verified; this keeps the check on the entry the
+// extraction actually writes through).
 func fetchCharts(ctx context.Context, work string) (central, secured *chartPin, err error) {
 	chartsDir := filepath.Join(work, "charts")
 	if err := os.MkdirAll(chartsDir, 0o700); err != nil {
 		return nil, nil, fmt.Errorf("creating the charts directory: %w", err)
+	}
+	if err := fscheck.CheckManagedDir(chartsDir); err != nil {
+		return nil, nil, fmt.Errorf("the charts directory: %w", err)
 	}
 	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		return requireHTTPS(req.URL.String())

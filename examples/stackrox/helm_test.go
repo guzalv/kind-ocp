@@ -116,6 +116,49 @@ func TestLoadOrCreateAdminPasswordCreatesThenReuses(t *testing.T) {
 	}
 }
 
+// An existing credential file that is not private is refused before it
+// is read: a shared password file could have been written — or read — by
+// another local user.
+func TestLoadOrCreateAdminPasswordRefusesAPermissiveExistingFile(t *testing.T) {
+	work := t.TempDir()
+	path := filepath.Join(work, adminPasswordFile)
+	if err := os.WriteFile(path, []byte("known-password"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadOrCreateAdminPassword(work); err == nil || !strings.Contains(err.Error(), "mode") {
+		t.Fatalf("loadOrCreateAdminPassword = %v, want a mode rejection", err)
+	}
+	// The refusal must not have replaced the file's contents either.
+	if b, err := os.ReadFile(path); err != nil || string(b) != "known-password" {
+		t.Errorf("the refused file was rewritten: (%q, %v)", b, err)
+	}
+}
+
+// A symlinked credential file is refused, not followed — even when the
+// target is a private file this user owns: whatever left the link could
+// repoint it, and the run would write the password through it (or read
+// a password someone else chose).
+func TestLoadOrCreateAdminPasswordRefusesASymlinkedFile(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	if err := os.WriteFile(target, []byte("chosen-by-someone-else"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	work := filepath.Join(dir, "work")
+	if err := os.Mkdir(work, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(work, adminPasswordFile)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadOrCreateAdminPassword(work); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("loadOrCreateAdminPassword = %v, want a symlink rejection", err)
+	}
+	if b, err := os.ReadFile(target); err != nil || string(b) != "chosen-by-someone-else" {
+		t.Errorf("the symlink target was written through: (%q, %v)", b, err)
+	}
+}
+
 func TestWriteSecretFileRefusesAPermissiveExistingFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "secret")
 	if err := os.WriteFile(path, []byte("old"), 0o644); err != nil {
@@ -123,6 +166,24 @@ func TestWriteSecretFileRefusesAPermissiveExistingFile(t *testing.T) {
 	}
 	if err := writeSecretFile(path, []byte("new")); err == nil {
 		t.Fatal("writeSecretFile overwrote a world-readable file")
+	}
+}
+
+func TestWriteSecretFileRefusesASymlinkedFile(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "link")
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSecretFile(path, []byte("new")); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("writeSecretFile = %v, want a symlink rejection", err)
+	}
+	if b, err := os.ReadFile(target); err != nil || string(b) != "old" {
+		t.Errorf("the symlink target was written through: (%q, %v)", b, err)
 	}
 }
 

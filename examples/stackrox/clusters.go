@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/netip"
 	"net/url"
-	"os"
 	"path/filepath"
 
 	corev1 "k8s.io/api/core/v1"
@@ -17,6 +16,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/stackrox/kind-ocp/config"
+	"github.com/stackrox/kind-ocp/internal/fscheck"
 	"github.com/stackrox/kind-ocp/kindocp"
 )
 
@@ -66,24 +66,33 @@ func ensureClusters(ctx context.Context, cfg *config.Config, log *slog.Logger) (
 
 // openWorkDir prepares the example's private work directory, where the
 // chart archives are extracted and the secret values files are written.
-// It is deliberately outside kind-ocp's state root: the state root is a
-// verified boundary the store walks, and foreign files have no business in
-// it. The directory must be private to the invoking user; an existing
-// group- or world-accessible directory is refused rather than reused.
-func openWorkDir(prefix string) (string, error) {
-	dir := filepath.Join(os.TempDir(), "kind-ocp-stackrox-example", prefix)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", fmt.Errorf("creating the work directory %s: %w", dir, err)
-	}
-	info, err := os.Stat(dir)
+// It sits beside kind-ocp's state root — the same caller-owned
+// neighborhood — and deliberately neither inside the state root (the
+// store's verified tree holds kind-ocp's own state, not foreign files)
+// nor under the system temporary directory (a predictable path there
+// has parents another local user can substitute, and tmp reaping would
+// silently invalidate the reused admin password).
+//
+// The directory is opened through kind-ocp's own filesystem boundary
+// (internal/fscheck — the same policy the state tree walks; the example
+// ships in the same module, so it reuses the implementation instead of
+// forking it): every ancestor is verified before it is trusted,
+// substitutable ancestors and symlinks are refused, and the directory
+// itself is created 0700 or verified caller-owned and private. The
+// resolved path it returns is the one the run writes through — never
+// the alias it started from.
+func openWorkDir(cfg *config.Config) (string, error) {
+	dir := filepath.Join(filepath.Dir(cfg.StateRoot), workDirName, cfg.Prefix)
+	resolved, err := fscheck.OpenManagedDir(dir)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("preparing the work directory %s: %w", dir, err)
 	}
-	if mode := info.Mode().Perm(); mode&0o077 != 0 {
-		return "", fmt.Errorf("the work directory %s is too permissive (%o); it holds the Central admin password — remove it or chmod 700", dir, mode)
-	}
-	return dir, nil
+	return resolved, nil
 }
+
+// workDirName is the workspace directory beside the state root: a
+// sibling of the state root itself, holding one per-prefix directory.
+const workDirName = "kind-ocp-stackrox-example"
 
 // restConfigFor loads a kubeconfig the way an outside consumer does: the
 // explicit path, no ambient context merging. kind-ocp's state kubeconfigs

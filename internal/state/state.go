@@ -57,7 +57,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/stackrox/kind-ocp/internal/fscheck"
@@ -134,7 +133,7 @@ func Open(root string) *Store {
 	if abs, err := filepath.Abs(root); err == nil {
 		root = abs
 	}
-	return &Store{root: root, rootNames: pathNames(root)}
+	return &Store{root: root, rootNames: fscheck.PathNames(root)}
 }
 
 // Root returns the store's root directory as configured. It is for
@@ -150,39 +149,22 @@ func (s *Store) recordPath(name string) string {
 	return filepath.Join(s.clusterDir(name), recordName)
 }
 
-// pathNames splits an absolute path into its components, dropping empty
-// and "." entries ("/" itself yields none).
-func pathNames(path string) []string {
-	var names []string
-	for _, part := range strings.Split(filepath.Clean(path), string(filepath.Separator)) {
-		if part != "" && part != "." {
-			names = append(names, part)
-		}
-	}
-	return names
-}
-
 // walk verifies — and when create is set, creates — every directory from
 // the filesystem root down to the store root joined with extra, applying
 // the boundary policy on the way down, and returns the fully-resolved
-// path it verified:
+// path it verified (fscheck.WalkDirNames carries the policy; the store
+// adds its marker through the walk's root hook):
 //
-//   - components above the store root get the ancestor policy
-//     (fscheck.CheckAncestorDir). An ancestor symlink is trusted only
-//     when the entry itself is caller- or root-owned
-//     (fscheck.CheckAncestorSymlink — in a sticky directory whoever owns
-//     an entry can replace it), and is then resolved hop by hop by
-//     resolveAncestorTarget: every directory component of each target
-//     is checked with the ancestor policy, and a target component that
-//     is itself a symlink must be a trusted entry whose own target is
-//     resolved the same way. EvalSymlinks is deliberately not used for
-//     this — it erases the intermediate links, so a trusted alias could
-//     depend on a swappable entry in an untrusted directory, and a
-//     later walk could resolve to a different tree;
+//   - components above the store root get the ancestor policy. An
+//     ancestor symlink is trusted only when the entry itself is caller-
+//     or root-owned, and is then resolved hop by hop: every directory
+//     component of each target is checked with the ancestor policy, and
+//     a target component that is itself a symlink must be a trusted
+//     entry whose own target is resolved the same way;
 //   - the store root and everything below get the managed policy
-//     (fscheck.CheckManagedDir: caller-owned, private, no symlinks;
-//     no ACL entries where the platform's ACLs can outdo the mode
-//     bits — see the fscheck package doc).
+//     (caller-owned, private, no symlinks; no ACL entries where the
+//     platform's ACLs can outdo the mode bits — see the fscheck
+//     package doc).
 //
 // The returned path is what later operations must use. It contains no
 // symlinks — ancestor components were resolved away and managed
@@ -209,13 +191,10 @@ func (s *Store) walk(extra []string, create bool) (string, error) {
 	if len(s.rootNames) == 0 {
 		return "", fmt.Errorf("state root %s is the filesystem root; refusing to manage it", s.root)
 	}
-	if err := validateComponents(extra); err != nil {
-		return "", err
-	}
 	names := append(append([]string(nil), s.rootNames...), extra...)
 	// The configured root may be reached through ancestor aliases, so
 	// they are trusted and resolved hop by hop.
-	return walkNames(names, len(s.rootNames)-1, true, create, false)
+	return fscheck.WalkDirNames(names, len(s.rootNames)-1, s.walkOptions(create, true))
 }
 
 // walkResolved verifies — and when create is set, creates below — the
@@ -228,16 +207,25 @@ func (s *Store) walk(extra []string, create bool) (string, error) {
 // operation pinned to root onto another tree: what is created,
 // written, and removed stays under root.
 func (s *Store) walkResolved(root string, extra []string, create bool) (string, error) {
-	rootNames := pathNames(root)
+	rootNames := fscheck.PathNames(root)
 	if len(rootNames) == 0 {
 		return "", fmt.Errorf("state root %s is the filesystem root; refusing to manage it", root)
 	}
-	if err := validateComponents(extra); err != nil {
-		return "", err
-	}
 	names := append(append([]string(nil), rootNames...), extra...)
-	path, err := walkNames(names, len(rootNames)-1, false, create, false)
-	return path, err
+	return fscheck.WalkDirNames(names, len(rootNames)-1, s.walkOptions(create, false))
+}
+
+// walkOptions builds the store's walk options. The state marker is
+// written exactly on creating walks — where the walk wrote it before
+// the loop moved into fscheck — so a read-only walk never marks, and a
+// creating walk below an already-marked root re-verifies the marker for
+// free.
+func (s *Store) walkOptions(create, followAliases bool) fscheck.WalkOptions {
+	o := fscheck.WalkOptions{Create: create, FollowAliases: followAliases}
+	if create {
+		o.OnManagedRoot = ensureMarker
+	}
+	return o
 }
 
 // prepareRoot verifies the ancestors of the store root (creating
@@ -259,251 +247,9 @@ func (s *Store) prepareRoot() (string, error) {
 	if len(s.rootNames) == 0 {
 		return "", fmt.Errorf("state root %s is the filesystem root; refusing to manage it", s.root)
 	}
-	return walkNames(s.rootNames, len(s.rootNames)-1, true, true, true)
-}
-
-// validateComponents rejects state path components that are not plain
-// single names: anything else would escape the directory the walk is
-// confined to.
-func validateComponents(extra []string) error {
-	for _, part := range extra {
-		if part == "" || part == "." || part == ".." || strings.ContainsRune(part, filepath.Separator) {
-			return fmt.Errorf("invalid state path component %q", part)
-		}
-	}
-	return nil
-}
-
-// walkNames is the verification loop walk, walkResolved, and prepareRoot
-// share: it walks names from the filesystem root down, applying the
-// ancestor policy to components above ancestors and the managed policy
-// from ancestors on. With followAliases set, an ancestor symlink is
-// trusted and resolved hop by hop, every hop policy-checked and charged
-// to the walk's shared hop budget; with it clear, any symlink in the
-// chain is a refusal (see walkResolved). With create, missing
-// components are created 0700 and the component at ancestors is marked
-// as kind-ocp state. With exclusiveRoot set (create only), the
-// component at ancestors is instead created exclusively: a directory
-// that already exists there — or that wins the Mkdir race — is a
-// refusal, so the walk proceeds only on a tree it created itself (see
-// prepareRoot). The refusal is final — no retry, no adoption after a
-// failed inspection — and the Mkdir rules out pre-existing state only:
-// a directory substituted after the Mkdir, before the walk's
-// subsequent checks on the new tree, is not caught here. The walk's
-// checks are sequential observations, not one atomic snapshot; the
-// callers that must stay pinned to one tree hold the verified
-// directory open and compare (see Removal).
-//
-// The inspections are sequential, not one atomic snapshot: this loop
-// Lstats each component for its own symlink check, and each policy
-// check (fscheck.CheckAncestorDir, CheckManagedDir) performs its own
-// Lstat of the same path afterwards. The walk therefore verifies the
-// chain as a sequence of observations; it does not detect a
-// substitution that happens between two of its inspections within one
-// call. Cross-call substitution is what the callers guard: operations
-// that must stay pinned to one tree hold the verified directory open
-// and compare (see Removal).
-func walkNames(names []string, ancestors int, followAliases, create, exclusiveRoot bool) (string, error) {
-	budget := newHopBudget()
-	cur := "/"
-	for i, name := range names {
-		next := filepath.Join(cur, name)
-		managed := i >= ancestors
-
-		var info fs.FileInfo
-		var err error
-		if exclusiveRoot && i == ancestors {
-			// The Mkdir is both the check and the create: an
-			// existing directory — pre-existing or race-won — is
-			// refused, never adopted. A separate existence check
-			// followed by a create would race with whatever
-			// appears in between.
-			if mkErr := os.Mkdir(next, 0o700); mkErr != nil {
-				if os.IsExist(mkErr) {
-					return "", fmt.Errorf(
-						"state directory %s exists but was not created by this operation — kind-ocp will not act on state it did not prepare; re-run the operation",
-						next)
-				}
-				return "", fmt.Errorf("creating state directory %s: %w", next, mkErr)
-			}
-			// next exists because this walk just created it, and it is
-			// inspected exactly once: whatever that inspection reports
-			// — including that next is suddenly gone — is final, with
-			// no retry and no adoption. A directory substituted after
-			// the inspection passes is not caught by this walk (the
-			// checks are sequential, not atomic); the removal's held
-			// handle detects the replacement at its next step.
-			if info, err = os.Lstat(next); err != nil {
-				return "", fmt.Errorf("checking state directory %s: %w", next, err)
-			}
-		} else {
-			info, err = os.Lstat(next)
-			if os.IsNotExist(err) {
-				if !create {
-					return "", fmt.Errorf("%s: %w", next, fs.ErrNotExist)
-				}
-				if err := os.Mkdir(next, 0o700); err != nil && !os.IsExist(err) {
-					return "", fmt.Errorf("creating state directory %s: %w", next, err)
-				}
-				// Re-inspect whatever is there now (also after a lost
-				// Mkdir race): only what passes the checks is used.
-				if info, err = os.Lstat(next); err != nil {
-					return "", fmt.Errorf("checking state directory %s: %w", next, err)
-				}
-			} else if err != nil {
-				return "", fmt.Errorf("inspecting %s: %w", next, err)
-			}
-		}
-
-		if info.Mode()&fs.ModeSymlink != 0 {
-			if managed {
-				return "", fmt.Errorf("%s is a symlink; kind-ocp refuses symlinks inside its state directory", next)
-			}
-			if !followAliases {
-				return "", fmt.Errorf(
-					"%s is a symlink, but the verified state tree's path is symlink-free — an entry was substituted; refusing to follow it",
-					next)
-			}
-			// Trust the entry, then resolve it: an untrusted entry
-			// (foreign-owned, swappable in a sticky parent) is
-			// refused before anything follows it.
-			if err := fscheck.CheckAncestorSymlink(next); err != nil {
-				return "", err
-			}
-			if err := budget.charge(next); err != nil {
-				return "", err
-			}
-			target, err := os.Readlink(next)
-			if err != nil {
-				return "", fmt.Errorf("reading symlink %s: %w", next, err)
-			}
-			resolved, err := resolveAncestorTarget(next, target, cur, budget)
-			if err != nil {
-				return "", err
-			}
-			if resolved == "/" {
-				return "", fmt.Errorf("symlink %s resolves to the filesystem root; refusing to manage state below it", next)
-			}
-			cur = resolved
-			continue
-		}
-
-		if managed {
-			if err := fscheck.CheckManagedDir(next); err != nil {
-				return "", err
-			}
-			if i == ancestors && create {
-				if err := ensureMarker(next); err != nil {
-					return "", err
-				}
-			}
-		} else if err := fscheck.CheckAncestorDir(next); err != nil {
-			return "", err
-		}
-		cur = next
-	}
-	return cur, nil
-}
-
-// maxAliasHops is the walk's own work limit: the total number of
-// symlink expansions one walk may perform. It is a bound kind-ocp
-// chose for itself — the walk resolves every hop itself with Lstat and
-// Readlink, so the kernel's ELOOP limit never applies — and reaching
-// it is not proof of a loop: the walk refuses work no legitimate state
-// path needs, loop or not. Forty sits comfortably above any real alias
-// chain, platform aliases included (macOS $TMPDIR costs one hop for
-// /var).
-const maxAliasHops = 40
-
-// hopBudget is one walk's share of symlink expansions. Every link the
-// walk follows — the ancestor aliases in the path itself and every
-// nested link their targets traverse — spends from the same budget, so
-// sibling links cannot each restart it: one walk resolves at most
-// maxAliasHops links in total, not per branch.
-type hopBudget struct{ remaining int }
-
-func newHopBudget() *hopBudget { return &hopBudget{remaining: maxAliasHops} }
-
-// charge spends one expansion on link, or reports the budget exhausted
-// (the walk stops there, as it would for a loop).
-func (h *hopBudget) charge(link string) error {
-	if h.remaining <= 0 {
-		return fmt.Errorf("resolving symlink %s needs more than %d symlink hops; refusing to resolve further", link, maxAliasHops)
-	}
-	h.remaining--
-	return nil
-}
-
-// resolveAncestorTarget resolves target — the readlink result of the
-// symlink at link, whose containing directory base has already been
-// verified — to a symlink-free directory, checking every entry the
-// resolution depends on:
-//
-//   - each directory component of the target must pass the ancestor
-//     policy (fscheck.CheckAncestorDir): a target hanging below a
-//     permissive directory is refused, not just a permissive leaf;
-//   - a target component that is itself a symlink must be a trusted
-//     entry (fscheck.CheckAncestorSymlink — whoever can replace an
-//     entry must be trusted) and is then resolved the same way,
-//     recursively.
-//
-// The resolution follows the kernel's rules: components are handled in
-// order, ".." climbs from the position the previous components resolved
-// to, and a relative target is relative to base. Every position is
-// policy-checked before the resolution descends into it, so the
-// returned path depends only on entries the walk has verified — an
-// alias whose way runs through a swappable entry in an untrusted
-// directory cannot pass, and every walk of the same state root verifies
-// the same chain. Every link followed spends from the walk's shared
-// hop budget, so the total number of expansions — not just the nesting
-// depth — is bounded.
-func resolveAncestorTarget(link, target, base string, budget *hopBudget) (string, error) {
-	cur := "/"
-	if !filepath.IsAbs(target) {
-		cur = base
-	}
-	for _, name := range strings.Split(target, string(filepath.Separator)) {
-		switch name {
-		case "", ".":
-			continue
-		case "..":
-			if cur != "/" {
-				cur = filepath.Dir(cur)
-			}
-			continue
-		}
-		next := filepath.Join(cur, name)
-		info, err := os.Lstat(next)
-		if err != nil {
-			return "", fmt.Errorf("resolving symlink %s: %w", link, err)
-		}
-		if info.Mode()&fs.ModeSymlink != 0 {
-			// Another hop: trust the entry, then resolve its own
-			// target the same way.
-			if err := fscheck.CheckAncestorSymlink(next); err != nil {
-				return "", err
-			}
-			if err := budget.charge(next); err != nil {
-				return "", err
-			}
-			sub, err := os.Readlink(next)
-			if err != nil {
-				return "", fmt.Errorf("reading symlink %s: %w", next, err)
-			}
-			if cur, err = resolveAncestorTarget(next, sub, cur, budget); err != nil {
-				return "", err
-			}
-			continue
-		}
-		if !info.IsDir() {
-			return "", fmt.Errorf("symlink %s points at %s, which is not a directory", link, next)
-		}
-		if err := fscheck.CheckAncestorDir(next); err != nil {
-			return "", err
-		}
-		cur = next
-	}
-	return cur, nil
+	o := s.walkOptions(true, true)
+	o.ExclusiveRoot = true
+	return fscheck.WalkDirNames(s.rootNames, len(s.rootNames)-1, o)
 }
 
 // EnsureRoot verifies the store's ancestors and the store root itself,
@@ -723,7 +469,8 @@ func requireMarker(root string) error {
 // filesystem that would hand a replacement the freed directory's very
 // own identity. The handle is taken on the resolved path right after
 // verification; a substitution in the window between the walk's
-// inspections and this open is not detected by the pin (see walkNames).
+// inspections and this open is not detected by the pin (see
+// fscheck.WalkDirNames).
 func openRootDir(resolved string) (*os.File, error) {
 	f, err := os.Open(resolved)
 	if err != nil {

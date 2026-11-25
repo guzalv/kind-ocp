@@ -60,29 +60,92 @@ func TestResolveConfigAppliesOverrides(t *testing.T) {
 
 func intPtr(i int) *int { return &i }
 
-func TestOpenWorkDirIsPrivate(t *testing.T) {
-	dir, err := openWorkDir("quote-test")
+// mustWorkConfig resolves a config whose state root sits under dir, so
+// the workspace openWorkDir derives from it lands under dir too and the
+// test cleans up with the temp dir.
+func mustWorkConfig(t *testing.T, dir, prefix string) *config.Config {
+	t.Helper()
+	return mustConfig(t, prefix, filepath.Join(dir, "kind-ocp"))
+}
+
+func TestOpenWorkDirCreatesAPrivatePerPrefixDirectory(t *testing.T) {
+	base := t.TempDir()
+	cfg := mustWorkConfig(t, base, "quote-test")
+	dir, err := openWorkDir(cfg)
 	if err != nil {
 		t.Fatalf("openWorkDir = %v", err)
 	}
-	defer func() { _ = os.RemoveAll(filepath.Dir(dir)) }()
-	if !strings.HasSuffix(dir, filepath.Join("kind-ocp-stackrox-example", "quote-test")) {
-		t.Errorf("the work dir %q is not per-prefix", dir)
+	if want := filepath.Join(base, "kind-ocp-stackrox-example", "quote-test"); dir != want {
+		// The walk resolves ancestor aliases (macOS temp dirs live
+		// under the /var symlink), so compare against the resolved
+		// form of the expected path — the run writes through exactly
+		// what the walk verified.
+		resolved, err := filepath.EvalSymlinks(want)
+		if err != nil || dir != resolved {
+			t.Errorf("the work dir %q is not the per-prefix sibling of the state root, want %q (resolved %q)", dir, want, resolved)
+		}
 	}
 	info, err := os.Stat(dir)
 	if err != nil || info.Mode().Perm() != 0o700 {
-		t.Errorf("the work dir mode = %v err %v, want 0700", info, err)
+		t.Errorf("the work dir mode = (%v, %v), want 0700", info, err)
+	}
+	// The second open adopts the directory the first run left behind —
+	// the admin password is reused across runs, so this is the path a
+	// re-run takes.
+	again, err := openWorkDir(cfg)
+	if err != nil || again != dir {
+		t.Errorf("re-open = (%q, %v), want (%q, nil)", again, err, dir)
 	}
 }
 
 func TestOpenWorkDirRefusesAPermissiveExistingDirectory(t *testing.T) {
-	dir := filepath.Join(os.TempDir(), "kind-ocp-stackrox-example", "permissive-test")
+	base := t.TempDir()
+	cfg := mustWorkConfig(t, base, "permissive-test")
+	dir := filepath.Join(base, workDirName, "permissive-test")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = os.RemoveAll(dir) }()
-	if _, err := openWorkDir("permissive-test"); err == nil {
-		t.Fatal("openWorkDir accepted a world-readable directory that holds secrets")
+	if _, err := openWorkDir(cfg); err == nil || !strings.Contains(err.Error(), "mode") {
+		t.Fatalf("openWorkDir = %v, want a mode rejection (the directory holds the admin password)", err)
+	}
+}
+
+func TestOpenWorkDirRefusesASymlinkedWorkspace(t *testing.T) {
+	base := t.TempDir()
+	cfg := mustWorkConfig(t, base, "symlinked-test")
+	target := filepath.Join(base, "elsewhere")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Join(base, workDirName)
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Even a private, caller-owned target: the managed region refuses
+	// the symlink itself, so nothing can redirect the workspace.
+	if err := os.Symlink(target, filepath.Join(parent, "symlinked-test")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openWorkDir(cfg); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("openWorkDir = %v, want a symlink rejection", err)
+	}
+}
+
+// The workspace's ancestors are verified, not assumed: a directory
+// another local user can write (group- or world-writable, no sticky bit)
+// can substitute the workspace entries below it, so the parent of the
+// per-prefix directory is held to the ancestor policy too.
+func TestOpenWorkDirRefusesASubstitutableAncestor(t *testing.T) {
+	base := t.TempDir()
+	cfg := mustWorkConfig(t, base, "substituted-test")
+	if err := os.MkdirAll(filepath.Join(base, workDirName), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(base, workDirName), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openWorkDir(cfg); err == nil || !strings.Contains(err.Error(), "writable") {
+		t.Fatalf("openWorkDir = %v, want a substitutable-ancestor rejection", err)
 	}
 }
 

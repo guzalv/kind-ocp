@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stackrox/kind-ocp/internal/fscheck"
 )
 
 func TestOpenIsLazyAndEnsureCreatesPerms(t *testing.T) {
@@ -736,7 +738,7 @@ func TestWalkChecksEveryAliasHop(t *testing.T) {
 			return names
 		}
 
-		over := links(t, "over", maxAliasHops+5)
+		over := links(t, "over", fscheck.MaxAliasHops+5)
 		alias := filepath.Join(dir, "budget")
 		if err := os.Symlink(strings.Join(over, string(filepath.Separator)), alias); err != nil {
 			t.Fatal(err)

@@ -10,10 +10,14 @@ service on another and stayed connected.
 
 It is an example, not product functionality: kind-ocp creates the clusters
 and applies the OpenShift layers; everything here deploys third-party
-software on top of them. The code uses only kind-ocp's public surface
-(`config`, `kindocp`) plus the standard Kubernetes Go clients, the way an
-outside consumer would, and lives as a `package main` so nothing can import
-it.
+software on top of them. The code drives kind-ocp through its public
+surface (`config`, `kindocp`) plus the standard Kubernetes Go clients,
+the way an outside consumer would, and lives as a `package main` so
+nothing can import it. Its credential workspace is the one part that
+reaches inside the module: it is verified with kind-ocp's internal
+filesystem boundary (`internal/fscheck`), the same policy the state tree
+walks, reused rather than forked. An outside consumer would keep its
+credentials under a caller-owned directory it verifies itself.
 
 ## What it does
 
@@ -93,14 +97,23 @@ StackRox version and should stay on the same appVersion.
 
 ## Secrets handling
 
-- The Central admin password is generated once (crypto/rand), stored `0600`
-  in the work directory (`$TMPDIR/kind-ocp-stackrox-example/<prefix>/`),
-  reused across runs, and never printed or logged.
-- The cluster registration secret rides in the Sensor values files, written
-  `0600` and passed to helm with `-f` — never through argv, which other
-  local users could read.
-- The work directory must be `0700`; an existing more permissive one is
-  refused.
+- The work directory sits beside kind-ocp's state root (default
+  `~/.local/state/kind-ocp-stackrox-example/<prefix>/`), not under the
+  system temporary directory: it holds persistent credentials, and a
+  predictable temp path has parents another local user could substitute.
+- The directory is opened through kind-ocp's own filesystem boundary:
+  every ancestor is verified before it is trusted (substitutable
+  ancestors, symlinks, and permissive directories are refused), and the
+  directory itself is created `0700` or verified caller-owned and
+  private. The run writes through the resolved path the walk returned.
+- The Central admin password is generated once (crypto/rand), stored
+  `0600` in the work directory, reused across runs, and never printed or
+  logged. Every credential file — the password and the Sensor values
+  files — is checked private (owner, mode, no symlink) before each read
+  and write; a symlinked or shared file is refused, not followed.
+- The cluster registration secret rides in the Sensor values files,
+  written `0600` and passed to helm with `-f` — never through argv,
+  which other local users could read.
 
 ## Why the Sensors do not run in OpenShift mode
 
@@ -117,9 +130,13 @@ that half.
 ## Known limitations
 
 - Central's chart generates a self-signed certificate; the example's own
-  API client skips TLS verification for its loopback port-forward (the
-  Sensors' connection is separate: mTLS with their registration identity
-  over the shared network, verified by the readiness wait).
+  API client skips TLS verification for its loopback port-forward. That
+  tunnel is bounded: client-go binds its listener on `127.0.0.1` only,
+  picks the local port itself, and every authenticated call runs under a
+  context cancelled the moment the forward exits — so the admin password
+  never travels to a local port the forward does not own (the Sensors'
+  connection is separate: mTLS with their registration identity over the
+  shared network, verified by the readiness wait).
 - With the collector disabled there is no runtime process-level signal
   collection; that is a deliberate scope cut for a topology example, not a
   supported deployment shape.

@@ -365,6 +365,12 @@ func TestRevokeSurfacesACentralRefusal(t *testing.T) {
 			if !strings.Contains(err.Error(), "crs-1") {
 				t.Errorf("the error %q does not name the CRS Central failed to revoke", err.Error())
 			}
+			// The per-ID refusal must be pinned by its own words: the
+			// ID alone would not tell it apart from the missing
+			// revoked-id coverage, which names the ID too.
+			if name == "refused" && !strings.Contains(err.Error(), "impacted by policy") {
+				t.Errorf("the error %q does not carry Central's refusal text", err.Error())
+			}
 		})
 	}
 }
