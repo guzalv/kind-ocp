@@ -83,6 +83,97 @@ func TestRecordRoundtrip(t *testing.T) {
 	}
 }
 
+// The expected-cluster count create persists round-trips through the
+// marker, and a tree that never carried one (an older binary's, or a
+// missing tree) reports its absence instead of an error — verify
+// degrades to a SKIP on that, never a false FAIL.
+func TestExpectedClustersRoundTrip(t *testing.T) {
+	store := Open(filepath.Join(t.TempDir(), "state"))
+	if _, err := store.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := store.ExpectedClusters(); err != nil || found {
+		t.Fatalf("ExpectedClusters on a fresh root = (%v, %v), want (false, nil)", found, err)
+	}
+	if err := store.SetExpectedClusters(2); err != nil {
+		t.Fatal(err)
+	}
+	got, found, err := store.ExpectedClusters()
+	if err != nil || !found || got != 2 {
+		t.Fatalf("ExpectedClusters after SetExpectedClusters(2) = (%d, %v, %v), want (2, true, nil)", got, found, err)
+	}
+	// An absent tree is no expectation, not an error.
+	other := Open(filepath.Join(t.TempDir(), "gone"))
+	if _, found, err := other.ExpectedClusters(); err != nil || found {
+		t.Fatalf("ExpectedClusters on an absent tree = (%v, %v), want (false, nil)", found, err)
+	}
+}
+
+// setMarkerField preserves fields this binary does not know: the
+// marker's compatibility rule (unknown fields are ignored, not
+// interpreted) must hold for writers as well as readers, so a rewrite
+// by an older binary drops nothing a newer one recorded.
+func TestSetExpectedClustersPreservesUnknownMarkerFields(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "state")
+	store := Open(root)
+	if _, err := store.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, markerName)
+	if err := os.WriteFile(path, []byte(`{"tool":"kind-ocp","futureField":"keep me"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetExpectedClusters(3); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(b, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc["futureField"] != "keep me" {
+		t.Errorf("the unknown field did not survive the rewrite: %s", b)
+	}
+	if doc["expectedClusters"] != float64(3) {
+		t.Errorf("expectedClusters = %v, want 3", doc["expectedClusters"])
+	}
+	if doc["tool"] != "kind-ocp" {
+		t.Errorf("tool = %v, want kind-ocp", doc["tool"])
+	}
+	// The marker is still 0600 and still validates.
+	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0o600 {
+		t.Errorf("marker mode after rewrite = %v err %v, want 0600", info, err)
+	}
+	if _, found, err := readMarker(root); err != nil || !found {
+		t.Errorf("readMarker after rewrite = (%v, %v), want (true, nil)", found, err)
+	}
+}
+
+// A tree whose marker does not identify kind-ocp is never written into:
+// the walk refuses it before setMarkerField runs, and the marker is
+// left exactly as it was.
+func TestSetExpectedClustersRefusesAForeignMarker(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "state")
+	store := Open(root)
+	if _, err := store.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, markerName)
+	foreign := `{"tool":"other-tool"}`
+	if err := os.WriteFile(path, []byte(foreign), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetExpectedClusters(2); err == nil {
+		t.Fatal("SetExpectedClusters on a foreign marker must fail")
+	}
+	if b, err := os.ReadFile(path); err != nil || string(b) != foreign {
+		t.Errorf("the foreign marker was rewritten: (%q, %v)", b, err)
+	}
+}
+
 func TestRecordsSortedAndEmpty(t *testing.T) {
 	t.Run("empty store", func(t *testing.T) {
 		store := Open(filepath.Join(t.TempDir(), "state"))
@@ -1693,7 +1784,7 @@ func TestCacheDirFor(t *testing.T) {
 		}
 		// Creating a layer cache is creating state: the root carries the
 		// marker, so a later delete recognizes and removes the tree.
-		if _, err := readMarker(root); err != nil {
+		if _, _, err := readMarker(root); err != nil {
 			t.Errorf("state marker: %v", err)
 		}
 	})

@@ -52,7 +52,9 @@ registration secret (revoked and regenerated under the recipe's name).
 
 ## Prerequisites
 
-- Everything kind-ocp needs (see the root README): Docker, Go 1.27+.
+- Everything kind-ocp needs (see the root README): Docker (client and
+  daemon, plus the buildx CLI plugin for the full profile), Go 1.27.4 or
+  newer.
 - The `helm` CLI, v3 or newer.
 - Network access to `charts.stackrox.io` (charts, verified against recorded
   SHA-256 digests) and `quay.io/stackrox-io` (the released public images the
@@ -66,13 +68,62 @@ go run ./examples/stackrox
 
 Flags mirror kind-ocp's own: `--prefix` (default `kind-ocp`), `--count`
 (default 2, minimum 2 — Central on 1, Sensor on 2..N), `--state-root`
-(default `$XDG_STATE_HOME/kind-ocp`). The example always uses profile
-`full` and never reads a kind-ocp config file: it is a recipe, and an
-ambient config changing what it deploys would be a surprise, not a feature.
+(default `$XDG_STATE_HOME/kind-ocp`). Two optional flags overlay your own
+helm values on the generated ones (see
+[pointing the example at your own images](#pointing-the-example-at-your-own-images)):
+`--central-values <file>` for the Central release and
+`--sensor-values <file>` for every Sensor release. The example always
+uses profile `full` and never reads a kind-ocp config file: it is a
+recipe, and an ambient config changing what it deploys would be a
+surprise, not a feature.
 
 On success the run prints the Central endpoint, the admin password's
 location, a port-forward command for the Central UI, and the exact cleanup
 command (`kind-ocp delete`).
+
+## What this run proves — and what it does not
+
+Proven, end to end: Central deployed and serving, cross-cluster NodePort
+reachability (every Sensor is a workload pod on one cluster that reached
+a NodePort service on another and stayed connected), and every Sensor
+cluster registered and reporting `HEALTHY` in Central.
+
+Not proven: anything that needs real OpenShift. The example pins
+`env.openshift: false` for both charts, so StackRox's OpenShift
+deployment mode — the SCC and Route paths — is never exercised (see
+[why the Sensors do not run in OpenShift mode](#why-the-sensors-do-not-run-in-openshift-mode)).
+And nothing anywhere in this repo drives a scan from Central to results:
+the Compliance Operator proof covers operator-initiated scans, this
+example covers deployment and connectivity. A Central-driven
+scan-to-results round trip still needs a real OpenShift cluster or a
+future proof.
+
+## Pointing the example at your own images
+
+The pinned released charts stay the default path, fetched and
+digest-verified exactly as before. When you are testing your own build —
+a Sensor off an unmerged branch, say — pass a values file instead of
+editing the repo:
+
+```sh
+# my-sensor.yaml — point the Sensor at an engineer-built image.
+# The chart composes every component image; `image.main` is the one
+# Sensor, Admission Control, and Compliance run.
+image:
+  main:
+    fullRef: my-registry.example.com/stackrox/main:my-branch
+go run ./examples/stackrox --sensor-values my-sensor.yaml
+```
+
+helm merges the later file over the example's generated values, so only
+the keys you set change; everything the recipe pins (the registration
+secret, the shrunk resource requests, the disabled collector) stays.
+`--central-values` works the same way for the Central release. Both
+flags accept one file each; the file must be a private, caller-owned
+regular file (a values file can carry secrets, so the example refuses a
+symlinked or world-readable one), its contents are never logged, and
+your images must be pullable from every cluster (kind nodes have no
+registry access beyond what the daemon and the network allow).
 
 ## Pins and determinism
 

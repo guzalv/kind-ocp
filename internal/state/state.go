@@ -112,8 +112,15 @@ const (
 // marked as its own. The recognized format is a JSON object whose "tool" is
 // "kind-ocp"; unknown fields (a version number, in older trees) are
 // ignored rather than interpreted.
+//
+// ExpectedClusters is one such field, written by create: the number of
+// clusters the run set out to build (see SetExpectedClusters). A pointer
+// so an absent field — a tree written by an older binary — stays
+// distinguishable from a recorded zero, which no create can produce
+// (count is validated ≥ 1 before the expectation is persisted).
 type marker struct {
-	Tool string `json:"tool"`
+	Tool             string `json:"tool"`
+	ExpectedClusters *int   `json:"expectedClusters,omitempty"`
 }
 
 // Store is the state directory for one prefix:
@@ -262,6 +269,94 @@ func (s *Store) prepareRoot() (string, error) {
 // returns the fully-resolved root path.
 func (s *Store) EnsureRoot() (string, error) {
 	return s.walk(nil, true)
+}
+
+// SetExpectedClusters records the number of clusters create is setting
+// out to build for this prefix, in the state marker the root already
+// carries (the creating walk wrote or validated it). Verify's
+// whole-prefix count assertion reads this expectation — never a count
+// resolved at verify time — so it reports what create built, whatever
+// count a later verify invocation would resolve.
+//
+// The rest of the marker survives byte-for-byte (see setMarkerField),
+// and a marker that does not validate is an error, never a rewrite: a
+// tree kind-ocp cannot prove its own is one it must not touch.
+func (s *Store) SetExpectedClusters(count int) error {
+	root, err := s.walk(nil, true)
+	if err != nil {
+		return err
+	}
+	if err := setMarkerField(root, "expectedClusters", count); err != nil {
+		return fmt.Errorf("recording the expected cluster count: %w", err)
+	}
+	return nil
+}
+
+// ExpectedClusters returns the number of clusters the last create set
+// out to build for this prefix, from the state marker. found is false
+// when the tree carries no such value — a state root written by an
+// older binary, or a marker that predates the field — and that is not
+// an error: verify degrades to a SKIP, never a false FAIL. The returned
+// count is whatever the marker carries; a value no create could have
+// written (zero or negative) is the caller's to classify.
+func (s *Store) ExpectedClusters() (count int, found bool, err error) {
+	root, err := s.walk(nil, false)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	m, found, err := readMarker(root)
+	if err != nil || !found {
+		return 0, false, err
+	}
+	if m.ExpectedClusters == nil {
+		return 0, false, nil
+	}
+	return *m.ExpectedClusters, true, nil
+}
+
+// setMarkerField sets one top-level field of the state marker in root,
+// rewriting the JSON object with only the named key replaced. The
+// marker's compatibility rule — unknown fields are ignored, not
+// interpreted — then holds for writers as well as readers: a binary
+// that does not know a newer field leaves it alone when it records its
+// own. The marker must validate first (a foreign or malformed marker
+// is an error, never a rewrite), and the write goes through the same
+// boundary checks every state write does.
+func setMarkerField(root string, field string, value any) error {
+	path := filepath.Join(root, markerName)
+	if err := fscheck.CheckWriteTarget(path); err != nil {
+		return err
+	}
+	if _, found, err := readMarker(root); err != nil || !found {
+		if err == nil {
+			err = fmt.Errorf("%s carries no %s", path, markerName)
+		}
+		return err
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(b, &doc); err != nil {
+		return fmt.Errorf("parsing %s: %w", path, err)
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	doc[field] = encoded
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		return fmt.Errorf("writing %s: %w", path, err)
+	}
+	return nil
 }
 
 // ensureClusterDir creates the cluster's state directory (0700, parents
@@ -448,7 +543,7 @@ func (s *Store) CheckKubeconfig(name string) (string, error) {
 // own, so a pre-existing unrelated directory under a custom state root
 // is never deleted.
 func requireMarker(root string) error {
-	found, err := readMarker(root)
+	_, found, err := readMarker(root)
 	if err != nil {
 		return err
 	}
@@ -766,7 +861,7 @@ func (r *Removal) Remove() error {
 // present but unreadable, malformed, or foreign marker is an error, not a
 // rewrite: a tree kind-ocp cannot prove its own is one it must not touch.
 func ensureMarker(root string) error {
-	found, err := readMarker(root)
+	_, found, err := readMarker(root)
 	if err != nil || found {
 		return err
 	}
@@ -786,32 +881,34 @@ func ensureMarker(root string) error {
 	return nil
 }
 
-// readMarker reports whether the store root carries a valid state marker.
-// found is false without an error when no marker exists; a present but
-// unreadable, malformed, or foreign marker is an error.
-func readMarker(root string) (found bool, err error) {
+// readMarker reads and validates the state marker in root. found is
+// false without an error when no marker exists; a present but
+// unreadable, malformed, or foreign marker is an error. The parsed
+// marker is returned so callers can read fields the walk does not
+// interpret (ExpectedClusters); its unknown-field rule lives here —
+// fields this binary does not know are ignored, never rejected.
+func readMarker(root string) (m marker, found bool, err error) {
 	path := filepath.Join(root, markerName)
 	if err := fscheck.CheckPrivateFile(path); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return false, nil
+			return marker{}, false, nil
 		}
-		return false, err
+		return marker{}, false, err
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return false, nil
+			return marker{}, false, nil
 		}
-		return false, err
+		return marker{}, false, err
 	}
-	var m marker
 	if err := json.Unmarshal(b, &m); err != nil {
-		return false, fmt.Errorf("parsing %s: %w", path, err)
+		return marker{}, false, fmt.Errorf("parsing %s: %w", path, err)
 	}
 	if m.Tool != "kind-ocp" {
-		return false, fmt.Errorf("%s does not identify kind-ocp state (tool %q)", path, m.Tool)
+		return marker{}, false, fmt.Errorf("%s does not identify kind-ocp state (tool %q)", path, m.Tool)
 	}
-	return true, nil
+	return m, true, nil
 }
 
 // writeMarker creates the state marker (0600). A concurrent writer that
@@ -826,7 +923,7 @@ func writeMarker(root string) error {
 		if !os.IsExist(err) {
 			return err
 		}
-		_, err = readMarker(root)
+		_, _, err = readMarker(root)
 		return err
 	}
 	if _, err := f.Write(b); err != nil {

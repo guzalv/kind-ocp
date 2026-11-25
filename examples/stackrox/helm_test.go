@@ -1,10 +1,15 @@
 package main
 
 import (
+	"context"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -184,6 +189,111 @@ func TestWriteSecretFileRefusesASymlinkedFile(t *testing.T) {
 	}
 	if b, err := os.ReadFile(target); err != nil || string(b) != "old" {
 		t.Errorf("the symlink target was written through: (%q, %v)", b, err)
+	}
+}
+
+// The values overrides ride the same privacy rule as the credentials:
+// a values file can carry secrets, so it must be a private,
+// caller-owned regular file before helm is pointed at it, and a file
+// that is not is refused with the flag that named it.
+func TestCheckValuesOverrides(t *testing.T) {
+	t.Run("no flags, no overrides", func(t *testing.T) {
+		o, err := checkValuesOverrides("", "")
+		if err != nil || o.central != "" || o.sensor != "" {
+			t.Fatalf("checkValuesOverrides() = (%+v, %v), want empty overrides and no error", o, err)
+		}
+	})
+	t.Run("private files pass", func(t *testing.T) {
+		dir := t.TempDir()
+		central := filepath.Join(dir, "central.yaml")
+		sensor := filepath.Join(dir, "sensor.yaml")
+		for _, p := range []string{central, sensor} {
+			if err := os.WriteFile(p, []byte("image: {}\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		o, err := checkValuesOverrides(central, sensor)
+		if err != nil {
+			t.Fatalf("checkValuesOverrides = %v, want acceptance", err)
+		}
+		if o.central != central || o.sensor != sensor {
+			t.Errorf("overrides = %+v, want the given paths", o)
+		}
+	})
+	t.Run("missing file is refused", func(t *testing.T) {
+		if _, err := checkValuesOverrides(filepath.Join(t.TempDir(), "absent.yaml"), ""); err == nil {
+			t.Fatal("a missing values file must be refused")
+		}
+	})
+	t.Run("permissive file is refused", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "values.yaml")
+		if err := os.WriteFile(path, []byte("image: {}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		_, err := checkValuesOverrides("", path)
+		if err == nil || !strings.Contains(err.Error(), "--sensor-values") {
+			t.Fatalf("checkValuesOverrides = %v, want a refusal naming --sensor-values", err)
+		}
+	})
+	t.Run("symlinked file is refused", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, "target")
+		if err := os.WriteFile(target, []byte("image: {}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(dir, "values.yaml")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := checkValuesOverrides(link, ""); err == nil {
+			t.Fatal("a symlinked values file must be refused, not followed")
+		}
+		if b, err := os.ReadFile(target); err != nil || string(b) != "image: {}\n" {
+			t.Errorf("the symlink target changed: (%q, %v)", b, err)
+		}
+	})
+}
+
+// helmRunner hands helm one -f per values file, in order: the generated
+// values first, the user's override after — helm merges later files over
+// earlier ones, so the override wins where the two disagree. The test
+// runs a stub helm that records its argv, so the assertion is about the
+// real command line, not a rendered string.
+func TestUpgradeInstallOrdersValuesFiles(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no POSIX sh available")
+	}
+	dir := t.TempDir()
+	argsFile := filepath.Join(dir, "argv")
+	stub := filepath.Join(dir, "helm")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + shellQuote(argsFile) + "\n"
+	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	generated := filepath.Join(dir, "values-sensor-kind-ocp-2.yaml")
+	override := filepath.Join(dir, "my-sensor.yaml")
+	runner := helmRunner{binary: stub}
+	err := runner.upgradeInstall(context.Background(), io.Discard,
+		"/work/charts/stackrox-secured-cluster-services", "/state/clusters/kind-ocp-2/kubeconfig",
+		[]string{generated, override}, time.Minute)
+	if err != nil {
+		t.Fatalf("upgradeInstall = %v", err)
+	}
+	b, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Split(strings.TrimSuffix(string(b), "\n"), "\n")
+	want := []string{
+		"upgrade", "--install", "stackrox-secured-cluster-services", "/work/charts/stackrox-secured-cluster-services",
+		"--namespace", "stackrox", "--create-namespace",
+		"--kubeconfig", "/state/clusters/kind-ocp-2/kubeconfig",
+		"-f", generated, "-f", override,
+		"--wait", "--timeout", "1m0s",
+	}
+	if !slices.Equal(args, want) {
+		t.Errorf("helm argv = %q, want %q (override after the generated values)", args, want)
 	}
 }
 

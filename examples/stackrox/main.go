@@ -25,6 +25,10 @@
 // verified against recorded SHA-256 digests; the images are the released
 // public tags the chart itself references (quay.io/stackrox-io, appVersion
 // 5.0.0), so a chart bump is an image bump — see the pins in charts.go.
+// Values overrides (--central-values, --sensor-values) let an engineer
+// point the releases at their own images without editing the repo; the
+// pinned released charts stay the default path and their digest
+// verification is unchanged.
 //
 // Secrets handling: the generated Central admin password and the cluster
 // registration secret are written only to 0600 files (checked private
@@ -66,6 +70,8 @@ func main() {
 	prefix := flag.String("prefix", "", "cluster name prefix (default kind-ocp)")
 	count := flag.Int("count", 0, "number of clusters; Central on 1, Sensor on 2..N (default 2)")
 	stateRoot := flag.String("state-root", "", "kind-ocp state root (default $XDG_STATE_HOME/kind-ocp)")
+	centralValues := flag.String("central-values", "", "optional helm values file overlaid on the generated Central values (helm merges later files over earlier ones)")
+	sensorValues := flag.String("sensor-values", "", "optional helm values file overlaid on every cluster's generated Sensor values (later files win)")
 	flag.Parse()
 
 	// The recipe controls the profile (full): the OpenShift layers are the
@@ -78,12 +84,18 @@ func main() {
 	if cfg.Count < 2 {
 		fail(fmt.Errorf("--count must be at least 2: the example puts Central on cluster 1 and Sensor on clusters 2..N (got %d)", cfg.Count))
 	}
+	// The values overrides are validated before the clusters are
+	// touched: a bad path is a startup error, not a mid-deploy one.
+	overrides, err := checkValuesOverrides(*centralValues, *sensorValues)
+	if err != nil {
+		fail(err)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	if err := deploy(ctx, cfg, log); err != nil {
+	if err := deploy(ctx, cfg, log, overrides); err != nil {
 		fail(err)
 	}
 }
@@ -96,7 +108,10 @@ func fail(err error) {
 // deploy runs the whole recipe. Each phase's errors name the phase; the
 // clusters are kind-ocp clusters and stay in place on failure, so the
 // standard cleanup (kind-ocp delete) applies to every failure path.
-func deploy(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
+// overrides (optional, from --central-values/--sensor-values) are
+// passed to helm after the generated values files, so the user's keys
+// win where the two disagree.
+func deploy(ctx context.Context, cfg *config.Config, log *slog.Logger, overrides valuesOverrides) error {
 	records, kubeconfigs, err := ensureClusters(ctx, cfg, log)
 	if err != nil {
 		return err
@@ -135,7 +150,11 @@ func deploy(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	if err := helm.upgradeInstall(ctx, os.Stderr, centralChart.dir, centralKubeconfig, valuesPath, helmTimeout); err != nil {
+	centralValues := []string{valuesPath}
+	if overrides.central != "" {
+		centralValues = append(centralValues, overrides.central)
+	}
+	if err := helm.upgradeInstall(ctx, os.Stderr, centralChart.dir, centralKubeconfig, centralValues, helmTimeout); err != nil {
 		return fmt.Errorf("deploying Central on %s: %w", centralCluster, err)
 	}
 	log.Info("Central deployed", "cluster", centralCluster)
@@ -201,7 +220,11 @@ func deploy(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		if err != nil {
 			return err
 		}
-		if err := helm.upgradeInstall(ctx, os.Stderr, securedChart.dir, kubeconfigs[name], valuesPath, helmTimeout); err != nil {
+		sensorValues := []string{valuesPath}
+		if overrides.sensor != "" {
+			sensorValues = append(sensorValues, overrides.sensor)
+		}
+		if err := helm.upgradeInstall(ctx, os.Stderr, securedChart.dir, kubeconfigs[name], sensorValues, helmTimeout); err != nil {
 			return fmt.Errorf("deploying Sensor on %s: %w", name, err)
 		}
 		log.Info("Sensor deployed", "cluster", name)

@@ -238,7 +238,15 @@ marker (`kind-ocp-state.json`); an existing unmarked directory is adopted
 only when empty, and recursive cleanup (`delete`) only ever removes a
 marked, verified tree — a pre-existing unrelated directory under a custom
 `--state-root` is never deleted, and `delete` checks that before deleting
-any cluster, so a refusal leaves everything in place.
+any cluster, so a refusal leaves everything in place. The marker also
+carries the expected cluster count (`expectedClusters`): `create`
+persists the number of clusters it is setting out to build, before the
+first cluster is provisioned, and `verify`'s whole-prefix count
+assertion reads exactly that — never a count resolved at verify time
+(§3.3: create-only values are not read outside create). A marker written
+by an older binary carries no such field and verify degrades to a SKIP
+with the remedy, never a false FAIL; rewrites preserve unknown fields,
+so the marker's ignore-don't-interpret rule holds for writers too.
 
 Each record carries the cluster's
 **instance ID** (the kube-system namespace UID): create binds it once the
@@ -323,7 +331,11 @@ every later cluster depends on — so the concurrent wave never races on either.
 Before the fan-out, create checks cancellation, then ensures the state root
 once (the discipline `state.walk` prescribes for concurrent creation — and the
 boundary check the host tune runs behind, so a run whose state root is refused
-never changed host settings on its way to failing), and only then asks the
+never changed host settings on its way to failing), records the run's
+cluster count in the state marker (the expectation verify's whole-prefix
+count assertion reads — persisted before the first cluster is
+provisioned, so an interrupted create leaves an honest shortfall
+behind), and only then asks the
 provisioner — only when it implements the optional host-limit capability
 (`provider.HostLimitRaiser`), which the kind runtime does — to raise
 `fs.inotify.max_user_instances` best-effort (Linux only, warn on refusal,
@@ -358,6 +370,28 @@ An `instance-id` FAIL stops that cluster's remaining checks: they are
 meaningless against a cluster the record does not describe. Output is
 one line per check: PASS / FAIL (with detail) / SKIP (with reason). Any
 FAIL exits non-zero. `verify <name>…` restricts to named clusters.
+
+The whole-prefix form (no names — the audit form) opens with a
+prefix-scoped `cluster-count` line: every cluster the last create set
+out to build, per the expectation create persisted in the state marker,
+must be in the inventory (the union of the provisioner's clusters and
+the state records). This closes the increment-10 finding: a cluster
+whose container and state record both vanished is invisible to `list`
+and to every per-cluster check, and the survivors alone reported
+all-PASS. The assertion reads only the persisted expectation — never a
+verify-time count resolution, so a prefix created with `--count 3`
+verified by a plain `verify` that would resolve count 2 reports the
+create's truth. A state root without an expectation (older binary), a
+marker that cannot be read, or a value no create could have written all
+degrade to a SKIP with reason and remedy — never a false FAIL, never
+blocking the clusters that exist. Only a valid expectation with named
+clusters missing from both the provisioner and state FAILs, naming the
+clusters and the recovery (re-run create: present clusters are reused,
+vanished ones are built fresh). Extra prefix-scoped clusters beyond the
+expectation are not a FAIL — leftovers from a larger count are a
+supported state, and each gets its own lines. The named form runs no
+count assertion: a targeted verify during recovery must not fail on a
+sibling.
 
 The cross-cluster NodePort check (AC-1.4, the Central→Sensor pattern's
 requirement) runs after the per-cluster checks, over exactly the
@@ -910,7 +944,7 @@ that pin them, and §3.
   basename derives a distinct sibling, and both alias-overlap shapes
   are refused without writes. The README documents that
   `kind-ocp delete` leaves the work directory and how to remove it.
-- [ ] **10. Usability and honesty pass (pre-publication).** Findings from
+- [x] **10. Usability and honesty pass (pre-publication).** Findings from
   the final target-user review. Code: `verify` must fail when the
   expected cluster count and the live inventory disagree — today a
   cluster whose record and cluster both vanished drops out of the
@@ -939,6 +973,79 @@ that pin them, and §3.
   registry, or MachineConfig reconciliation (document as limits);
   publishing (remote, tags, final module path, clean-machine install
   test) stays with the repository owner.
+  Delivered: the count assertion is a prefix-scoped `cluster-count`
+  line the whole-prefix (audit) form runs first. Its expectation is
+  persisted by create in the state marker (`expectedClusters`, written
+  after the state root is ensured and before the first cluster is
+  provisioned, so an interrupted create leaves an honest shortfall) —
+  never a verify-time count resolution, which keeps §3.3's
+  paste-safety property: a prefix created with `--count 3` verified by
+  a plain `verify` that would resolve 2 reports the create's truth.
+  The assertion compares the generated name set against the inventory
+  (the union of provisioner clusters and state records — the exact
+  shape that hid a both-vanished cluster) and FAILs naming the missing
+  clusters and the recovery (re-run create: present clusters are
+  reused, vanished ones are built fresh). Old state (no field), an
+  unreadable marker, or a value no create could have written all
+  degrade to a SKIP with reason and remedy, never a false FAIL and
+  never blocking the clusters that exist; extra prefix-scoped clusters
+  beyond the expectation are not a FAIL (leftovers from a larger count
+  are supported state and get their own lines). The named form runs
+  no count assertion — targeted recovery must not fail on a sibling.
+  Marker rewrites preserve unknown fields (the ignore-don't-interpret
+  rule holds for writers), and a foreign or malformed marker is never
+  rewritten. Name generation was unified in
+  `config.GeneratedClusterNames` so the assertion can never drift from
+  what create named the clusters. Unit regressions (Docker-free):
+  vanished-cluster FAIL naming cluster and remedy with the survivor
+  still checked, the drift case (count-3 create, count-2 verify →
+  PASS), old/corrupt-state SKIP table, named-form exemption, marker
+  round-trip, unknown-field preservation, foreign-marker refusal.
+  README: a "What is proven" section separates the three proofs (CO
+  operator-driven scans, example deployment/registration/health) from
+  the unproven Central-driven scan-to-results round trip, and states
+  the SCC shim's exact semantics (defaults `runAsUser`/`runAsGroup`/
+  `fsGroup` where unset, explicit `runAsUser` wins, never denies, does
+  not evaluate `runAsNonRoot`, real SCC admission can reject — the
+  shim cannot); the example's `env.openshift: false` vanilla mode is
+  stated at the root README, not only the example's. Quickstart and
+  prerequisites rewritten with the real requirements: Docker client
+  and daemon, the buildx CLI plugin for full-profile create, Go 1.27.4+
+  (the go.mod minimum), kubectl for the inspection commands, the
+  network endpoints create fetches from (docker.io, the OLM release on
+  github.com, raw.githubusercontent.com at the pinned openshift/api
+  commit), and the macOS pitfalls surfaced from §6.1/§3.4 (the
+  docker.sock symlink and DOCKER_HOST pinning, buildx discoverability
+  together with DOCKER_HOST, CGO_ENABLED=0 failing closed on the ACL
+  checks). A "When something goes wrong" section carries the
+  four-branch recovery decision tree (failed create → re-run, bound
+  pending records converge; unbound/replaced → delete and re-create;
+  delete is idempotent and retryable; unsafe state refusals name their
+  fix), each branch citing the behavior it relies on. A "Performance
+  and resource budget" section documents measured cold/warm/reconcile
+  create, delete, and verify times on the development machine (105 s
+  cold, 85 s warm, 8 s reconcile, ~1 s delete, 17 s verify; 58 s
+  minimal pair and 89 s three-full from the increment-7 runs; ~17 min
+  cold integration suite from increment 8), the per-cluster idle
+  budget (~1 GiB RAM, 15–20 % of one CPU per node container, ~1.5 GB
+  volume + ~4 MB layer, node image shared once per daemon), and that
+  N>2 fan-out has no concurrency limit after the first cluster.
+  Example: `--central-values` and `--sensor-values` file flags overlay
+  user values on the generated ones (one `-f` each, in order, so
+  later files win); the files ride the example's privacy rule for
+  files it reads (private, caller-owned, regular — a values file can
+  carry secrets) and their contents are never logged; the pinned chart
+  fetch and its digest verification are unchanged. The example README
+  documents the worked override (an engineer's own Sensor image via
+  `image.main.fullRef`, the chart's own image override surface,
+  verified against the pinned chart) and a "What this run proves — and
+  what it does not" section matching the root README's honesty.
+  Live evidence on the development machine (Docker Desktop 28.1.1):
+  cold create 105 s → verify all-PASS including `cluster-count`; the
+  vanished-cluster smoke — container and record of kind-ocp-2 removed,
+  verify FAILs `cluster-count` naming kind-ocp-2 and exits non-zero,
+  the re-run create rebuilds it in 45 s and verify returns to
+  all-PASS; delete leaves zero containers.
 ## 6. Testing strategy
 
 - Unit (no Docker): config resolution and precedence, per-cluster overrides,

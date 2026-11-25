@@ -1129,6 +1129,209 @@ func TestVerifyReportsMissingAndUnmanagedClusters(t *testing.T) {
 	}
 }
 
+// vanishCluster removes a cluster the way the increment-10 finding
+// describes: the container and the state record both go, so the cluster
+// is invisible to list and to every per-cluster check — exactly the
+// shape that let a lone survivor report all-PASS before the count
+// assertion existed.
+func vanishCluster(t *testing.T, client *Client, prov *fakeProvisioner, name string) {
+	t.Helper()
+	prov.mu.Lock()
+	delete(prov.clusters, name)
+	prov.mu.Unlock()
+	kubeconfigPath, err := client.store.KubeconfigPath(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Dir(kubeconfigPath)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The increment-10 finding: a cluster whose container and state record
+// both vanished produced no verify line at all, and the survivors alone
+// reported all-PASS. The whole-prefix count assertion must FAIL naming
+// the vanished cluster and the remedy, while the survivor's checks
+// still run.
+func TestVerifyFailsWhenAVanishedClusterLeavesNoTrace(t *testing.T) {
+	cfg := testConfig(t, 2, "minimal")
+	prov := newFakeProvisioner()
+	client := newTestClient(t, cfg, layers.NewRegistry(), prov)
+	client.clientset = func(string) (kubernetes.Interface, error) { return readyClientset(), nil }
+	if _, err := client.Create(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	vanishCluster(t, client, prov, "p-2")
+
+	results, err := client.Verify(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := findResult(results, cfg.Prefix, expectedClustersCheck)
+	if count == nil {
+		t.Fatalf("no cluster-count result in %v", results)
+	}
+	if count.Status != StatusFail {
+		t.Fatalf("cluster-count = %s (%s), want FAIL", count.Status, count.Detail)
+	}
+	for _, want := range []string{"p-2", "re-run create"} {
+		if !strings.Contains(count.Detail, want) {
+			t.Errorf("cluster-count detail %q does not name %q", count.Detail, want)
+		}
+	}
+	// The survivor is still checked.
+	if r := findResult(results, "p-1", "nodes-ready"); r == nil || r.Status != StatusPass {
+		t.Errorf("p-1 nodes-ready = %+v, want PASS — the vanished sibling must not stop the survivor's checks", r)
+	}
+	// The vanished cluster produces no per-cluster lines of its own (it
+	// is invisible to list); the count line is its only mention.
+	for _, r := range results {
+		if r.Cluster == "p-2" {
+			t.Errorf("result %+v names p-2; a vanished cluster has no per-cluster checks", r)
+		}
+	}
+}
+
+// The count assertion reads what create persisted, never a count a
+// verify-time client would resolve: a prefix created with --count 3 and
+// verified through a client that resolves count 2 (the default) must
+// not FAIL. This is §3.3's paste-safety property standing — the CLI
+// reads no create-only values outside create, and the façade's verify
+// path reads none either.
+func TestVerifyCountAssertionUsesThePersistedExpectationNotTheConfig(t *testing.T) {
+	createCfg := testConfig(t, 3, "minimal")
+	prov := newFakeProvisioner()
+	client := newTestClient(t, createCfg, layers.NewRegistry(), prov)
+	client.clientset = func(string) (kubernetes.Interface, error) { return readyClientset(), nil }
+	if _, err := client.Create(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// A plain verify resolves a different count (2, the default); the
+	// assertion must still expect all three clusters.
+	verifyCfg := testConfig(t, 2, "minimal")
+	verifyCfg.StateRoot = createCfg.StateRoot
+	verifyClient := newTestClient(t, verifyCfg, layers.NewRegistry(), prov)
+	verifyClient.clientset = client.clientset
+	results, err := verifyClient.Verify(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := findResult(results, verifyCfg.Prefix, expectedClustersCheck)
+	if count == nil {
+		t.Fatalf("no cluster-count result in %v", results)
+	}
+	if count.Status != StatusPass {
+		t.Fatalf("cluster-count = %s (%s), want PASS — the expectation is the persisted one (3), not the resolved count (2)",
+			count.Status, count.Detail)
+	}
+	if !strings.Contains(count.Detail, "3") {
+		t.Errorf("cluster-count detail %q does not report the persisted expectation", count.Detail)
+	}
+}
+
+// Old and corrupt state degrade to a SKIP, never a false FAIL and never
+// a blocked verify: a state root written by an older binary carries no
+// expectation at all, a marker carrying a value no create could have
+// written is corrupt, and so is a marker that does not parse. In every
+// case the clusters that exist are still checked.
+func TestVerifyCountAssertionDegradesOnOldOrCorruptState(t *testing.T) {
+	cases := []struct {
+		name          string
+		markerContent string
+		// readyCheck is the check that must have run for p-1: the
+		// first two markers leave a verifiable tree (nodes-ready
+		// runs and passes); a marker that does not parse fails the
+		// boundary walk behind the kubeconfig check — the cluster
+		// is still checked, with that failure, never dropped.
+		readyCheck string
+		readyWant  CheckStatus
+	}{
+		{
+			name:          "older binary, no field",
+			markerContent: `{"tool":"kind-ocp"}`,
+			readyCheck:    "nodes-ready",
+			readyWant:     StatusPass,
+		},
+		{
+			name:          "count no create could write",
+			markerContent: `{"tool":"kind-ocp","expectedClusters":0}`,
+			readyCheck:    "nodes-ready",
+			readyWant:     StatusPass,
+		},
+		{
+			name:          "marker does not parse",
+			markerContent: `not json`,
+			readyCheck:    "kubeconfig",
+			readyWant:     StatusFail,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig(t, 1, "minimal")
+			prov := newFakeProvisioner("p-1")
+			client := newTestClient(t, cfg, layers.NewRegistry(), prov)
+			client.clientset = func(string) (kubernetes.Interface, error) { return readyClientset(), nil }
+			if err := client.store.WriteRecord(state.Record{
+				Name: "p-1", Context: "kind-p-1", Profile: "minimal",
+				Status: state.StatusComplete, InstanceID: testInstanceID,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			// The state package's documented marker name.
+			markerPath := filepath.Join(client.StateRoot(), "kind-ocp-state.json")
+			if err := os.WriteFile(markerPath, []byte(tc.markerContent), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			results, err := client.Verify(context.Background(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			count := findResult(results, cfg.Prefix, expectedClustersCheck)
+			if count == nil {
+				t.Fatalf("no cluster-count result in %v", results)
+			}
+			if count.Status != StatusSkipped {
+				t.Fatalf("cluster-count = %s (%s), want SKIP", count.Status, count.Detail)
+			}
+			// The cluster that exists is still checked.
+			r := findResult(results, "p-1", tc.readyCheck)
+			if r == nil || r.Status != tc.readyWant {
+				t.Errorf("p-1 %s = %+v, want %s — a degraded expectation must not stop the cluster's own checks",
+					tc.readyCheck, r, tc.readyWant)
+			}
+		})
+	}
+}
+
+// The named form keeps its targeted semantics: verifying one cluster
+// during recovery must not fail on a vanished sibling — the count
+// assertion is a property of the whole-prefix audit form only.
+func TestVerifyNamedSelectionRunsNoCountAssertion(t *testing.T) {
+	cfg := testConfig(t, 2, "minimal")
+	prov := newFakeProvisioner()
+	client := newTestClient(t, cfg, layers.NewRegistry(), prov)
+	client.clientset = func(string) (kubernetes.Interface, error) { return readyClientset(), nil }
+	if _, err := client.Create(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	vanishCluster(t, client, prov, "p-2")
+
+	results, err := client.Verify(context.Background(), []string{"p-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range results {
+		if r.Check == expectedClustersCheck {
+			t.Errorf("cluster-count ran in the named form: %+v", r)
+		}
+	}
+	if r := findResult(results, "p-1", "nodes-ready"); r == nil || r.Status != StatusPass {
+		t.Errorf("p-1 nodes-ready = %+v, want PASS", r)
+	}
+}
+
 // A pending record fails create-status but its layer checks still run (the
 // run may be a legitimate same-instance retry away from complete) — as long
 // as the record is bound to the live instance.
@@ -1491,12 +1694,26 @@ func TestSameNameReplacementRejected(t *testing.T) {
 				// SKIPs with that reason, asserted below the loop.
 				continue
 			}
+			if r.Check == expectedClustersCheck {
+				// Hand-seeded state carries no persisted
+				// expectation (an older binary's shape): the
+				// count assertion SKIPs with that reason,
+				// asserted below the loop.
+				continue
+			}
 			if r.Status != StatusPass {
 				t.Errorf("check %s = %s (%s), want PASS for the matching instance", r.Check, r.Status, r.Detail)
 			}
 		}
 		if r := findResult(results, "p-1", crossClusterCheck); r == nil || r.Status != StatusSkipped {
 			t.Errorf("cross-cluster check = %+v, want SKIP (single cluster)", r)
+		}
+		// The count assertion's degradation is part of the contract
+		// under test here: state without an expectation is the
+		// older-binary shape, and verify must SKIP it, never FAIL.
+		if r := findResult(results, cfg.Prefix, expectedClustersCheck); r == nil ||
+			r.Status != StatusSkipped || !strings.Contains(r.Detail, "older kind-ocp") {
+			t.Errorf("cluster-count = %+v, want SKIP with the old-state reason", r)
 		}
 		// The layer checks are bound to the instance the identity
 		// check just confirmed: a layer whose Verify mutates the

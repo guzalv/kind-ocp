@@ -142,9 +142,18 @@ func cloneNode(memo map[*yaml.Node]*yaml.Node, n *yaml.Node) *yaml.Node {
 // ClusterNames returns the generated cluster names, <prefix>-1 through
 // <prefix>-N.
 func (c *Config) ClusterNames() []string {
-	names := make([]string, 0, c.Count)
-	for i := 1; i <= c.Count; i++ {
-		names = append(names, fmt.Sprintf("%s-%d", c.Prefix, i))
+	return GeneratedClusterNames(c.Prefix, c.Count)
+}
+
+// GeneratedClusterNames returns the cluster names <prefix>-1 through
+// <prefix>-count: the deterministic set create builds and verify's
+// count assertion compares the inventory against. One implementation
+// behind both, so the assertion can never drift from what create named
+// the clusters.
+func GeneratedClusterNames(prefix string, count int) []string {
+	names := make([]string, 0, count)
+	for i := 1; i <= count; i++ {
+		names = append(names, fmt.Sprintf("%s-%d", prefix, i))
 	}
 	return names
 }

@@ -45,19 +45,60 @@ func newHelmRunner() (helmRunner, error) {
 	return helmRunner{binary: binary}, nil
 }
 
+// valuesOverrides carries the optional user-supplied helm values files:
+// one overlaid on the Central release's generated values, one on every
+// Sensor release's. Both are empty when the flags were not passed.
+type valuesOverrides struct {
+	central string
+	sensor  string
+}
+
+// checkValuesOverrides validates the optional values files before
+// anything runs. They ride the example's privacy rule for files it
+// reads: a helm values file can carry secrets (image pull credentials,
+// proxy passwords), so a file that is not a private, caller-owned
+// regular file is refused, not handed to helm — the same refusal the
+// admin password gets. Validating up front fails a bad path before the
+// clusters are touched; only the paths, never the contents, reach argv
+// or the log.
+func checkValuesOverrides(central, sensor string) (valuesOverrides, error) {
+	var o valuesOverrides
+	if central != "" {
+		if err := fscheck.CheckPrivateFile(central); err != nil {
+			return o, fmt.Errorf("--central-values: %w", err)
+		}
+		o.central = central
+	}
+	if sensor != "" {
+		if err := fscheck.CheckPrivateFile(sensor); err != nil {
+			return o, fmt.Errorf("--sensor-values: %w", err)
+		}
+		o.sensor = sensor
+	}
+	return o, nil
+}
+
 // upgradeInstall runs `helm upgrade --install` for one release against one
 // cluster's kubeconfig. It is idempotent: re-running the example converges
 // the releases. Output goes to out (the run's stderr) so the evidence log
 // carries helm's own progress; a failure wraps the command error with the
 // tail of that output.
-func (h helmRunner) upgradeInstall(ctx context.Context, out io.Writer, chartDir, kubeconfigPath, valuesPath string, timeout time.Duration) error {
+//
+// valuesPaths are the -f files in order: helm merges later files over
+// earlier ones, so the generated values file comes first and a
+// user-supplied override (see checkValuesOverrides) wins where the two
+// disagree. Only the paths cross into argv; file contents never reach
+// the command line or the log.
+func (h helmRunner) upgradeInstall(ctx context.Context, out io.Writer, chartDir, kubeconfigPath string, valuesPaths []string, timeout time.Duration) error {
 	args := []string{
 		"upgrade", "--install", releaseName(chartDir), chartDir,
 		"--namespace", stackroxNamespace, "--create-namespace",
 		"--kubeconfig", kubeconfigPath,
-		"-f", valuesPath,
-		"--wait", "--timeout", timeout.String(),
 	}
+	for _, p := range valuesPaths {
+		args = append(args, "-f", p)
+	}
+	args = append(args, "--wait", "--timeout", timeout.String())
 	cmd := exec.CommandContext(ctx, h.binary, args...)
 	cmd.Stdout = out
 	cmd.Stderr = out

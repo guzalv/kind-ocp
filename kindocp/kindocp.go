@@ -195,6 +195,18 @@ func (c *Client) Create(ctx context.Context) ([]Record, error) {
 	if _, err := c.store.EnsureRoot(); err != nil {
 		return nil, err
 	}
+	// Persist what this run set out to build — the number of clusters,
+	// in the state marker — before anything is provisioned. Verify's
+	// whole-prefix count assertion reads that expectation instead of
+	// resolving the create-only count itself (§3.3: the CLI reads no
+	// create-only values outside create, so a plain verify under a
+	// different resolved count cannot drift the assertion), and an
+	// interrupted create leaves the expectation behind: the shortfall
+	// is reported by the next verify, not silently dropped with the
+	// cluster.
+	if err := c.store.SetExpectedClusters(len(plans)); err != nil {
+		return nil, err
+	}
 	// Once per run, before anything is provisioned: the host tune the
 	// runtime asks for (kind's node containers need the inotify
 	// instances), best-effort and never fatal. Only a provisioner that
@@ -638,6 +650,14 @@ type CheckResult struct {
 // failing check is reported as FAIL with detail; only structural problems
 // (unknown cluster name, no clusters at all) return an error.
 //
+// The whole-prefix form (no names) is the audit form: it opens with the
+// cluster-count assertion — every cluster the last create set out to
+// build, per the expectation create persisted in the state marker, must
+// be in the inventory — so a cluster whose container and state record
+// both vanished FAILs instead of dropping out of the checks (see
+// checkExpectedClusters). The named form keeps targeted semantics and
+// runs no count assertion.
+//
 // Verify reports management state explicitly: an existing cluster without a
 // state record FAILs "managed-state" instead of passing vacuously with zero
 // layer checks, a record whose create run never finished FAILs
@@ -680,6 +700,17 @@ func (c *Client) Verify(ctx context.Context, names []string) ([]CheckResult, err
 	}
 
 	var results []CheckResult
+	// The whole-prefix form is the audit form, so it opens with the
+	// count assertion: every cluster the last create set out to build
+	// must be in the inventory. A cluster whose container and state
+	// record both vanished is invisible to every other check (list
+	// selects from the inventory, and nothing else names it), and the
+	// survivors alone could report all-PASS — the finding this check
+	// exists to close. The named form keeps today's targeted semantics:
+	// a recovery verify of one cluster must not fail on a sibling.
+	if len(names) == 0 {
+		results = append(results, c.checkExpectedClusters(infos)...)
+	}
 	var clusters []verifiedCluster
 	for _, info := range infos {
 		rs, vc := c.verifyCluster(ctx, info)
@@ -868,6 +899,75 @@ func (c *Client) checkRecordIdentity(ctx context.Context, name string, rec state
 		return results, true
 	}
 	return results, false
+}
+
+// expectedClustersCheck is the count assertion's name in verify output.
+// Its line is prefix-scoped (the CLUSTER column carries the prefix, not
+// a cluster name): it asserts a property of the whole prefix — the
+// inventory matches what create built — and no cluster can be named the
+// bare prefix (generated names are <prefix>-<integer>), so the line
+// never collides with a cluster's own.
+const expectedClustersCheck = "cluster-count"
+
+// checkExpectedClusters asserts the audit form's completeness: every
+// cluster the last create set out to build is in the inventory — the
+// union of the provisioner's clusters and the state records, which is
+// what list selected from. The expectation is what create persisted in
+// the state marker, never the count this client happened to resolve:
+// the CLI reads create-only values only for create, so a prefix created
+// with --count 3 verified by a plain verify that would resolve count 2
+// reports the create's truth (no drift, and no FAIL from the survivor
+// set shrinking).
+//
+// The check degrades to a SKIP — never a false FAIL, and never blocking
+// the clusters that exist — whenever the expectation cannot be asserted:
+// a state root written by an older binary carries none, a marker that
+// cannot be read is corrupt state (the reason is reported, the other
+// checks still run), and a value no create could have written (zero or
+// negative; create validates count ≥ 1 before persisting) is corruption
+// of the same kind. Only one condition FAILs: a valid expectation with
+// named clusters missing from both the provisioner and state — exactly
+// the vanished-cluster case no other check can see. Extra prefix-scoped
+// clusters beyond the expectation are not a FAIL: leftovers from a
+// larger count are a supported state (create never removes them), and
+// each still gets its own lines below.
+func (c *Client) checkExpectedClusters(infos []ClusterInfo) []CheckResult {
+	line := func(status CheckStatus, detail string) CheckResult {
+		return CheckResult{Cluster: c.cfg.Prefix, Check: expectedClustersCheck, Status: status, Detail: detail}
+	}
+	expected, found, err := c.store.ExpectedClusters()
+	switch {
+	case err != nil:
+		return []CheckResult{line(StatusSkipped, fmt.Sprintf(
+			"reading the persisted cluster expectation: %v — the clusters that exist are still checked below", err))}
+	case !found:
+		return []CheckResult{line(StatusSkipped,
+			"this state carries no persisted cluster expectation (written by an older kind-ocp) — "+
+				"re-run create to record one; the clusters that exist are still checked below")}
+	case expected < 1:
+		return []CheckResult{line(StatusSkipped, fmt.Sprintf(
+			"the persisted cluster expectation is not a count create could have written (%d) — "+
+				"the state marker is corrupt; delete and re-create. The clusters that exist are still checked below",
+			expected))}
+	}
+	live := make(map[string]bool, len(infos))
+	for _, info := range infos {
+		live[info.Name] = true
+	}
+	var missing []string
+	for _, name := range config.GeneratedClusterNames(c.cfg.Prefix, expected) {
+		if !live[name] {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) == 0 {
+		return []CheckResult{line(StatusPass, fmt.Sprintf(
+			"all %d cluster(s) the last create expected are in the inventory", expected))}
+	}
+	return []CheckResult{line(StatusFail, fmt.Sprintf(
+		"the last create expected %d cluster(s); missing from both the provisioner and kind-ocp state: %s — "+
+			"re-run create to build the missing cluster(s) (clusters still present are reused when they match)",
+		expected, strings.Join(missing, ", ")))}
 }
 
 func (c *Client) checkNodesReady(ctx context.Context, info ClusterInfo, kubeconfigPath string) CheckResult {
