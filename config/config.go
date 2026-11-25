@@ -145,11 +145,23 @@ func (c *Config) ClusterNames() []string {
 	return GeneratedClusterNames(c.Prefix, c.Count)
 }
 
+// IsCreatableCount reports whether count is one create can set out to
+// build: the exact range ValidateCreate enforces (1 through the safety
+// cap). Verify's count assertion classifies a persisted expectation
+// with it, so a value no create could have written is treated as
+// corrupt state — and never handed to name generation, whose sized
+// allocation would follow a corrupt count.
+func IsCreatableCount(count int) bool {
+	return count >= 1 && count <= maxCount
+}
+
 // GeneratedClusterNames returns the cluster names <prefix>-1 through
 // <prefix>-count: the deterministic set create builds and verify's
 // count assertion compares the inventory against. One implementation
 // behind both, so the assertion can never drift from what create named
-// the clusters.
+// the clusters. Callers pass a count IsCreatableCount accepted (create
+// validates before building; verify classifies corrupt expectations
+// before comparing), which bounds the returned set by the cap.
 func GeneratedClusterNames(prefix string, count int) []string {
 	names := make([]string, 0, count)
 	for i := 1; i <= count; i++ {
@@ -197,7 +209,7 @@ func (c *Config) ProfileFor(cluster string) string {
 // scope (the prefix) plus the structural file format, which every command
 // shares.
 func (c *Config) ValidateCreate() error {
-	if c.Count < 1 || c.Count > maxCount {
+	if !IsCreatableCount(c.Count) {
 		return fmt.Errorf("count must be between 1 and %d, got %d", maxCount, c.Count)
 	}
 	if c.Profile == "" {

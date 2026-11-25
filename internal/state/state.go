@@ -297,8 +297,9 @@ func (s *Store) SetExpectedClusters(count int) error {
 // when the tree carries no such value — a state root written by an
 // older binary, or a marker that predates the field — and that is not
 // an error: verify degrades to a SKIP, never a false FAIL. The returned
-// count is whatever the marker carries; a value no create could have
-// written (zero or negative) is the caller's to classify.
+// count is whatever the marker carries, outside any range create
+// validates; classifying a value no create could have written (see
+// config.IsCreatableCount) is the caller's.
 func (s *Store) ExpectedClusters() (count int, found bool, err error) {
 	root, err := s.walk(nil, false)
 	if err != nil {

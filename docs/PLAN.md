@@ -151,7 +151,9 @@ the create path. Per-cluster overrides resolve after global resolution,
 keyed by the final generated names. `kindocp.New` snapshots the resolved
 Config (`Config.Clone`, a deep copy: nested profile slices and layer YAML
 trees included) so a caller mutating its Config after construction cannot
-re-scope or otherwise re-configure a live client. Validation: count ≥ 1,
+re-scope or otherwise re-configure a live client. Validation: count
+within create's safety cap (`config.IsCreatableCount`, the same
+classifier verify's count assertion uses for persisted expectations),
 prefix is a valid kind name (`config.ValidatePrefix`, also enforced by the
 façade for library-constructed configs), profiles reference known layers,
 state root creatable. All of this is unit-tested without Docker (AC-6.2).
@@ -384,7 +386,12 @@ verified by a plain `verify` that would resolve count 2 reports the
 create's truth. A state root without an expectation (older binary), a
 marker that cannot be read, or a value no create could have written all
 degrade to a SKIP with reason and remedy — never a false FAIL, never
-blocking the clusters that exist. Only a valid expectation with named
+blocking the clusters that exist. Corrupt expectations are classified
+against create's own count bound (`config.IsCreatableCount`) before
+any name is generated: a corrupt count can be arbitrarily large, and
+the generated-name set is allocated to match the count, so a huge
+value can neither be reported as dozens of phantom missing clusters
+nor reach the sized allocation. Only a valid expectation with named
 clusters missing from both the provisioner and state FAILs, naming the
 clusters and the recovery (re-run create: present clusters are reused,
 vanished ones are built fresh). Extra prefix-scoped clusters beyond the
@@ -988,9 +995,14 @@ that pin them, and §3.
   reused, vanished ones are built fresh). Old state (no field), an
   unreadable marker, or a value no create could have written all
   degrade to a SKIP with reason and remedy, never a false FAIL and
-  never blocking the clusters that exist; extra prefix-scoped clusters
-  beyond the expectation are not a FAIL (leftovers from a larger count
-  are supported state and get their own lines). The named form runs
+  never blocking the clusters that exist — classified against create's
+  own count bound (`config.IsCreatableCount`, the range
+  `ValidateCreate` enforces) before any name is generated, so an
+  arbitrarily large corrupt value can neither be reported as phantom
+  missing clusters nor reach the name generator's sized allocation;
+  extra prefix-scoped clusters beyond the expectation are not a FAIL
+  (leftovers from a larger count are supported state and get their own
+  lines). The named form runs
   no count assertion — targeted recovery must not fail on a sibling.
   Marker rewrites preserve unknown fields (the ignore-don't-interpret
   rule holds for writers), and a foreign or malformed marker is never
@@ -999,7 +1011,10 @@ that pin them, and §3.
   what create named the clusters. Unit regressions (Docker-free):
   vanished-cluster FAIL naming cluster and remedy with the survivor
   still checked, the drift case (count-3 create, count-2 verify →
-  PASS), old/corrupt-state SKIP table, named-form exemption, marker
+  PASS), old/corrupt-state SKIP table (below 1, above create's cap,
+  and a huge value pinned to return promptly — it must never reach
+  name generation), leftover-beyond-expectation PASS with the
+  leftover's own per-cluster lines, named-form exemption, marker
   round-trip, unknown-field preservation, foreign-marker refusal.
   README: a "What is proven" section separates the three proofs (CO
   operator-driven scans, example deployment/registration/health) from

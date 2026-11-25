@@ -1233,14 +1233,23 @@ func TestVerifyCountAssertionUsesThePersistedExpectationNotTheConfig(t *testing.
 // Old and corrupt state degrade to a SKIP, never a false FAIL and never
 // a blocked verify: a state root written by an older binary carries no
 // expectation at all, a marker carrying a value no create could have
-// written is corrupt, and so is a marker that does not parse. In every
-// case the clusters that exist are still checked.
+// written is corrupt — below 1 or above create's safety cap, including
+// a huge value whose names would exhaust memory — and so is a marker
+// that does not parse. In every case the clusters that exist are still
+// checked.
 func TestVerifyCountAssertionDegradesOnOldOrCorruptState(t *testing.T) {
+	// The first count no create could write, derived from the
+	// classifier create validates with, so a cap bump moves this
+	// probe with it.
+	firstNonCreatable := 1
+	for config.IsCreatableCount(firstNonCreatable) {
+		firstNonCreatable++
+	}
 	cases := []struct {
 		name          string
 		markerContent string
 		// readyCheck is the check that must have run for p-1: the
-		// first two markers leave a verifiable tree (nodes-ready
+		// first three markers leave a verifiable tree (nodes-ready
 		// runs and passes); a marker that does not parse fails the
 		// boundary walk behind the kubeconfig check — the cluster
 		// is still checked, with that failure, never dropped.
@@ -1256,6 +1265,22 @@ func TestVerifyCountAssertionDegradesOnOldOrCorruptState(t *testing.T) {
 		{
 			name:          "count no create could write",
 			markerContent: `{"tool":"kind-ocp","expectedClusters":0}`,
+			readyCheck:    "nodes-ready",
+			readyWant:     StatusPass,
+		},
+		{
+			name:          "count above create's cap",
+			markerContent: fmt.Sprintf(`{"tool":"kind-ocp","expectedClusters":%d}`, firstNonCreatable),
+			readyCheck:    "nodes-ready",
+			readyWant:     StatusPass,
+		},
+		{
+			// The corruption the cap classification exists for:
+			// before it, this value reached name generation and
+			// its sized allocation (observed past 3.5 GB of RSS
+			// before a kill) — the row must return promptly.
+			name:          "huge count never reaches name generation",
+			markerContent: `{"tool":"kind-ocp","expectedClusters":999999999}`,
 			readyCheck:    "nodes-ready",
 			readyWant:     StatusPass,
 		},
@@ -1302,6 +1327,57 @@ func TestVerifyCountAssertionDegradesOnOldOrCorruptState(t *testing.T) {
 					tc.readyCheck, r, tc.readyWant)
 			}
 		})
+	}
+}
+
+// Extra prefix-scoped clusters beyond the expectation are not a count
+// FAIL: leftovers from a larger count are supported state (create never
+// removes them), so the count line PASSes and the leftover is reported
+// by its own per-cluster lines.
+func TestVerifyCountAssertionPassesOnLeftoversBeyondTheExpectation(t *testing.T) {
+	cfg := testConfig(t, 1, "minimal")
+	prov := newFakeProvisioner()
+	client := newTestClient(t, cfg, layers.NewRegistry(), prov)
+	client.clientset = func(string) (kubernetes.Interface, error) { return readyClientset(), nil }
+	if _, err := client.Create(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// A leftover from a larger count: still in the provisioner with a
+	// complete, bound record — the state an earlier create --count 2
+	// leaves behind when a later create runs with a smaller count.
+	prov.mu.Lock()
+	prov.clusters["p-2"] = true
+	prov.mu.Unlock()
+	if err := client.store.WriteRecord(state.Record{
+		Name: "p-2", Context: "kind-p-2", Profile: "minimal",
+		Status: state.StatusComplete, InstanceID: testInstanceID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := client.Verify(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := findResult(results, cfg.Prefix, expectedClustersCheck)
+	if count == nil {
+		t.Fatalf("no cluster-count result in %v", results)
+	}
+	if count.Status != StatusPass {
+		t.Fatalf("cluster-count = %s (%s), want PASS — a leftover beyond the expectation is supported state, not a missing cluster",
+			count.Status, count.Detail)
+	}
+	if strings.Contains(count.Detail, "p-2") {
+		t.Errorf("cluster-count detail %q names the leftover; the count line reports the expectation only", count.Detail)
+	}
+	// The leftover is reported by its own lines, never by the count's.
+	if r := findResult(results, "p-2", "nodes-ready"); r == nil || r.Status != StatusPass {
+		t.Errorf("p-2 nodes-ready = %+v, want PASS — a leftover gets its own per-cluster lines (results: %v)", r, results)
+	}
+	for _, r := range results {
+		if r.Cluster == "p-2" && r.Status == StatusFail {
+			t.Errorf("p-2 result %+v is a FAIL; a leftover with a bound record verifies like any other cluster", r)
+		}
 	}
 }
 

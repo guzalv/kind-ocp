@@ -923,14 +923,19 @@ const expectedClustersCheck = "cluster-count"
 // the clusters that exist — whenever the expectation cannot be asserted:
 // a state root written by an older binary carries none, a marker that
 // cannot be read is corrupt state (the reason is reported, the other
-// checks still run), and a value no create could have written (zero or
-// negative; create validates count ≥ 1 before persisting) is corruption
-// of the same kind. Only one condition FAILs: a valid expectation with
-// named clusters missing from both the provisioner and state — exactly
-// the vanished-cluster case no other check can see. Extra prefix-scoped
-// clusters beyond the expectation are not a FAIL: leftovers from a
-// larger count are a supported state (create never removes them), and
-// each still gets its own lines below.
+// checks still run), and a value no create could have written is
+// corruption of the same kind. The classifier is create's own count
+// bound (config.IsCreatableCount — create validates 1..maxCount before
+// persisting), and it runs before any name is generated: a corrupt
+// count can be arbitrarily large, and the generated-name set is
+// allocated to match the count, so classifying first keeps both the
+// FAIL detail (at most maxCount missing names) and the memory verify
+// spends bounded by what create can actually build. Only one condition
+// FAILs: a valid expectation with named clusters missing from both the
+// provisioner and state — exactly the vanished-cluster case no other
+// check can see. Extra prefix-scoped clusters beyond the expectation
+// are not a FAIL: leftovers from a larger count are a supported state
+// (create never removes them), and each still gets its own lines below.
 func (c *Client) checkExpectedClusters(infos []ClusterInfo) []CheckResult {
 	line := func(status CheckStatus, detail string) CheckResult {
 		return CheckResult{Cluster: c.cfg.Prefix, Check: expectedClustersCheck, Status: status, Detail: detail}
@@ -944,7 +949,7 @@ func (c *Client) checkExpectedClusters(infos []ClusterInfo) []CheckResult {
 		return []CheckResult{line(StatusSkipped,
 			"this state carries no persisted cluster expectation (written by an older kind-ocp) — "+
 				"re-run create to record one; the clusters that exist are still checked below")}
-	case expected < 1:
+	case !config.IsCreatableCount(expected):
 		return []CheckResult{line(StatusSkipped, fmt.Sprintf(
 			"the persisted cluster expectation is not a count create could have written (%d) — "+
 				"the state marker is corrupt; delete and re-create. The clusters that exist are still checked below",
