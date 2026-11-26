@@ -7,8 +7,8 @@ import (
 )
 
 // TestMain keeps this suite hermetic against the ambient scratch
-// environment (umask 002, a policy-refused TMPDIR chain): the §5.3
-// cold-machine findings. See internal/testscratch.
+// environment (umask 002, a policy-refused TMPDIR chain). See
+// internal/testscratch.
 func TestMain(m *testing.M) {
 	testscratch.Main(m)
 }

@@ -22,16 +22,16 @@ import (
 	"github.com/guzalv/kind-ocp/kindocp"
 )
 
-// fetchRegressionLayers is the two layers whose interaction the F-1
-// regression covers: config-openshift's placeholder CRDs, and the
+// fetchRegressionLayers is the two layers whose interaction the
+// fetch-failure regression covers: config-openshift's placeholder CRDs, and the
 // openshift-api-crds layer that supersedes them. The regression needs
 // neither OLM nor node-labels, so it runs without them — which makes the
 // CRD fetch the only outbound HTTPS request the failing create can make.
 // The four-layer happy path lives in openshift_api_crds_test.go.
 var fetchRegressionLayers = []string{"config-openshift", "openshift-api-crds"}
 
-// TestSecondCreateWithoutCacheAndNetwork is the F-1 regression: the
-// increment-4 review's exact scenario. After a successful create, a
+// TestSecondCreateWithoutCacheAndNetwork is the
+// fetch-failure regression: after a successful create, a
 // second create runs with the CRD cache removed and the pinned fetch
 // made unreachable. It must fail in openshift-api-crds with the fetch
 // error — and the cluster must keep the real CRDs: real schema,
@@ -96,7 +96,7 @@ func TestSecondCreateWithoutCacheAndNetwork(t *testing.T) {
 	// tunneling, no outbound dialing. The two-layer profile means the
 	// CRD fetch is the run's only outbound HTTPS request (the kind
 	// reuse and the apiserver on 127.0.0.1 are local, exempt through
-	// NO_PROXY), so the failure lands where the review found it and
+	// NO_PROXY), so the failure lands on the CRD fetch and
 	// nowhere else — and the test depends on no upstream network
 	// policy, because nothing is tunneled and nothing is dialed.
 	bin := buildKindOcp(t)
@@ -176,7 +176,7 @@ func TestSecondCreateWithoutCacheAndNetwork(t *testing.T) {
 }
 
 // buildKindOcp builds the kind-ocp CLI into a scratch directory and
-// returns its path. The F-1 regression runs the second create as the
+// returns its path. The regression runs the second create as the
 // real CLI in a subprocess (see the test's comment for why), and the
 // test binary already runs inside the module, so the build needs
 // nothing but the Go toolchain the test itself needed.
@@ -190,7 +190,7 @@ func buildKindOcp(t *testing.T) string {
 	return bin
 }
 
-// writeCreateConfig writes the config file the F-1 regression's
+// writeCreateConfig writes the config file the regression's
 // subprocess resolves: the same prefix, the same two-layer profile, and
 // the same state root as the in-process first create, so the subprocess
 // reuses (not replaces) the cluster.
@@ -213,7 +213,7 @@ profiles:
 
 // newRefusingProxy starts a local HTTP proxy that refuses every request
 // it receives — CONNECT tunnels included — with an error, without
-// dialing anywhere. The F-1 regression's failing create must fail its
+// dialing anywhere. The regression's failing create must fail its
 // one outbound HTTPS request (the CRD fetch); refusing everything
 // guarantees that failure regardless of the host's own upstream network
 // policy, because nothing is tunneled and nothing is dialed. The run's

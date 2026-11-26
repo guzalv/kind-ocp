@@ -32,7 +32,8 @@ const (
 	sccNameLabel        = "kubernetes.io/metadata.name"
 )
 
-// TestCreateWithSCCAdmissionLayer exercises increment 6's layer end to
+// TestCreateWithSCCAdmissionLayer exercises the scc-admission layer
+// end to
 // end on a real Docker daemon: create with the scc-admission profile
 // (the layer has no hard dependencies, so it runs alone), verify
 // passes, and the layer's postconditions hold independently of its own
@@ -59,10 +60,10 @@ func TestCreateWithSCCAdmissionLayer(t *testing.T) {
 	cluster := prefix + "-1"
 	stateRoot := filepath.Join(t.TempDir(), "state")
 
-	increment6 := []string{sccadmission.Name}
+	sccAdmissionLayers := []string{sccadmission.Name}
 	tweak := func(cfg *config.Config) {
-		cfg.Profiles = map[string]config.Profile{"increment-6": {Layers: increment6}}
-		cfg.Profile = "increment-6"
+		cfg.Profiles = map[string]config.Profile{"scc-admission-only": {Layers: sccAdmissionLayers}}
+		cfg.Profile = "scc-admission-only"
 	}
 	client, _ := testClientAt(t, prefix, stateRoot, tweak, nil)
 	if _, err := client.Delete(ctx); err != nil {
@@ -83,8 +84,8 @@ func TestCreateWithSCCAdmissionLayer(t *testing.T) {
 	if records[0].Status != kindocp.RecordStatusComplete {
 		t.Fatalf("record status = %s, want complete", records[0].Status)
 	}
-	if !slices.Equal(records[0].Layers, increment6) {
-		t.Fatalf("record layers = %v, want %v", records[0].Layers, increment6)
+	if !slices.Equal(records[0].Layers, sccAdmissionLayers) {
+		t.Fatalf("record layers = %v, want %v", records[0].Layers, sccAdmissionLayers)
 	}
 
 	// 2. Verify passes, including the layer's live probe check.
@@ -92,7 +93,7 @@ func TestCreateWithSCCAdmissionLayer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
-	requireAllPassAndLayerChecks(t, results, increment6, "after create")
+	requireAllPassAndLayerChecks(t, results, sccAdmissionLayers, "after create")
 
 	// 3. The layer's postconditions, read through the exported
 	// kubeconfig, independently of its own Verify.
@@ -239,7 +240,7 @@ func TestCreateWithSCCAdmissionLayer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verify after reconcile: %v", err)
 	}
-	requireAllPassAndLayerChecks(t, results, increment6, "after reconcile")
+	requireAllPassAndLayerChecks(t, results, sccAdmissionLayers, "after reconcile")
 
 	// 5. The namespace-switch regression: changing watchedNamespaces
 	// re-scopes the webhook to the new list. Only the new namespace is
@@ -256,8 +257,8 @@ func TestCreateWithSCCAdmissionLayer(t *testing.T) {
 		t.Fatal(err)
 	}
 	switchedClient, _ := testClientAt(t, prefix, stateRoot, func(cfg *config.Config) {
-		cfg.Profiles = map[string]config.Profile{"increment-6": {Layers: increment6}}
-		cfg.Profile = "increment-6"
+		cfg.Profiles = map[string]config.Profile{"scc-admission-only": {Layers: sccAdmissionLayers}}
+		cfg.Profile = "scc-admission-only"
 		cfg.Layers = map[string]yaml.Node{sccadmission.Name: sccSettings.SCC}
 	}, nil)
 	if _, err := switchedClient.Create(ctx); err != nil {
@@ -267,7 +268,7 @@ func TestCreateWithSCCAdmissionLayer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verify after the namespace switch: %v", err)
 	}
-	requireAllPassAndLayerChecks(t, results, increment6, "after the namespace switch")
+	requireAllPassAndLayerChecks(t, results, sccAdmissionLayers, "after the namespace switch")
 
 	// The switched selector, read straight from the configuration.
 	switchedMWC, err := cs.AdmissionregistrationV1().MutatingWebhookConfigurations().Get(ctx, sccadmission.Name, metav1.GetOptions{})
@@ -318,8 +319,8 @@ func TestCreateWithSCCAdmissionLayer(t *testing.T) {
 	// watches, and the check names the drifted selector — running its
 	// probe against a registration that does not match the verified
 	// configuration would prove nothing about the scope the
-	// configuration asks about (the shape gate from the security
-	// review), so the probe is skipped and the drift named instead.
+	// configuration asks about, so the probe is skipped and the drift
+	// named instead.
 	corruptResults, err := client.Verify(ctx, nil)
 	if err != nil {
 		t.Fatalf("verify with the retired configuration: %v", err)
@@ -352,7 +353,7 @@ func TestCreateWithSCCAdmissionLayer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verify after the switch back: %v", err)
 	}
-	requireAllPassAndLayerChecks(t, results, increment6, "after the switch back")
+	requireAllPassAndLayerChecks(t, results, sccAdmissionLayers, "after the switch back")
 
 	// 6. The foreign-manager regression: a field another field manager
 	// owns — a matchCondition, absent from the layer's manifest —
@@ -441,7 +442,7 @@ func TestCreateWithSCCAdmissionLayer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verify after the recovery: %v", err)
 	}
-	requireAllPassAndLayerChecks(t, results, increment6, "after the foreign-manager recovery")
+	requireAllPassAndLayerChecks(t, results, sccAdmissionLayers, "after the foreign-manager recovery")
 	recovered, err := cs.AdmissionregistrationV1().MutatingWebhookConfigurations().Get(ctx, sccadmission.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("reading the recovered MutatingWebhookConfiguration: %v", err)

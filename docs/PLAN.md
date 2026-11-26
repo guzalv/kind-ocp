@@ -1,7 +1,7 @@
-# kind-ocp — implementation plan
+# kind-ocp — architecture and design record
 
-This file is the architecture and the increment record: what was built,
-in what order, and the decisions that shaped it.
+This file is the architecture and design record: what the code does
+and the decisions that shaped it.
 
 ## 1. Objective
 
@@ -11,18 +11,18 @@ OpenShift layers. After `create` finishes, StackRox Central/Sensor and the
 Compliance Operator deploy and work on every cluster. The repo creates
 clusters; it deploys nothing.
 
-## 2. Locked decisions
+## 2. Design decisions
 
 | Decision | Choice | Rationale |
 |---|---|---|
 | Language | Go 1.27, single `kind-ocp` binary plus importable packages | user decision |
 | CLI framework | spf13/cobra | standard, subcommands + flags |
 | Config format | YAML (`gopkg.in/yaml.v3`), loaded only via `--config` or `KIND_OCP_CONFIG` | explicit and deterministic; no CWD magic |
-| Config precedence | flag > env > file > built-in default | AC-2.2, unit-tested |
-| kind provisioning | **kind as a library** (`sigs.k8s.io/kind` v0.33.0, pinned in go.mod) behind `provider.Provisioner` | no kind binary on the host; version pinned by go.mod (AC-4); programmatic kubeconfig export into the state dir (no `~/.kube/config` pollution); programmatic node access for cross-cluster checks. Risk (less stable library API) is contained by the thin wrapper and the version pin. |
+| Config precedence | flag > env > file > built-in default | unit-tested |
+| kind provisioning | **kind as a library** (`sigs.k8s.io/kind` v0.33.0, pinned in go.mod) behind `provider.Provisioner` | no kind binary on the host; version pinned by go.mod; programmatic kubeconfig export into the state dir (no `~/.kube/config` pollution); programmatic node access for cross-cluster checks. Risk (less stable library API) is contained by the thin wrapper and the version pin. |
 | k8s access | `k8s.io/client-go` typed clientset (nodes, deployments) + dynamic client with server-side apply for arbitrary manifests | layers apply CRDs and schema-less CRs; SSA is also a ported gotcha (OLM CRDs exceed the client-side annotation limit) |
-| SCC-UID webhook | **Go implementation**; image built at `create` time via digest-pinned multi-stage `docker build` (golang builder → `FROM scratch`), loaded into each cluster the same way `kind load` does | patch logic is plain Go and unit-testable (AC-6.2 explicitly lists it); no python runtime in the cluster; no third-party webhook image at all, which closes the PoC's floating `python:3.12-slim` gap more strongly than digest-pinning a foreign image. The builder image is the pinned external input. Trade-off recorded in the layer docs. |
-| openshift/api CRD sourcing (increment 4) | **Pinned runtime fetch over HTTPS**: the module's version/commit is embedded at build time from go.mod (a generated pin file — no committed CRD copies), and `create` fetches the 18 CRDs from that exact commit into a per-state-root cache with Go's net/http | AC-6.4 requires only Docker at runtime (no Go toolchain, no module cache on the host), and AC-3.4 requires go.mod to stay the single source of truth with no committed copies. Reading the module cache at runtime would tie the binary to a Go checkout; the pinned fetch keeps `go install` usable. Cluster creation already requires network (node-image pulls), so this adds no new environmental dependency. |
+| SCC-UID webhook | **Go implementation**; image built at `create` time via digest-pinned multi-stage `docker build` (golang builder → `FROM scratch`), loaded into each cluster the same way `kind load` does | patch logic is plain Go and unit-testable; no python runtime in the cluster; no third-party webhook image at all, which closes the PoC's floating `python:3.12-slim` gap more strongly than digest-pinning a foreign image. The builder image is the pinned external input. Trade-off recorded in the layer docs. |
+| openshift/api CRD sourcing | **Pinned runtime fetch over HTTPS**: the module's version/commit is embedded at build time from go.mod (a generated pin file — no committed CRD copies), and `create` fetches the 18 CRDs from that exact commit into a per-state-root cache with Go's net/http | The design requires only Docker at runtime (no Go toolchain, no module cache on the host), and go.mod stays the single source of truth with no committed copies. Reading the module cache at runtime would tie the binary to a Go checkout; the pinned fetch keeps `go install` usable. Cluster creation already requires network (node-image pulls), so this adds no new environmental dependency. |
 | Regeneration tool | ported to Go (`tools/regenerate`), fetches SHA-pinned upstream files over HTTPS, splices between `BEGIN/END UPSTREAM` markers | repo stays single-language; no python/PyYAML dependency |
 | Module path | `github.com/guzalv/kind-ocp` | final |
 | License | Apache-2.0 | org standard |
@@ -57,7 +57,7 @@ examples/                StackRox Central+Sensor recipe (example only)
 `internal/cli` and `kindocp` share the façade: the CLI is a thin skin over the
 library, so external Go consumers get the same behavior programmatically.
 
-### 3.2 Layer model (AC-2)
+### 3.2 Layer model
 
 ```go
 type Layer interface {
@@ -70,7 +70,7 @@ type Layer interface {
 `Env` carries the target cluster (name, context, kubeconfig path), a contextualized
 `slog.Logger`, and `DecodeSettings(layer, dst)` which decodes the
 resolved per-layer config into the layer's own settings struct (pre-filled
-with its defaults, so only explicitly set keys override — AC-4.3). It also
+with its defaults, so only explicitly set keys override). It also
 carries the cache-directory service for layers that fetch pinned upstream
 content: `CacheDir` is a callback the framework binds to the layer being
 applied, taking the layer's single content pin as its only argument, so a
@@ -95,7 +95,7 @@ because the identifier is also the registry and config key.
   names in a profile are a validation error.
 - Adding or removing a layer = new package under `internal/layers/` + one
   registration line in `internal/builtin/builtin.go`. The provisioning loop in
-  `kindocp` never changes (AC-2.4).
+  `kindocp` never changes.
 - Registration order = apply order for the six builtins:
   `config-openshift` → `node-labels` → `olm` → `openshift-api-crds` →
   `platform-objects` → `scc-admission`. Reasons: OLM-created deployments
@@ -115,7 +115,13 @@ because the identifier is also the registry and config key.
   catalog-operator image are digest-verified or pinned via
   `configmapRegistryImage`; a user version override is trusted as pinned.
 
-### 3.3 Config resolution (AC-2.2, AC-2.3, AC-4)
+  Pinned upstream content is applied verbatim, never edited: the
+  openshift/api CRDs are digest-verified bytes, so upstream shapes carry
+  over unchanged — the pinned SCC CRD declares no shortNames, which is
+  why `kubectl get scc` does not resolve (the full resource name,
+  `securitycontextconstraints`, does).
+
+### 3.3 Config resolution
 
 ```yaml
 prefix: kind-ocp            # clusters are <prefix>-<i>; contexts kind-<name>
@@ -155,7 +161,9 @@ Resolve validates only the shared scope (the prefix) plus the structural
 file format, so a create-only mistake (a bad `KIND_OCP_COUNT`, `--count 0`,
 a cluster-3 override with count 2) never blocks delete, list, verify, or
 kubeconfig. Create-only semantics are checked by `Config.ValidateCreate` in
-the create path. Per-cluster overrides resolve after global resolution,
+the create path, and every defined profile's layer names are validated
+there too — selected or not, so a typo in an unselected profile fails
+fast. Per-cluster overrides resolve after global resolution,
 keyed by the final generated names. `kindocp.New` snapshots the resolved
 Config (`Config.Clone`, a deep copy: nested profile slices and layer YAML
 trees included) so a caller mutating its Config after construction cannot
@@ -164,20 +172,20 @@ within create's safety cap (`config.IsCreatableCount`, the same
 classifier verify's count assertion uses for persisted expectations),
 prefix is a valid kind name (`config.ValidatePrefix`, also enforced by the
 façade for library-constructed configs), profiles reference known layers,
-state root creatable. All of this is unit-tested without Docker (AC-6.2).
+state root creatable. All of this is unit-tested without Docker.
 
 Defaults live in exactly two kinds of places: global defaults
 (`config/defaults.go`: prefix, count, profile, node image digest, state root,
 timeouts) and each layer's settings struct (OLM version, webhook namespaces /
-UID / builder digest, …). The README documents every default and pin (AC-4.2).
+UID / builder digest, …). The README documents every default and pin.
 
-### 3.4 State (AC-1.3, AC-1.5)
+### 3.4 State
 
 ```
 ${XDG_STATE_HOME:-$HOME/.local/state}/kind-ocp/<prefix>/
 ├── kind-ocp-state.json            # 0600 — state marker (proves ownership)
 ├── expected-clusters              # 0600 — the count the last create set out to build
-├── cache/<layer>/<pin>/…          # 0600 — layers' fetched-content caches, keyed by content pin (increment 4+)
+├── cache/<layer>/<pin>/…          # 0600 — layers' fetched-content caches, keyed by content pin
 ├── clusters/<name>/kubeconfig     # 0600 — cluster-admin credential
 └── clusters/<name>/record.json    # name, context, profile, layers, node image, instance ID, created
 ```
@@ -222,6 +230,18 @@ it (no corrective chmod: kind creates new files at 0600, and a chmod
 through an unverified path would itself be a write outside the
 boundary). `record.json` gets the same treatment in both directions: a
 read or a write through a symlinked or shared record file is refused.
+
+Refusals carry their remedies. The ancestor policy's write-bit
+refusals name the chmod fix for the offending path — shell-quoted, and
+`chmod go-w` when both write bits are set (`chmod g-w` alone would
+leave a 0777 directory 0757, still refused) — and are classifiable as
+`fscheck.ErrUnsafeAncestor`; the state-root walk decorates that class
+with the `--state-root` / `XDG_STATE_HOME` alternative, so one error
+carries both remedies. This matters on umask-002 systems (the Debian
+`usergroups` default), where other tooling leaves `~/.local` 0775 and
+the default state root under it is refused as group-writable; the walk
+creates a missing `~/.local` as 0700, so a fresh machine never hits
+the refusal.
 
 Mode bits alone do not describe access on macOS: an extended ACL entry
 can grant access the mode does not show (a 0600 kubeconfig with an
@@ -279,7 +299,7 @@ state directory. That closes the PoC's stale-state bug: a
 `create` after `delete` starts from zero. Delete is idempotent; absent
 clusters and absent state are not errors.
 
-### 3.5 Provisioning flow (AC-1)
+### 3.5 Provisioning flow
 
 `create` resolves config, validates it eagerly (every cluster's profile is
 resolved and every per-cluster override checked **before** the first cluster
@@ -323,7 +343,7 @@ earlier clusters behind), then for each cluster `<prefix>-<i>`:
 7. Rewrite the record with status `complete`, keeping the binding.
 
 Failure at any step: exit non-zero with a chain that names cluster, step, and
-cause; clusters are left in place (AC-1.7); and an executable cleanup command
+cause; clusters are left in place; and an executable cleanup command
 — `kind-ocp delete --config '' --prefix <p> --state-root <root>` for the
 effective prefix and state root, POSIX-shell-quoted by `internal/shell.Quote`
 so a state root containing spaces or quotes survives a copy-paste — is
@@ -361,9 +381,9 @@ layer application is cancelled out from under its record.
 
 All clusters share kind's default `kind` Docker network (kind behavior), which
 is what makes cross-cluster NodePort reachability work — asserted by verify's
-cross-cluster check (§3.6, AC-1.4).
+cross-cluster check (§3.6).
 
-### 3.6 Verify model (AC-5.1)
+### 3.6 Verify model
 
 `verify` runs, per cluster: global checks (all nodes Ready — zero nodes is a
 FAIL; also cross-cluster NodePort reachability), the
@@ -427,7 +447,7 @@ supported state, and each gets its own lines. The named form runs no
 count assertion: a targeted verify during recovery must not fail on a
 sibling.
 
-The cross-cluster NodePort check (AC-1.4, the Central→Sensor pattern's
+The cross-cluster NodePort check (the Central→Sensor pattern's
 requirement) runs after the per-cluster checks, over exactly the
 clusters whose identity checks passed — a peer that failed
 verification is reported by its own lines, never by a reachability
@@ -477,9 +497,9 @@ context — a cancelled or expired check still removes what it created
 every layer check it leaves no state behind on every path the process
 survives, and a namespace left by a killed run is never adopted or
 removed — deleting the cluster removes such residue with everything
-else. The pod-level half of AC-1.4 — a workload pod on A reaching
+else. The pod-level half of that check — a workload pod on A reaching
 B's NodePort — is asserted by the integration test with a real client
-pod, and end to end by the StackRox example (§5.1).
+pod, and end to end by the StackRox example (§3.9).
 
 ### 3.7 Errors and logging
 
@@ -494,7 +514,7 @@ logs never contain credential material. Loggers are derived per
 cluster and per layer (`cluster=kind-ocp-2 layer=olm`). Errors wrap with
 cluster, layer, and operation context (`fmt.Errorf` chains, no error-code
 enum). No bare sleeps: waits are condition-based with timeouts (internal/kube
-poll helpers — AC-6.5), and every wait bounds its API calls through the
+poll helpers), and every wait bounds its API calls through the
 deadline context.
 
 ### 3.8 Admission-webhook hardening
@@ -511,88 +531,39 @@ redirect targets in its failures (a Location can carry credentials);
 the probe's create is exactly-once (MaxRetries 0); the mutation is
 bound to the cluster instance verify validated
 (`Env.ClusterInstanceID`); the webhook Deployment's template and the
-probe pod both set `automountServiceAccountToken: false`. Pinned by
-unit regressions against fake apiservers, plus a real-API integration
-regression for the SSA-merge semantics.
+probe pod both set `automountServiceAccountToken: false`. These
+properties are pinned by unit regressions against fake apiservers, plus
+a real-API integration regression for the SSA-merge semantics.
 
-## 4. Porting map from PR #23841
+### 3.9 Example recipe: `examples/stackrox`
 
-| PoC (tests/e2e/kind-compliance/) | kind-ocp |
-|---|---|
-| `ensure_kind_cluster` | `internal/provider/kind` Create + wait |
-| `raise_inotify` | best-effort Linux sysctl with warning (increment 7) |
-| `install_olm` | `internal/layers/olm` |
-| placeholder CRDs + 3 singletons + Infrastructure status patch (`install_co` config-shim part) | `internal/layers/configopenshift` + `assets/` |
-| node labeling (`install_co_olm` label line) | `internal/layers/nodelabels` |
-| `OPENSHIFT_CRD_MAP` + `stage_openshift_crds` | `internal/layers/openshiftapicrds` (path map + staging from the pinned `openshift/api` module) |
-| `apply_platform_shim` (objects.yaml, sccs.yaml) | `internal/layers/platformobjects` + `assets/` |
-| `regenerate.sh` (+ python splice) | `tools/regenerate` (Go) |
-| `install_scc_webhook` + `scc-shim-webhook.py` | `internal/layers/sccadmission` (Go webhook, TLS generated in Go, namespaces/UID configurable, concurrent server) |
-| `install_co` OLM part (CatalogSource/OperatorGroup/Subscription, CSV fallback), `wait_profilebundles_valid` | `internal/verify/compliance` (CO fitness proof — never reachable from `create`) |
-| multi-cluster parallel `up`/`down`/`verify` orchestration | `kindocp` façade |
-| NOT ported: `render_charts`, `deploy_central`, `central_internal_endpoint`, `start_central_pf`, `generate_init_bundle`, `deploy_secured`, `central_api`, `cluster_id_for`, `cluster_ready` | `examples/stackrox` (increment 9, example only) |
-
-Gotchas to preserve land with the code that needs them and are
-asserted by verify checks: OLM CRDs via SSA; wait for CRD Established before
-using kinds; CatalogSource in namespace `olm`; SCCs via create (or SSA), with
-delete+recreate on re-runs; status writes through the status subresource;
-master label on control-plane nodes; serving-cert secret before CO starts;
-CSV channel-head fallback; per-cluster temp/state paths; per-wait deadlines;
-exit-code fidelity in Make recipes.
-
-## 5. Increment checklist
-
-Each increment is one gated pass: implement → verify (tester) → review →
-security → triage. Acceptance for every increment: `make build test lint`
-green, unit tests need no Docker, integration evidence attached. All
-eleven increments are delivered; the table records what each delivered
-and where its behavior is pinned. Design rationale lives in §3 — each
-row names the section that carries it — except for the two entries kept
-as blocks below the table.
-
-| # | Increment | Delivered | Pinned by |
-|---|---|---|---|
-| 1 | Scaffold and framework skeleton | Go module, Makefile (build/test/lint), lint config, LICENSE; CLI (`create`, `delete`, `list`, `kubeconfig`, `verify`); config system with precedence, per-cluster overrides, custom profiles, validation, pins as defaults; public layer framework with an empty builtin registry; kind-as-library provisioner behind `provider.Provisioner`; state root 0700/0600 with kubeconfig export and idempotent prefix-scoped delete; sequential `--count N` create with the failure contract (keep clusters, print the POSIX-quoted delete command); verify's node-Ready check; instance-ID-bound records. Restates §3.3–§3.5. | `config/`, `layers/`, `internal/state/`, `internal/cli/` unit tests |
-| 2 | Kubernetes helpers + `olm` layer | `internal/kube`: REST config, dynamic-client SSA, CRD Established wait, rollout-complete wait, owned no-redirect HTTP fetch. `olm` layer: pinned release default, SSA for CRDs (annotation-limit gotcha), digest-verified release manifests, catalog-operator image pinned via `configmapRegistryImage`, floating `operatorhubio-catalog` CatalogSource dropped; verify checks both deployments Available and `operators.coreos.com/v1alpha1` served. Rationale: §3.2. | `internal/kube`, `internal/layers/olm` tests |
-| 3 | `config-openshift` and `node-labels` layers | 13 placeholder CRDs + 3 singletons as embedded assets; Infrastructure status via the status subresource; master label with the empty-string value; create-only placeholder CRDs through the fixed CRD resource path. Rationale: §3.2. | `internal/layers/configopenshift`, `internal/layers/nodelabels`, `assets/` tests |
-| 4 | `openshift-api-crds` layer | Build-time-generated pin file (commit, per-manifest SHA-256, size bound) kept in sync with go.mod by unit tests; runtime HTTPS fetch at the pinned commit into a per-state-root cache — digest-validated, bounded reads, atomic replacement; SSA + Established wait; verify checks all 18 Established and carrying the real root schemas. | `internal/layers/openshiftapicrds`, `tools/pin-openshift-api` tests |
-| 5 | `platform-objects` layer + regeneration tool | `objects.yaml` and `sccs.yaml` as embedded assets (namespaces first, then singletons, SCCs with delete+recreate on re-runs); SCC stream validated against the pinned CRD's required fields; `kube.Client.Apply`/`ApplyStatus` take the field manager as a required argument. `tools/regenerate` (Go, SHA-pinned fetches): strict splice/marker rules — a BEGIN is closed by the very next marker line, missing/duplicate/nested/unmanaged pairs and wrong layouts are refused, the replacement is a byte-range edit that never normalizes untouched bytes, and the spliced file is validated against the pre-splice file as decoded objects. | `internal/layers/platformobjects` tests; `tools/regenerate` command-path regressions |
-| 6 | `scc-admission` layer | Go webhook (concurrent server, generated TLS, configurable watched namespaces and injected UID); image built via a digest-pinned multi-stage docker build and loaded into each cluster; MutatingWebhookConfiguration scoped by namespaceSelector; failurePolicy `Ignore` (documented trade-off). Verify: a `runAsNonRoot: true` pod with no `runAsUser` in a watched namespace becomes Running with the injected UID. Hardening: §3.8. | `internal/layers/sccadmission` fake-apiserver unit regressions + SSA-merge integration regression |
-| 7 | Multi-cluster + complete verify | Concurrent clusters 2..N with cluster 1 sequential-first; inotify raise behind `provider.HostLimitRaiser` (§3.5); verify complete — global checks, every enabled layer's check, PASS/FAIL/SKIP; cross-cluster NodePort check (§3.6). Integration tests: count=2 full profile and count=3. | `test/integration` |
-| 8 | CO fitness proof + CI | `internal/verify/compliance` (semantics and gate behavior: §6); scc-admission image build moved behind `provider.ImageBuilder` — no layer invokes a container-runtime CLI directly; CI: lint + unit on every PR, integration behind the `integration` label, `workflow_dispatch`, nightly; actions SHA-pinned, workflow-level `contents: read`, no secrets. | `internal/verify/compliance` tests; `.github/workflows/ci.yaml` |
-| 9 | StackRox example | `examples/stackrox` — recipe design and boundary rules: §5.1. | example unit tests (no Docker, no helm, no network) |
-| 10 | Usability and honesty pass | Expected-vs-inventory count assertion (§3.6) with its regressions; example values-override flags and their refusal rules (§5.1); README honesty, prerequisites, recovery decision tree, performance budget (the README is the artifact; numbers in §6). | `kindocp` count-assertion regressions; `examples/stackrox` override regressions |
-| 11 | Cold-machine findings | Refusal remedies: the ancestor policy's write-bit refusals name their chmod fix and are classifiable as `fscheck.ErrUnsafeAncestor`, and the state-root walk decorates that class with the `--state-root` / `XDG_STATE_HOME` alternative — one error carries both remedies (§5.3); hermetic test scratch: `internal/testscratch`, whose TestMain helper masks ambient umask write bits and re-points the scratch base under the system `/tmp` when the ambient chain is refused, wired into the seven affected packages; unselected-profile layer validation in `planClusters` — create-only by construction, a deliberate tightening (release-notes: a config with a typo'd unselected profile that previously created fine now fails fast); README: umask-002 prerequisite warning, scc-shortname limitation, disk-footprint totals and small-disk warning; maintenance doc: lint-toolchain requirement. | `internal/fscheck`, `internal/state`, `kindocp`, `internal/cli` regressions; `internal/testscratch` tests; the §5.3 umask-002 proof run |
-
-### 5.1 StackRox example (increment 9)
-
-`examples/stackrox`: Central on cluster 1, Sensors on 2..N over NodePort
-on the shared kind network, released public images, collector disabled.
-A `package main` (structurally unimportable — the create path can never
-reach it) using kind-ocp's public surface plus standard client-go the
-way an outside consumer would, with one deliberate exception: its
-credential workspace is verified through kind-ocp's internal filesystem
-boundary (`internal/fscheck`), the same policy the state tree walks,
-reused rather than forked. Beyond kind-ocp's own requirements it needs
-only the helm CLI.
+Central on cluster 1, Sensors on 2..N over NodePort on the shared kind
+network, released public images, collector disabled. A `package main`
+(structurally unimportable — the create path can never reach it) using
+kind-ocp's public surface plus standard client-go the way an outside
+consumer would, with one deliberate exception: its credential workspace
+is verified through kind-ocp's internal filesystem boundary
+(`internal/fscheck`), the same policy the state tree walks, reused
+rather than forked. Beyond kind-ocp's own requirements it needs only
+the helm CLI at run time; its tests need no Docker, no helm, and no
+network.
 
 The two StackRox chart tarballs (central-services and
 secured-cluster-services 500.0.0, appVersion 5.0.0) are fetched once
 per run from charts.stackrox.io, verified against recorded SHA-256
-digests before a bounded, traversal-refusing extraction.
-Central deploys with NodePort exposure, scanner and telemetry off, and
-resource requests shrunk to kind scale. Sensors register with a
-cluster registration secret (CRS — init bundles are deprecated in
-Central 5.0) generated through Central's REST API over a client-go
-port-forward. The CRS name is deterministic, so a re-run converges: a
-409 from the generate call lists the same-named CRS and revokes it by
-id — only when exactly one entry holds the name — then regenerates.
-Revocation removes only the bootstrap credential: Sensors that
-already registered keep their issued identities, and the helm upgrade
-that follows re-applies the fresh manifest everywhere. The readiness gate is Central reporting every
-Sensor cluster registered and HEALTHY — the end-to-end AC-1.4 proof.
-Secrets (admin password, CRS) live in 0600 files under a 0700 work
-directory, passed to helm via `-f`, never through argv, never logged.
+digests before a bounded, traversal-refusing extraction. Sensors
+register with a cluster registration secret (CRS — init bundles are
+deprecated in Central 5.0) generated through Central's REST API over a
+client-go port-forward. The CRS name is deterministic, so a re-run
+converges: a 409 from the generate call lists the same-named CRS and
+revokes it by id — only when exactly one entry holds the name — then
+regenerates. Revocation removes only the bootstrap credential: Sensors
+that already registered keep their issued identities, and the helm
+upgrade that follows re-applies the fresh manifest everywhere. The
+readiness gate is Central reporting every Sensor cluster registered
+and HEALTHY — the end-to-end proof. Secrets (admin password,
+CRS) live in 0600 files under a 0700 work directory, passed to helm
+via `-f`, never through argv, never logged.
 
 The workspace is a per-prefix sibling of the state root, derived from
 the *resolved* state base and opened through the same `WalkDirNames`
@@ -602,18 +573,17 @@ with no path comparison left to fool: on a case-insensitive volume
 one directory while remaining two strings, exactly the shape a lexical
 overlap check passes while pointing credentials into the tree
 `kind-ocp delete` removes. Override containment is by directory
-identity (`os.Stat` + `os.SameFile` over the override's ancestors)
-for the same reason. The Central client authenticates Central before
-any credential is sent: the TLS peer must present a certificate
-chaining to the CA the chart's install hook wrote into the
-`central-tls` secret, verified as `central.stackrox.svc`; redirect
-answers and non-https base URLs are refused outright. The
-port-forward binds 127.0.0.1 only, local port chosen by client-go
-(port 0 — no listen-close-use window), under a single cause-carrying
-cancel context that is the forward's stop signal, every API call's
-lifetime, and the thing the goroutine cancels the moment
-`ForwardPorts` returns — the tunnel's own failure is published as the
-context's cause.
+identity (`os.Stat` + `os.SameFile` over the override's ancestors) for
+the same reason. The Central client authenticates Central before any
+credential is sent: the TLS peer must present a certificate chaining
+to the CA the chart's install hook wrote into the `central-tls`
+secret, verified as `central.stackrox.svc`; redirect answers and
+non-https base URLs are refused outright. The port-forward binds
+127.0.0.1 only, local port chosen by client-go (port 0 — no
+listen-close-use window), under a single cause-carrying cancel context
+that is the forward's stop signal, every API call's lifetime, and the
+thing the goroutine cancels the moment `ForwardPorts` returns — the
+tunnel's own failure is published as the context's cause.
 
 Values overrides (`--central-values`, `--sensor-values`) overlay the
 generated values, one `-f` each, in order. A user-supplied path is
@@ -621,117 +591,67 @@ resolved to its absolute checked form before helm sees it (the
 workspace's ancestor policy, private leaf): helm v4.3.1 reads a bare
 `-` as stdin and parses each `-f` operand as a CSV record — a comma
 splits it into several files, a quote breaks the parse, a newline or
-CR ends the record early (verified live) — so operands containing a
-comma, double quote, newline, or carriage return are refused, and
-only the absolute path is handed on. Overrides must be single-link
-files (hard-linked overrides are refused — in-place writers elsewhere
-in the tree would clobber them) and are checked private/caller-owned
-like all credential files. helm's own stdout/stderr are discarded
-(its diagnostics quote values content, which carries the admin
-password); a failed run reports the exit status and the full
-shell-quoted command line.
+CR ends the record early — so operands containing a comma, double
+quote, newline, or carriage return are refused, and only the absolute
+path is handed on. Overrides must be single-link files (hard-linked
+overrides are refused — in-place writers elsewhere in the tree would
+clobber them) and are checked private/caller-owned like all credential
+files. helm's own stdout/stderr are discarded (its diagnostics quote
+values content, which carries the admin password); a failed run
+reports the exit status and the full shell-quoted command line.
 
-### 5.2 Usability and honesty pass (increment 10)
+## 4. Porting map from PR #23841
 
-The code delivery is the expected-vs-inventory count assertion (§3.6)
-and its Docker-free regressions in `kindocp`: vanished-cluster FAIL
-naming cluster and remedy, drift (count-3 create, count-2 verify →
-PASS), the corrupt/legacy SKIP table, atomic replacement and
-concurrent updates of the expectation file, marker untouched by count
-writes. The documentation work — the "What is proven" separation, the
-real prerequisites and network endpoints, the recovery decision tree,
-the performance and resource budget (§6) — lives in the README, which
-is the artifact. The example gained the values-override flags (§5.1);
-their refusal rules (operands with comma/quote/newline/CR, overrides
-inside the workspace or the run's state tree, hard-linked files,
-case-colliding spellings) are pinned by regressions in
-`examples/stackrox`.
+| PoC (tests/e2e/kind-compliance/) | kind-ocp |
+|---|---|
+| `ensure_kind_cluster` | `internal/provider/kind` Create + wait |
+| `raise_inotify` | best-effort Linux sysctl with warning |
+| `install_olm` | `internal/layers/olm` |
+| placeholder CRDs + 3 singletons + Infrastructure status patch (`install_co` config-shim part) | `internal/layers/configopenshift` + `assets/` |
+| node labeling (`install_co_olm` label line) | `internal/layers/nodelabels` |
+| `OPENSHIFT_CRD_MAP` + `stage_openshift_crds` | `internal/layers/openshiftapicrds` (path map + staging from the pinned `openshift/api` module) |
+| `apply_platform_shim` (objects.yaml, sccs.yaml) | `internal/layers/platformobjects` + `assets/` |
+| `regenerate.sh` (+ python splice) | `tools/regenerate` (Go) |
+| `install_scc_webhook` + `scc-shim-webhook.py` | `internal/layers/sccadmission` (Go webhook, TLS generated in Go, namespaces/UID configurable, concurrent server) |
+| `install_co` OLM part (CatalogSource/OperatorGroup/Subscription, CSV fallback), `wait_profilebundles_valid` | `internal/verify/compliance` (CO fitness proof — never reachable from `create`) |
+| multi-cluster parallel `up`/`down`/`verify` orchestration | `kindocp` façade |
+| NOT ported: `render_charts`, `deploy_central`, `central_internal_endpoint`, `start_central_pf`, `generate_init_bundle`, `deploy_secured`, `central_api`, `cluster_id_for`, `cluster_ready` | `examples/stackrox` (example only) |
 
-### 5.3 Cold-machine findings (increment 11)
+Gotchas to preserve land with the code that needs them and are
+asserted by verify checks: OLM CRDs via SSA; wait for CRD Established before
+using kinds; CatalogSource in namespace `olm`; SCCs via create (or SSA), with
+delete+recreate on re-runs; status writes through the status subresource;
+master label on control-plane nodes; serving-cert secret before CO starts;
+CSV channel-head fallback; per-cluster temp/state paths; per-wait deadlines;
+exit-code fidelity in Make recipes.
 
-Findings from the first clean-machine install test (v0.1.0, Ubuntu,
-umask 002 — the Debian usergroups default). The state-tree privacy
-policy is correct by design and stays; the gap is that its refusals
-meet the most common Linux default with no remedy offered.
-
-- **State root on umask-002 distros (the defect)**: `~/.local` exists
-  0775 (created by other tooling under umask 002), so the default state
-  root `~/.local/state/kind-ocp` is refused: "is group-writable". A
-  fresh machine is fine — the walk creates a missing `~/.local` as
-  0700 — but the refusal must carry its remedy (chmod g-w the
-  offending path, or point --state-root / XDG_STATE_HOME elsewhere),
-  and the README prerequisites must warn umask-002 users before they
-  hit it.
-- **Test hermeticity, same root cause**: 7 of 23 unit-test packages
-  (internal/cli, internal/state, internal/fscheck,
-  internal/provider/kind, kindocp, test/publicapi, examples/stackrox)
-  fail when the ambient TMPDIR chain contains a user-owned
-  group-writable non-sticky directory. The suites must be hermetic
-  against the ambient chain: a shared test helper that, when the
-  TMPDIR chain fails the ancestor policy, re-points the package's
-  scratch base to a 0700 directory directly under the system /tmp
-  (sticky — the policy deliberately tolerates it). Prove with the full
-  suite run under umask 002 with a group-writable TMPDIR.
-- **`kubectl get scc` shortname**: the pinned upstream SCC CRD
-  declares no shortNames, and adding one would diverge from the
-  digest-verified bytes. Document in the README (use the full
-  `securitycontextconstraints`); no code change.
-- **Unselected-profile validation**: a custom profile in the config
-  file whose layer list names an unknown layer errors only when that
-  profile is selected (`layers.LayerNamesForProfile`). Validate every
-  defined profile's layer names in the create path, so a typo in an
-  unselected profile fails fast. Regressions for selected and
-  unselected shapes.
-- **lint toolchain**: golangci-lint binaries built with go1.25 cannot
-  lint a go1.27.4 module. Document in docs/maintenance.md: install
-  golangci-lint built with go1.27.4.
-- **Disk footprint**: the README performance section states per-cluster
-  numbers but no total and no small-disk warning. Add both: a default
-  2-cluster run costs ~5 GB of images plus ~1.5 GB per cluster in
-  volumes, and a small disk caps the practical cluster count well
-  below the 64 limit.
-
-Delivered as increment 11. The refusal remedies and the validations
-landed as specified above. One mechanism detail the findings did not
-spell out: re-pointing the scratch base alone is not enough, because
-the testing package creates `t.TempDir`'s per-test subdirectories with
-mode 0777 — they are umask-subject, so under umask 002 they come out
-0775 (user-owned, group-writable, non-sticky) wherever the base lives.
-The delivered helper (`internal/testscratch`, wired into the seven
-packages' TestMain through `testscratch.Main`) therefore does two
-things: it adds the group- and other-write bits to the test binary's
-umask (preserving stricter ambient masks, never loosening them), and
-it re-points `GOTMPDIR`/`TMPDIR` to a fresh 0700 directory directly
-under the system `/tmp` when the ambient chain fails the ancestor
-policy. Neither touches what the boundary refuses: tests that chmod a
-directory into an unsafe shape keep failing as designed, because chmod
-applies exactly the requested mode. Proof (the §6 manual-evidence
-convention): the seven packages fail before the fix and the full
-suite passes after it, run under `umask 002` with `TMPDIR` pointed at
-a user-owned group-writable non-sticky directory.
-
-The review pass tightened the remedies: the chmod operand is
-shell-quoted, so a state-root chain containing spaces pastes into a
-shell as printed, and a directory with both write bits set (0777) is
-told `chmod go-w` — `chmod g-w` alone would leave it 0757, still
-refused. The maintenance doc's lint-toolchain requirement states the
-real boundary, the `go` directive's language (minor) version: a
-go1.27.2-built binary lints this go1.27.4 module fine.
-
-## 6. Testing strategy
+## 5. Testing strategy
 
 - Unit (no Docker): config resolution and precedence, per-cluster overrides,
   profile/layer selection, name generation, state paths and permissions, CRD
   path map, webhook patch logic, manifest rendering, wait conditions against
   fakes.
-- Integration (build tag `integration`): lifecycle per increment, cross-cluster
-  reachability (7), CO proof (8), N=3 concurrency (7). Docker-gated with a
+- Hermetic scratch (`internal/testscratch`, wired into the affected
+  packages' TestMain through `testscratch.Main`): unit tests do not
+  depend on the ambient umask or TMPDIR chain. The helper adds the
+  group- and other-write bits to the test binary's umask (preserving
+  stricter ambient masks, never loosening them), because the testing
+  package creates `t.TempDir` subdirectories 0777 — umask-subject, so
+  under umask 002 they come out 0775 wherever the base lives — and it
+  re-points `GOTMPDIR`/`TMPDIR` to a fresh 0700 directory directly
+  under the system `/tmp` (sticky — the ancestor policy deliberately
+  tolerates it) when the ambient chain fails that policy. Neither
+  touches what the boundary refuses: tests that chmod a directory into
+  an unsafe shape keep failing as designed, because chmod applies
+  exactly the requested mode.
+- Integration (build tag `integration`): lifecycle, cross-cluster
+  reachability, the CO proof, N=3 concurrency. Docker-gated with a
   shared guard that is environment-aware: locally an unavailable daemon skips
   the test with a clear message; under CI (any environment setting `CI`,
   which every GitHub Actions runner does) the same condition fails it — a
   green CI run that skipped every test would be a false pass for exactly the
   job whose purpose is to run them.
-- CO fitness proof (`internal/verify/compliance`, increment 8): a
+- CO fitness proof (`internal/verify/compliance`): a
   deployment proof, never a verify check — an import-boundary test
   fails the build on any import of it outside itself and the tagged
   integration test, and it is one-shot on a fresh cluster (a
@@ -741,11 +661,10 @@ go1.27.2-built binary lints this go1.27.4 module fine.
   pinned, externally-run crane. Measured cold, the full uncached
   suite (including the proof's per-cluster image pulls) runs in
   ~17–18 minutes against the Makefile's 60m go test budget.
-- Manual evidence per increment: real `create`/`verify`/`delete` runs with
-  command output kept in the workflow run (this repo has no external PR until
-  publishing).
+- Manual evidence: real `create`/`verify`/`delete` runs with command
+  output recorded.
 
-### 6.1 Local macOS development note
+### 5.1 Local macOS development note
 
 On macOS with Docker Desktop, `/var/run/docker.sock` is a symlink to the
 Desktop daemon's socket, and that symlink's target has been observed to
@@ -770,25 +689,28 @@ neither workaround. These are environment constraints, not kind-ocp
 defects — the errors surface unchanged from kind through the contextual
 wrapping.
 
-### 6.2 Measured performance and resource budget
+### 5.2 Measured performance and resource budget
 
 On the development machine (Docker Desktop 28.1.1): create 105 s cold,
 85 s warm, 8 s reconcile; delete ~1 s; verify 17 s; 58 s for a minimal
 cluster pair and 89 s for three full clusters; ~17 min for the cold
 integration suite. Per-cluster idle budget: ~1 GiB RAM, 15–20 % of one
 CPU per node container, ~1.5 GB volume + ~4 MB layer, node image
-shared once per daemon. The hard count cap is 64 (enforced by
-create); there is no concurrency limiter after the first cluster (a
-deliberate scope cut).
+shared once per daemon. Totals for the default 2-cluster run: roughly
+5 GB of images (pulled once, shared by every cluster on the daemon)
+plus ~1.5 GB per cluster in volumes; a small disk caps the practical
+cluster count well below the 64 limit. The hard count cap is 64
+(enforced by create); there is no concurrency limiter after the first
+cluster (a deliberate scope cut).
 
-## 7. Risks and mitigations
+## 6. Risks and mitigations
 
 - Upstream pin drift breaks create or the CO proof → pins are defaults,
   overridable by config; bump procedure documented (README).
 - kind library API instability → pinned version, thin `provider` boundary.
-- Local-build webhook on create (increment 6) adds a docker build step →
+- Local-build webhook on create adds a docker build step →
   measured once and documented; if it proves fragile, the documented fallback
   is a digest-pinned third-party image with the patch logic tested by
-  integration only (weaker AC-6.2 coverage — avoid).
+  integration only (weaker webhook coverage than the fake-apiserver unit tests — avoid).
 - CI cost of the CO proof → single job, label-gated on PRs, nightly (§2).
 - macOS quirks (inotify, sysctl) → warnings, never failures.

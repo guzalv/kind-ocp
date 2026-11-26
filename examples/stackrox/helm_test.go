@@ -236,7 +236,7 @@ func TestWriteValuesFilesPreserveAHardLinkedFile(t *testing.T) {
 	if path != generated {
 		t.Fatalf("writeSensorValues returned %q, want the generated path %q", path, generated)
 	}
-	// The reviewer's assertion: the original bytes survive the run.
+	// The original bytes must survive the run.
 	if b, err := os.ReadFile(user); err != nil || !bytes.Equal(b, original) {
 		t.Fatalf("the hard-linked user file was rewritten: (%q, %v), want the original bytes untouched", b, err)
 	}
@@ -463,7 +463,7 @@ func TestCheckValuesOverridesRefusesTheWorkDirectory(t *testing.T) {
 			t.Errorf("the work directory holds %v (%v) after the refusal, want only the user's file", entries, err)
 		}
 	}
-	// The reviewer's shape: the generated Sensor values name a previous
+	// The stale-values shape: the generated Sensor values name a previous
 	// run left behind, carrying the user's own image edits.
 	userValues := []byte("image:\n  main:\n    fullRef: my-registry.example.com/stackrox/main:my-branch\n")
 	setup := func(t *testing.T, prefix string) (*config.Config, string) {
@@ -624,7 +624,7 @@ func TestCheckValuesOverridesRefusesTheStateDirectory(t *testing.T) {
 		}
 		return cfg, tree
 	}
-	// The reviewer's shape: valid custom image values parked at the
+	// The parked-file shape: valid custom image values parked at the
 	// expected-clusters path — the file SetExpectedClusters replaces
 	// with the count before the first cluster is provisioned.
 	userValues := []byte("image:\n  main:\n    fullRef: my-registry.example.com/stackrox/main:my-branch\n")
@@ -759,7 +759,7 @@ func TestCheckValuesOverridesRefusesAHardLinkedFile(t *testing.T) {
 	userValues := []byte("image:\n  main:\n    fullRef: my-registry.example.com/stackrox/main:my-branch\n")
 
 	t.Run("hard-linked to a cluster record, outside both trees", func(t *testing.T) {
-		// The reviewer's probe: a marked per-prefix state tree holding
+		// The probe shape: a marked per-prefix state tree holding
 		// one cluster record — a file Store.WriteRecord rewrites in
 		// place on every run — and a private user file outside both
 		// trees hard-linked to it. The tree checks pass (the
@@ -799,8 +799,8 @@ func TestCheckValuesOverridesRefusesAHardLinkedFile(t *testing.T) {
 		// values files are replaced atomically, but the other names a
 		// link can carry are not all so kind, and the check cannot
 		// tell — so the generated-values shape is refused like any
-		// other. This pins the deliberate choice from the sixth
-		// review round: no acceptance criterion requires hard-link
+		// other. This pins a deliberate
+		// choice: no acceptance criterion requires hard-link
 		// support, and a future acceptance would be a deliberate
 		// change, not drift.
 		work := t.TempDir()

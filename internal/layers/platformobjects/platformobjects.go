@@ -68,8 +68,7 @@
 //     this layer fills them in — and under one shared manager the
 //     bootstrap's re-run would release this layer's fields (its
 //     `spec: {}` APIServer re-apply emptied this layer's spec into a
-//     value the real CRD rejects as null; found live in the
-//     increment-5 integration run). Under per-layer managers each layer
+//     value the real CRD rejects as null). Under per-layer managers each layer
 //     owns the fields it applies, and this layer — applying later —
 //     wins any shared field it also writes.
 //

@@ -17,9 +17,9 @@ import (
 	"github.com/guzalv/kind-ocp/kindocp"
 )
 
-// TestCreateWithOLMLayer exercises increment 2's layer end to end on a
+// TestCreateWithOLMLayer exercises the olm layer end to end on a
 // real Docker daemon: create with an olm-only profile (not full — full
-// grows as later increments register layers, and this test is only
+// grows as more layers register, and this test is only
 // about olm), verify passes the layer check, and a re-run of create
 // reconciles — server-side apply re-applying the same release under
 // the same field manager must be a no-op against a live OLM, not a
@@ -32,7 +32,7 @@ func TestCreateWithOLMLayer(t *testing.T) {
 	stateRoot := filepath.Join(t.TempDir(), "state")
 
 	// olmOnly selects exactly the olm layer, keeping the test stable
-	// when the next increments register theirs.
+	// as more layers register.
 	olmOnly := func(cfg *config.Config) {
 		cfg.Profiles = map[string]config.Profile{"olm-only": {Layers: []string{"olm"}}}
 		cfg.Profile = "olm-only"

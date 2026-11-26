@@ -379,7 +379,7 @@ func TestNewDefaultsRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The builtin registry grows one layer per increment; assert its
+	// The builtin registry's layer set is deliberate; assert its
 	// current shape so a new registration extends it deliberately.
 	want := []string{"config-openshift", "node-labels", "olm", "openshift-api-crds", "platform-objects", "scc-admission"}
 	if names := c.reg.Names(); !slices.Equal(names, want) {
@@ -648,9 +648,9 @@ func TestCreateEagerValidation(t *testing.T) {
 	})
 
 	// A profile's layer list naming an unknown layer fails create up
-	// front, selected (the long-standing behavior) or not (§5.3's
-	// cold-machine finding: a typo in an unselected profile previously
-	// created fine and surfaced only on the run that selected it).
+	// front, selected (the long-standing behavior) or not: a typo in an
+	// unselected profile otherwise
+	// creates fine and surfaces only on the run that selects it.
 	t.Run("unknown layer in a selected profile", func(t *testing.T) {
 		cfg := testConfig(t, 1, "typoed")
 		cfg.Profiles["typoed"] = config.Profile{Layers: []string{"one", "nope"}}
@@ -1178,8 +1178,8 @@ func TestVerifyReportsMissingAndUnmanagedClusters(t *testing.T) {
 	}
 }
 
-// vanishCluster removes a cluster the way the increment-10 finding
-// describes: the container and the state record both go, so the cluster
+// vanishCluster removes a cluster without a trace: the container and
+// the state record both go, so the cluster
 // is invisible to list and to every per-cluster check — exactly the
 // shape that let a lone survivor report all-PASS before the count
 // assertion existed.
@@ -1197,11 +1197,11 @@ func vanishCluster(t *testing.T, client *Client, prov *fakeProvisioner, name str
 	}
 }
 
-// The increment-10 finding: a cluster whose container and state record
-// both vanished produced no verify line at all, and the survivors alone
-// reported all-PASS. The whole-prefix count assertion must FAIL naming
-// the vanished cluster and the remedy, while the survivor's checks
-// still run.
+// A cluster whose container and state record
+// both vanish produces no verify line at all; the survivors alone
+// would report all-PASS. The whole-prefix count assertion must FAIL
+// naming the vanished cluster and the remedy, while the survivor's
+// checks still run.
 func TestVerifyFailsWhenAVanishedClusterLeavesNoTrace(t *testing.T) {
 	cfg := testConfig(t, 2, "minimal")
 	prov := newFakeProvisioner()
@@ -1340,7 +1340,7 @@ func TestVerifyCountAssertionDegradesOnOldOrCorruptState(t *testing.T) {
 			readyWant:  StatusPass,
 		},
 		{
-			// The shapes the reviewer wrote live: a non-integer
+			// A non-integer
 			// expectation must classify as corrupt state (SKIP with
 			// the remedy) while the tree stays fully usable — the
 			// marker's ownership never depends on the count's shape.
@@ -1433,7 +1433,7 @@ func TestVerifyCountAssertionDegradesOnOldOrCorruptState(t *testing.T) {
 	})
 }
 
-// The empty-inventory case the reviewer found live: with a valid
+// The empty-inventory case: with a valid
 // expectation of 2 and every cluster vanished (no containers, no
 // records), verify must return the count FAIL naming what is missing —
 // not the bare "no clusters with prefix" structural error, which is

@@ -169,8 +169,7 @@ func TestCreateConcurrentClustersCompleteStateIsolated(t *testing.T) {
 // TestCreateClustersTwoThroughNRunConcurrently pins the concurrency
 // itself: the Applies for clusters 2 and 3 must overlap in time. The
 // rendezvous layer fails the create when the second wave cluster finds
-// no partner within its timeout, so a sequential wave (a regression to
-// the increment-1 loop) fails this test.
+// no partner within its timeout, so a sequential wave fails this test.
 func TestCreateClustersTwoThroughNRunConcurrently(t *testing.T) {
 	client := newConcurrentClient(t, 3, newRendezvousLayer())
 
@@ -217,8 +216,7 @@ func TestCreateConcurrentFailuresAreAggregated(t *testing.T) {
 }
 
 // TestCreateClusterOneFailureStopsTheWave: cluster 1's create is the
-// gate — when it fails, clusters 2..N are never started, which is the
-// sequential contract every earlier increment ran under.
+// gate — when it fails, clusters 2..N are never started.
 func TestCreateClusterOneFailureStopsTheWave(t *testing.T) {
 	cfg := testConfig(t, 3, "full")
 	prov := newFakeProvisioner()

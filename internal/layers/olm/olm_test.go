@@ -325,9 +325,8 @@ func decodeExcerpt(t *testing.T) []*unstructured.Unstructured {
 	return objs
 }
 
-// The increment-2 review finding: the layer applied the release
-// objects unchanged, so the default cluster carried two floating image
-// references — the operatorhubio-catalog CatalogSource at
+// The release objects ship two floating image references by default:
+// the operatorhubio-catalog CatalogSource at
 // quay.io/operatorhubio/catalog:latest with a 60m poll, and the
 // catalog-operator's --configmapServerImage at
 // quay.io/operator-framework/configmap-operator-registry:latest.
@@ -453,9 +452,9 @@ const availableDeployment = `{"kind":"Deployment","apiVersion":"apps/v1",` +
 	`"status":{"observedGeneration":1,"availableReplicas":1,` +
 	`"conditions":[{"type":"Available","status":"True"}]}}`
 
-// The regression for the increment-2 gate finding: Verify's discovery
-// read — the GroupVersionServed call — ran under the caller's unbounded
-// context, so an apiserver that wedged /api and /apis hung
+// Verify's discovery read — the GroupVersionServed call — must be
+// bounded: under the caller's unbounded context, an apiserver that
+// wedged /api and /apis would hang
 // `kind-ocp verify` indefinitely (the CLI hands Verify
 // context.Background) while every neighboring read was bounded. The
 // fake apiserver answers the operator Deployment reads immediately
@@ -569,7 +568,7 @@ func (t *fileTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}, nil
 }
 
-// The security-gate finding: the version pin does not bind the bytes —
+// The version pin does not bind the bytes —
 // GitHub release assets are mutable under a tag — and the manifest
 // bytes are applied with cluster-admin credentials. fetchRelease must
 // verify the default release's files against their reviewed digests

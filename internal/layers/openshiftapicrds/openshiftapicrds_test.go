@@ -574,13 +574,12 @@ func TestCacheLoadClassification(t *testing.T) {
 	})
 }
 
-// The F-2 regression at unit level: Established is not enough — a CRD
+// The downgrade regression at unit level: Established is not enough — a CRD
 // replaced by its placeholder (established, with a schema that defines
 // nothing and preserves everything) FAILs the check naming the CRD,
 // while the real one passes. The fixtures carry live schemas because
-// the schema is the check: the api-approved marker alone passed a
-// schema-less CRD in the increment-4 fix's own positive fixture, which
-// is the second review's finding.
+// the schema is the check: the api-approved marker alone would pass a
+// schema-less CRD.
 func TestVerifyDistinguishesRealCRDsFromPlaceholders(t *testing.T) {
 	// The two live root schemas the check distinguishes: the real
 	// openshift/api one defines properties and preserves nothing; the
@@ -707,7 +706,7 @@ users:
 	})
 
 	t.Run("a placeholder carrying the real-CRD marker still fails", func(t *testing.T) {
-		// The second review's negative fixture: the marker is metadata
+		// The marker is metadata
 		// a schema-only change leaves untouched, so a placeholder that
 		// carries it must fail exactly like one without it.
 		env := envFor(t, allRealExcept(map[string]string{

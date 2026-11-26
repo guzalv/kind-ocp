@@ -400,12 +400,12 @@ func TestDeploymentRolledOut(t *testing.T) {
 		}
 	})
 
-	// The increment-2 review finding, verbatim: a Recreate-strategy
-	// Deployment whose pod template changed reports generation=2,
+	// A Recreate-strategy Deployment whose pod template changed
+	// reports generation=2,
 	// observedGeneration=2, replicas=1, updatedReplicas=0,
 	// availableReplicas=1, and Available=True while the old replica is
 	// still the only one running — the replacement has not started.
-	// Availability alone called this rollout complete.
+	// Availability alone must not call this rollout complete.
 	t.Run("available from the old replica is not rolled out", func(t *testing.T) {
 		d := deployment(func(d *appsv1.Deployment) {
 			d.Generation = 2
@@ -420,7 +420,7 @@ func TestDeploymentRolledOut(t *testing.T) {
 		})
 		ok, why := DeploymentRolledOut(d)
 		if ok {
-			t.Fatal("DeploymentRolledOut = true for the review's mid-rollout status, want false")
+			t.Fatal("DeploymentRolledOut = true for a mid-rollout status, want false")
 		}
 		if !strings.Contains(why, "0/1 updated") {
 			t.Errorf("why = %q, want the updated-replica shortfall", why)
@@ -469,8 +469,8 @@ func TestWaitForDeploymentRolledOut(t *testing.T) {
 	})
 
 	// The waiter must keep polling through the mid-rollout status that
-	// is simultaneously Available: the poll returning nil here was the
-	// increment-2 review finding.
+	// is simultaneously Available: returning nil here would accept a
+	// rollout whose replacement has not started.
 	t.Run("available old replica is polled through, not accepted", func(t *testing.T) {
 		cs := fake.NewSimpleClientset(deployment(func(d *appsv1.Deployment) {
 			d.Generation = 2

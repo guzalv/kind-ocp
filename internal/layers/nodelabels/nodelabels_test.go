@@ -97,8 +97,8 @@ func TestCheckMasterLabel(t *testing.T) {
 		}
 	})
 
-	// The regression the increment-3 review found live: a non-empty
-	// value matched the old presence-only check while scheduling
+	// A non-empty label value must fail the check naming the node and
+	// its value: a presence-only check would pass it while scheduling
 	// master-selected Deployments nowhere (their nodeSelectors match
 	// master: "" exactly).
 	t.Run("non-empty label value fails and is named with its value", func(t *testing.T) {
@@ -366,12 +366,11 @@ func TestVerify(t *testing.T) {
 	})
 }
 
-// The regression the increment-3 review reproduced on a live cluster: a
-// master label with a non-empty value — nothing in kind sets one, but
+// A master label with a non-empty value — nothing in kind sets one, but
 // a stray `kubectl label node -l node-role.kubernetes.io/control-plane
 // node-role.kubernetes.io/master=weird` produces exactly this state —
-// passed the old presence-only Verify while scheduling
-// master-selected Deployments nowhere. Verify must reject it, and a
+// must be rejected by Verify: a presence-only check would pass it while
+// scheduling master-selected Deployments nowhere. A
 // re-run of the layer must converge the value back to the empty
 // string.
 func TestReconcileRestoresEmptyMasterLabelValue(t *testing.T) {
@@ -399,9 +398,9 @@ func TestReconcileRestoresEmptyMasterLabelValue(t *testing.T) {
 	}
 }
 
-// The same regression class the increment-2 gates found in the olm
-// layer: Verify's read ran under the caller's unbounded context, so a
-// wedged apiserver hung `kind-ocp verify` indefinitely (the CLI hands
+// Verify's read must be bounded: under the caller's unbounded context,
+// a wedged apiserver would hang
+// `kind-ocp verify` indefinitely (the CLI hands
 // it context.Background). The fake apiserver stalls the node list far
 // beyond the read budget; the read must fail within the bound.
 func TestVerifyReadIsBounded(t *testing.T) {

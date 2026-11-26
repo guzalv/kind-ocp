@@ -258,7 +258,8 @@ func TestCreateDeleteLifecycleMinimal(t *testing.T) {
 	}
 }
 
-// TestSameNameReplacementRejected reproduces the review finding on a real
+// TestSameNameReplacementRejected exercises the same-name replacement
+// hazard on a real
 // daemon: a cluster deleted through one state root and re-created under the
 // same name through another must not be trusted by the first root's record.
 // The record is bound to the cluster instance (kube-system UID); verify
@@ -281,7 +282,7 @@ func TestSameNameReplacementRejected(t *testing.T) {
 		t.Fatalf("create under root A: %v", err)
 	}
 
-	// The reviewer's path: delete the cluster through a foreign root B,
+	// The replacement path: delete the cluster through a foreign root B,
 	// then re-create the same name under B. Root A's state is untouched.
 	clientB, _ := testClient(t, prefix)
 	if _, err := clientB.Delete(ctx); err != nil {
@@ -330,7 +331,8 @@ func TestSameNameReplacementRejected(t *testing.T) {
 	}
 }
 
-// TestInterruptedCreateReplacementRejected reproduces the review finding on
+// TestInterruptedCreateReplacementRejected exercises the interrupted-create
+// replacement hazard on
 // a real daemon: a create that dies before the cluster identity is recorded
 // (here: a readiness timeout that fires before the first poll can answer)
 // leaves an unbound pending record. A same-named replacement cluster —
@@ -357,7 +359,7 @@ func TestInterruptedCreateReplacementRejected(t *testing.T) {
 		t.Fatalf("create under root A = %v, want a readiness timeout", err)
 	}
 
-	// The reviewer's path: delete the cluster through a foreign root B and
+	// The replacement path: delete the cluster through a foreign root B and
 	// re-create the same name under it. Root A's state is untouched.
 	clientB, _ := testClient(t, prefix)
 	if _, err := clientB.Delete(ctx); err != nil {
@@ -429,7 +431,7 @@ func (l *flakyLayer) Apply(_ context.Context, _ layers.Env) error {
 func (l *flakyLayer) Verify(_ context.Context, _ layers.Env) error { return nil }
 
 // TestLayerFailureRetryConvergesSameInstance is the interrupted-create
-// companion the review asked for: a create interrupted mid-layer (after the
+// companion: a create interrupted mid-layer (after the
 // identity is bound, before completion) must converge on a retry against
 // the same instance, with the binding preserved.
 func TestLayerFailureRetryConvergesSameInstance(t *testing.T) {

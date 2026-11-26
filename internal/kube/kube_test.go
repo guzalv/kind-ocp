@@ -497,7 +497,7 @@ func TestNewClientsetRefusesRedirects(t *testing.T) {
 // before http.Client ever builds a target request — leaves the
 // Location nowhere to surface. The 308 is deliberate: it is the other
 // status whose redirect re-sends a DELETE's body, so the refusal is
-// proven on the shape the security finding is about.
+// proven on the body-carrying request shape.
 func TestNewClientsetRefusalDisclosesNoTarget(t *testing.T) {
 	// Distinctive secrets the assertion can look for verbatim.
 	const (

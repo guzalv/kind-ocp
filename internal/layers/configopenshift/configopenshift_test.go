@@ -303,10 +303,10 @@ func TestVerify(t *testing.T) {
 	})
 }
 
-// The same regression class the increment-2 gates found in the olm
-// layer: Verify's read ran under the caller's unbounded context, so a
-// wedged apiserver hung `kind-ocp verify` indefinitely (the CLI hands
-// it context.Background). The fake apiserver stalls the Infrastructure
+// Verify's read must be bounded: under the caller's unbounded context,
+// a wedged apiserver would hang
+// `kind-ocp verify` indefinitely (the CLI hands it
+// context.Background). The fake apiserver stalls the Infrastructure
 // read far beyond the read budget; the read must fail within the bound.
 func TestVerifyReadIsBounded(t *testing.T) {
 	const readBudget = 200 * time.Millisecond
@@ -575,8 +575,7 @@ func TestApply(t *testing.T) {
 	applyAssertions(t, api)
 }
 
-// The increment-4 review's finding, at unit level: a cluster that
-// already has CRDs under these names — the real openshift/api CRDs the
+// A cluster that already has CRDs under these names — the real openshift/api CRDs the
 // openshift-api-crds layer installs, or any foreign form — must not be
 // overwritten by the placeholder bootstrap. Existing CRDs are skipped,
 // the missing ones are created, and the singletons still converge.

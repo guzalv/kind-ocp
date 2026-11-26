@@ -5,7 +5,7 @@
 // that another local user can substitute entries in, and the test
 // suites deliberately build state trees under t.TempDir() to exercise
 // it. That makes them depend on two ambient facts a fresh machine can
-// break (the §5.3 cold-machine findings, both observed on a clean
+// break (both observed on a clean
 // Ubuntu install with umask 002, the Debian usergroups default):
 //
 //   - a permissive process umask: t.TempDir's per-test subdirectories

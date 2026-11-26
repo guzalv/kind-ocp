@@ -19,8 +19,8 @@ const (
 	// DefaultCount matches the product statement: N clusters, default 2.
 	DefaultCount = 2
 
-	// DefaultProfile enables every registered layer. With no builtin layers
-	// registered (early increments) this is equivalent to minimal.
+	// DefaultProfile enables every registered layer. With no builtin
+	// layers registered this is equivalent to minimal.
 	DefaultProfile = "full"
 
 	// DefaultKindNodeImage is the kind v0.33 node image for Kubernetes

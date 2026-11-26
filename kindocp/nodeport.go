@@ -73,7 +73,7 @@ import (
 // are on one network, and B's kube-proxy routes B's NodePort to a
 // listening endpoint. The pod-network half of the pattern — a workload
 // pod on A reaching B — is proven by the integration test with a real
-// client pod, and end to end by the StackRox example (increment 9).
+// client pod, and end to end by the StackRox example.
 //
 // Ownership of the probe's namespace is proven, never assumed. The
 // namespace's name is unique to one preparation (a fresh random tail

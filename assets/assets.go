@@ -6,7 +6,7 @@
 //
 // Provenance and pin policy live with each asset: everything here is
 // either hand-authored placeholder content ported from the PoC (stackrox
-// PR #23841) or, from increment 5 on, upstream-derived content guarded by
+// PR #23841) or upstream-derived content guarded by
 // regeneration markers and SHA pins (tools/regenerate).
 package assets
 

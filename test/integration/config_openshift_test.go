@@ -24,7 +24,7 @@ import (
 // The layer names and API shapes this test asserts against; they mirror
 // the config-openshift and node-labels layers' contracts.
 var (
-	increment3Layers = []string{"config-openshift", "node-labels"}
+	configOpenshiftProfileLayers = []string{"config-openshift", "node-labels"}
 
 	// The 13 placeholder CRDs, in asset document order.
 	configOpenshiftCRDs = []string{
@@ -51,18 +51,19 @@ var (
 	controlPlaneLabel = "node-role.kubernetes.io/control-plane"
 )
 
-// TestCreateWithConfigOpenshiftAndNodeLabels exercises increment 3's
-// layers end to end on a real Docker daemon: create with a profile of
-// exactly the two new layers (full grows as later increments register
-// theirs), verify passes both layer checks, the layers' postconditions
+// TestCreateWithConfigOpenshiftAndNodeLabels exercises the
+// config-openshift and node-labels layers end to end on a real Docker
+// daemon: create with a profile of exactly those two layers (full grows
+// as more layers register), verify passes both layer checks, the layers'
+// postconditions
 // hold independently of their own Verify — the 13 CRDs established, the
 // three singletons present, Infrastructure/cluster carrying the
 // platformStatus status, every control-plane node master-labeled with
 // the empty-string value — and a re-run of create reconciles: the
 // server-side applies (labels and the status subresource included) are
-// no-ops against a live cluster. A corrupted non-empty master label —
-// the deviation the increment-3 review found live — FAILs verify naming
-// the node and converges back to "" on the next create.
+// no-ops against a live cluster. A corrupted non-empty master label
+// FAILs verify naming the node and converges back to "" on the next
+// create.
 func TestCreateWithConfigOpenshiftAndNodeLabels(t *testing.T) {
 	requireDocker(t)
 	ctx := context.Background()
@@ -70,11 +71,11 @@ func TestCreateWithConfigOpenshiftAndNodeLabels(t *testing.T) {
 	cluster := prefix + "-1"
 	stateRoot := filepath.Join(t.TempDir(), "state")
 
-	increment3 := func(cfg *config.Config) {
-		cfg.Profiles = map[string]config.Profile{"increment-3": {Layers: increment3Layers}}
-		cfg.Profile = "increment-3"
+	tweak := func(cfg *config.Config) {
+		cfg.Profiles = map[string]config.Profile{"config-openshift-node-labels": {Layers: configOpenshiftProfileLayers}}
+		cfg.Profile = "config-openshift-node-labels"
 	}
-	client, _ := testClientAt(t, prefix, stateRoot, increment3, nil)
+	client, _ := testClientAt(t, prefix, stateRoot, tweak, nil)
 	if _, err := client.Delete(ctx); err != nil {
 		t.Fatalf("pre-clean delete: %v", err)
 	}
@@ -91,8 +92,8 @@ func TestCreateWithConfigOpenshiftAndNodeLabels(t *testing.T) {
 	if records[0].Status != kindocp.RecordStatusComplete {
 		t.Fatalf("record status = %s, want complete", records[0].Status)
 	}
-	if !slices.Equal(records[0].Layers, increment3Layers) {
-		t.Fatalf("record layers = %v, want %v in registration order", records[0].Layers, increment3Layers)
+	if !slices.Equal(records[0].Layers, configOpenshiftProfileLayers) {
+		t.Fatalf("record layers = %v, want %v in registration order", records[0].Layers, configOpenshiftProfileLayers)
 	}
 
 	// 2. Verify passes, including both layer checks.
@@ -100,7 +101,7 @@ func TestCreateWithConfigOpenshiftAndNodeLabels(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
-	requireAllPassAndLayerChecks(t, results, increment3Layers, "after create")
+	requireAllPassAndLayerChecks(t, results, configOpenshiftProfileLayers, "after create")
 
 	// 3. The layers' postconditions hold independently of their own
 	// Verify, read through the exported kubeconfig.
@@ -181,9 +182,9 @@ func TestCreateWithConfigOpenshiftAndNodeLabels(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verify after reconcile: %v", err)
 	}
-	requireAllPassAndLayerChecks(t, results, increment3Layers, "after reconcile")
+	requireAllPassAndLayerChecks(t, results, configOpenshiftProfileLayers, "after reconcile")
 
-	// 6. The live regression the increment-3 review found: a master
+	// 6. The label-tamper regression: a master
 	// label with a non-empty value — which nothing in kind sets, but a
 	// stray `kubectl label node` produces — schedules master-selected
 	// Deployments nowhere while a presence-only check would report
@@ -232,7 +233,7 @@ func TestCreateWithConfigOpenshiftAndNodeLabels(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verify after label recovery: %v", err)
 	}
-	requireAllPassAndLayerChecks(t, results, increment3Layers, "after label recovery")
+	requireAllPassAndLayerChecks(t, results, configOpenshiftProfileLayers, "after label recovery")
 }
 
 // singleClusterSkipOK reports whether one check result is the

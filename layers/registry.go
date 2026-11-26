@@ -7,7 +7,7 @@ import (
 )
 
 // Registry holds layer implementations in registration order, which is the
-// apply order (later increments register layers in dependency-safe order;
+// apply order (layers register in dependency-safe order;
 // see docs/PLAN.md §3.2).
 type Registry struct {
 	order  []string

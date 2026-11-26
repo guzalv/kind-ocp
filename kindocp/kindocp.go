@@ -162,8 +162,7 @@ func fromStateRecord(r state.Record) Record {
 // shared kind network and pulls the pinned node image — the two
 // cluster-scoped resources every later cluster depends on — so the
 // concurrent wave never races on either. A failure there stops the run
-// before any other cluster starts, which is the sequential contract
-// every earlier increment ran under.
+// before any other cluster starts.
 //
 // Every cluster's profile is resolved — and every profile the config
 // defines is validated against the registry, selected or not — before

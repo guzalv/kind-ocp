@@ -720,7 +720,7 @@ func TestVerifyCrossClusterNodePortRefusesUnmatchedBackendPort(t *testing.T) {
 	// The resolver-failure subtest lives with the endpoint-corroboration
 	// refusal above (TestVerifyCrossClusterNodePortRefusesUncorroboratedEndpoint,
 	// "an endpoint resolution failure fails the preparation"): the two
-	// resolver capabilities merged in the ninth review round, and the
+	// tests share one resolver capability, and the
 	// duplicated coverage there is the kept one.
 }
 

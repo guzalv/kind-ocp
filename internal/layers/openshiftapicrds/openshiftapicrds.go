@@ -2,7 +2,7 @@
 // 18 real OpenShift platform CRDs — the config.openshift.io,
 // operator.openshift.io, and security.openshift.io groups — that the
 // Compliance Operator's ocp4 checks read and that the platform-objects
-// layer (a later increment) builds its singletons and SCCs on.
+// layer builds its singletons and SCCs on.
 //
 // Ported from the PoC's stage_openshift_crds with OPENSHIFT_CRD_MAP
 // (stackrox PR #23841). The config-openshift layer already applied
@@ -235,10 +235,10 @@ const realCRDAnnotation = "api-approved.openshift.io"
 // Verify checks the layer's postconditions and mutates nothing: all 18
 // CRDs exist, report Established, and carry the real openshift/api
 // schema. Established alone does not distinguish them (placeholders
-// establish too, which is exactly how a downgraded cluster passed the
-// increment-4 review's check), and neither does the
+// establish too, so an Established-only check would pass a downgraded
+// cluster), and neither does the
 // api-approved.openshift.io annotation (a schema-only change leaves it
-// untouched — the second review's finding); the root schemas the
+// untouched); the root schemas the
 // cluster actually serves are the check. The read is bounded by
 // readTimeout.
 func (l Layer) Verify(ctx context.Context, env layers.Env) error {

@@ -7,8 +7,8 @@ import (
 )
 
 // TestMain keeps this suite hermetic against the ambient scratch
-// environment (umask 002, a policy-refused TMPDIR chain): the §5.3
-// cold-machine findings. See internal/testscratch.
+// environment (umask 002, a policy-refused TMPDIR chain). See
+// internal/testscratch.
 //
 // It lives in the external test package because testscratch checks the
 // ambient chain through fscheck itself — an in-package TestMain would

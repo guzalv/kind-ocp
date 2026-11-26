@@ -20,11 +20,11 @@ import (
 	"github.com/guzalv/kind-ocp/kindocp"
 )
 
-// increment5Layers is everything the platform-objects layer builds on,
+// platformObjectsProfileLayers is everything the platform-objects layer builds on,
 // in registration order. The profile is not "full" — full grows as
-// later increments register layers, and this test is only about
-// increment 5.
-var increment5Layers = []string{"config-openshift", "node-labels", "olm", "openshift-api-crds", "platform-objects"}
+// more layers register, and this test is only about the layers up to
+// platform-objects.
+var platformObjectsProfileLayers = []string{"config-openshift", "node-labels", "olm", "openshift-api-crds", "platform-objects"}
 
 // The GVRs this test reads directly, independently of the layer's own
 // table.
@@ -56,7 +56,8 @@ var wantConfigMaps = []struct {
 	{"openshift-etcd", "etcd-pod", "pod.yaml"},
 }
 
-// TestCreateWithPlatformObjectsLayer exercises increment 5's layer end
+// TestCreateWithPlatformObjectsLayer exercises the platform-objects
+// layer end
 // to end on a real Docker daemon: create with the five-layer profile,
 // verify passes every layer check, and the layer's postconditions hold
 // independently of its own Verify — both SCCs installed with every
@@ -77,11 +78,11 @@ func TestCreateWithPlatformObjectsLayer(t *testing.T) {
 	cluster := prefix + "-1"
 	stateRoot := filepath.Join(t.TempDir(), "state")
 
-	increment5 := func(cfg *config.Config) {
-		cfg.Profiles = map[string]config.Profile{"increment-5": {Layers: increment5Layers}}
-		cfg.Profile = "increment-5"
+	tweak := func(cfg *config.Config) {
+		cfg.Profiles = map[string]config.Profile{"through-platform-objects": {Layers: platformObjectsProfileLayers}}
+		cfg.Profile = "through-platform-objects"
 	}
-	client, _ := testClientAt(t, prefix, stateRoot, increment5, nil)
+	client, _ := testClientAt(t, prefix, stateRoot, tweak, nil)
 	if _, err := client.Delete(ctx); err != nil {
 		t.Fatalf("pre-clean delete: %v", err)
 	}
@@ -98,8 +99,8 @@ func TestCreateWithPlatformObjectsLayer(t *testing.T) {
 	if records[0].Status != kindocp.RecordStatusComplete {
 		t.Fatalf("record status = %s, want complete", records[0].Status)
 	}
-	if !slices.Equal(records[0].Layers, increment5Layers) {
-		t.Fatalf("record layers = %v, want %v in registration order", records[0].Layers, increment5Layers)
+	if !slices.Equal(records[0].Layers, platformObjectsProfileLayers) {
+		t.Fatalf("record layers = %v, want %v in registration order", records[0].Layers, platformObjectsProfileLayers)
 	}
 
 	// 2. Verify passes, including every layer check.
@@ -107,7 +108,7 @@ func TestCreateWithPlatformObjectsLayer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
-	requireAllPassAndLayerChecks(t, results, increment5Layers, "after create")
+	requireAllPassAndLayerChecks(t, results, platformObjectsProfileLayers, "after create")
 
 	// 3. The layer's postconditions hold independently of its own
 	// Verify, read through the exported kubeconfig.
@@ -192,7 +193,7 @@ func TestCreateWithPlatformObjectsLayer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verify after reconcile: %v", err)
 	}
-	requireAllPassAndLayerChecks(t, results, increment5Layers, "after reconcile")
+	requireAllPassAndLayerChecks(t, results, platformObjectsProfileLayers, "after reconcile")
 	// The re-created SCC still carries its nulls.
 	scc, err := kubeClient.Dynamic.Resource(sccGVR).Get(ctx, "restricted-v2", metav1.GetOptions{})
 	if err != nil {
@@ -238,5 +239,5 @@ func TestCreateWithPlatformObjectsLayer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verify after the tamper recovery: %v", err)
 	}
-	requireAllPassAndLayerChecks(t, results, increment5Layers, "after the tamper recovery")
+	requireAllPassAndLayerChecks(t, results, platformObjectsProfileLayers, "after the tamper recovery")
 }

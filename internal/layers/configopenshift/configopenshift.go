@@ -19,8 +19,8 @@
 // openshift-api-crds layer installed, or a foreign one) is left exactly
 // as it is. Server-side applying the placeholders instead would
 // overwrite the real CRDs with the placeholder schemas — a re-create
-// whose later fetch fails would downgrade a working cluster, the exact
-// finding of the increment-4 review. The singletons and the
+// whose later fetch fails would downgrade a working cluster. The
+// singletons and the
 // Infrastructure status stay server-side applies: nothing supersedes
 // those objects, and re-applying them is a converge, not a downgrade.
 //

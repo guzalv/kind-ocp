@@ -176,7 +176,7 @@ func assertPodLevelNodePortReachable(ctx context.Context, t *testing.T, source, 
 	}
 }
 
-// TestCreateDefaultCountFullProfileAndVerify is the increment's
+// TestCreateDefaultCountFullProfileAndVerify is the
 // canonical run: the default count (2) with the default profile (full,
 // all six layers) on a real Docker daemon. Both clusters come up
 // (cluster 1 first, cluster 2 concurrently — the create path's

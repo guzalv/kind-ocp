@@ -339,12 +339,12 @@ concurrency limiter, so the practical bound is the daemon's capacity.
 
 ## Repository layout and history
 
-Docs: [docs/PLAN.md](docs/PLAN.md) (architecture and increment records)
+Docs: [docs/PLAN.md](docs/PLAN.md) (architecture and design record)
 and [docs/maintenance.md](docs/maintenance.md) (bump procedures and CI).
 
 kind-ocp is a productized port of the multi-cluster kind proof in
 stackrox PR #23841. The porting map and preserved gotchas are in
 docs/PLAN.md §4. The repo was built by an automated multi-agent
-development workflow; docs/PLAN.md records the increment history.
+development workflow; docs/PLAN.md records the design decisions.
 
 License: Apache-2.0.

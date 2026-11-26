@@ -273,9 +273,9 @@ func (t *scriptedTransport) RoundTrip(req *http.Request) (*http.Response, error)
 
 const releaseURL = "https://github.example.test/olm/releases/download/v0.46.0/crds.yaml"
 
-// The security-gate finding: the fetch validated https only for the
-// initial URL and then delegated redirects to net/http's default
-// policy, which counts hops but never checks their scheme — so one
+// The fetch must validate https on every hop, not only the initial
+// URL: net/http's default redirect
+// policy counts hops but never checks their scheme — so one
 // HTTP Location header away, unauthenticated content could reach the
 // cluster-admin apply path. The redirect policy must refuse a non-https
 // hop before the request is issued, on every hop (the second-hop case

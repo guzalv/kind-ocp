@@ -230,7 +230,7 @@ func TestExpectedClustersClassifiesCorruptCounts(t *testing.T) {
 		if _, err := store.EnsureRoot(); err != nil {
 			t.Fatal(err)
 		}
-		// The shape the reviewer's probe wrote into the marker when
+		// The shape a foreign writer could leave in the marker when
 		// the count lived there: ownership must not depend on it.
 		marker := `{"tool":"kind-ocp","expectedClusters":"two"}`
 		if err := os.WriteFile(filepath.Join(root, markerName), []byte(marker), 0o600); err != nil {
@@ -247,9 +247,9 @@ func TestExpectedClustersClassifiesCorruptCounts(t *testing.T) {
 
 // A failed count write preserves the tree exactly: the previous
 // expectation stays readable, the marker is untouched, and the tree
-// still verifies as removable — the failure this pins is the one the
-// reviewer forced live, where an in-place truncate left a zero-byte
-// marker and delete refused as unsafe. The update goes through a
+// still verifies as removable — the failure this pins is the one an
+// in-place truncate produces, where a zero-byte
+// marker makes delete refuse as unsafe. The update goes through a
 // temporary file and a rename, so the live file is never opened for
 // writing; the forced failure here (a read-only state root — the
 // staging file cannot be created, the exact step before any write)
@@ -709,8 +709,7 @@ func TestAncestorWriteBitsAreRejectedWithoutSticky(t *testing.T) {
 		// (the Debian usergroups default) leaves ~/.local 0775, and
 		// the default state root lives under it. The refusal must
 		// carry both remedies in one error chain: the chmod fix for
-		// the offending directory, and the state-root alternative
-		// (§5.3's cold-machine finding).
+		// the offending directory, and the state-root alternative.
 		shared := filepath.Join(dir, "groupwritable")
 		if err := os.Mkdir(shared, 0o775); err != nil {
 			t.Fatal(err)
@@ -1632,8 +1631,8 @@ func TestRemovalRefusesReplacedRoot(t *testing.T) {
 // What makes this case hard is a filesystem that recycles inode
 // numbers immediately (ext4 does): a pin built on a stat snapshot of
 // device and inode can match the replacement exactly, and the stale
-// operation then writes into the new tree and removes it — the
-// reviewer's ext4 finding. A pin built on an open handle cannot: an
+// operation then writes into the new tree and removes it. A pin built
+// on an open handle cannot: an
 // inode with an open reference is never reassigned, so the replacement
 // differs from the held directory even where its identity is the
 // recycled one, and every handoff and the cleanup refuse it.
@@ -1641,8 +1640,8 @@ func TestRemovalRefusesReplacedRoot(t *testing.T) {
 // On filesystems that do not recycle the inode this way (APFS, the
 // macOS development host, hands a new directory a fresh number), the
 // snapshot pin also refuses — the regression is load-bearing on
-// recycling filesystems, and ext4 verification accompanies it (see the
-// increment evidence); the assertions hold everywhere.
+// recycling filesystems, and ext4 verification accompanies it; the
+// assertions hold everywhere.
 func TestRemovalRefusesRecreatedRoot(t *testing.T) {
 	// recreate removes the pinned tree and writes fresh marked state
 	// at the same path, the way a concurrent create could between two

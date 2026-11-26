@@ -158,7 +158,7 @@ func runCommandEnv(t *testing.T, prov *cliFakeProvisioner, env map[string]string
 	return out.String(), errOut.String(), err
 }
 
-// Regression tests for the review finding that scope-only commands rejected
+// Regression tests for the hazard that scope-only commands rejected
 // create-only selections: `delete --count 3` was an unknown flag, a config
 // file with an override for cluster 3 failed count validation during
 // delete, `delete --count 0` and a malformed KIND_OCP_COUNT failed cleanup.

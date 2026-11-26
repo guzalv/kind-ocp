@@ -24,17 +24,18 @@ import (
 	"github.com/guzalv/kind-ocp/kindocp"
 )
 
-// increment4Layers is everything the openshift-api-crds layer builds on,
+// crdProfileLayers is everything the openshift-api-crds layer builds on,
 // in registration order: the placeholder CRDs and singletons it
 // supersedes, the node labels OLM's operators schedule on, OLM itself,
-// and the new layer. The profile is not "full" — full grows as later
-// increments register layers, and this test is only about increment 4.
-var increment4Layers = []string{"config-openshift", "node-labels", "olm", "openshift-api-crds"}
+// and the new layer. The profile is not "full" — full grows as more
+// layers register, and this test is only about the layers up to
+// openshift-api-crds.
+var crdProfileLayers = []string{"config-openshift", "node-labels", "olm", "openshift-api-crds"}
 
-// increment4CRDNames is the 18 CRDs this test expects the layer to have
+// openshiftAPICRDNames is the 18 CRDs this test expects the layer to have
 // installed, written out independently of the layer's table so a table
 // drift fails here, not only in the layer's own checks.
-var increment4CRDNames = []string{
+var openshiftAPICRDNames = []string{
 	"apiservers.config.openshift.io",
 	"authentications.config.openshift.io",
 	"clusteroperators.config.openshift.io",
@@ -62,7 +63,8 @@ var crdGVR = schema.GroupVersionResource{
 	Resource: "customresourcedefinitions",
 }
 
-// TestCreateWithOpenshiftAPICRDsLayer exercises increment 4's layer end
+// TestCreateWithOpenshiftAPICRDsLayer exercises the openshift-api-crds
+// layer end
 // to end on a real Docker daemon: create with the four-layer profile,
 // fetch-and-stage the 18 real CRDs from the pinned openshift/api commit
 // into the state root's cache, supersede the config-openshift
@@ -77,11 +79,11 @@ func TestCreateWithOpenshiftAPICRDsLayer(t *testing.T) {
 	cluster := prefix + "-1"
 	stateRoot := filepath.Join(t.TempDir(), "state")
 
-	increment4 := func(cfg *config.Config) {
-		cfg.Profiles = map[string]config.Profile{"increment-4": {Layers: increment4Layers}}
-		cfg.Profile = "increment-4"
+	tweak := func(cfg *config.Config) {
+		cfg.Profiles = map[string]config.Profile{"through-openshift-api-crds": {Layers: crdProfileLayers}}
+		cfg.Profile = "through-openshift-api-crds"
 	}
-	client, _ := testClientAt(t, prefix, stateRoot, increment4, nil)
+	client, _ := testClientAt(t, prefix, stateRoot, tweak, nil)
 	if _, err := client.Delete(ctx); err != nil {
 		t.Fatalf("pre-clean delete: %v", err)
 	}
@@ -100,8 +102,8 @@ func TestCreateWithOpenshiftAPICRDsLayer(t *testing.T) {
 	if records[0].Status != kindocp.RecordStatusComplete {
 		t.Fatalf("record status = %s, want complete", records[0].Status)
 	}
-	if !slices.Equal(records[0].Layers, increment4Layers) {
-		t.Fatalf("record layers = %v, want %v in registration order", records[0].Layers, increment4Layers)
+	if !slices.Equal(records[0].Layers, crdProfileLayers) {
+		t.Fatalf("record layers = %v, want %v in registration order", records[0].Layers, crdProfileLayers)
 	}
 
 	// 2. Verify passes, including every layer check.
@@ -109,7 +111,7 @@ func TestCreateWithOpenshiftAPICRDsLayer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
-	requireAllPassAndLayerChecks(t, results, increment4Layers, "after create")
+	requireAllPassAndLayerChecks(t, results, crdProfileLayers, "after create")
 
 	// 3. The layer's postconditions hold independently of its own
 	// Verify, read through the exported kubeconfig.
@@ -124,7 +126,7 @@ func TestCreateWithOpenshiftAPICRDsLayer(t *testing.T) {
 
 	// A short bound: the CRDs are already established (Apply waited for
 	// them), so this is an immediate read through the public helper.
-	if err := kube.WaitForCRDsEstablished(ctx, kubeClient.Dynamic, 30*time.Second, increment4CRDNames); err != nil {
+	if err := kube.WaitForCRDsEstablished(ctx, kubeClient.Dynamic, 30*time.Second, openshiftAPICRDNames); err != nil {
 		t.Errorf("openshift/api CRDs not established: %v", err)
 	}
 
@@ -174,11 +176,12 @@ func TestCreateWithOpenshiftAPICRDsLayer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verify after reconcile: %v", err)
 	}
-	requireAllPassAndLayerChecks(t, results, increment4Layers, "after reconcile")
+	requireAllPassAndLayerChecks(t, results, crdProfileLayers, "after reconcile")
 
-	// 6. The F-2 live regression, the increment-4 review's second
-	// finding: a real CRD replaced by its placeholder — the exact
-	// substitution the review observed config-openshift making — passes
+	// 6. The downgrade regression: a real CRD
+	// replaced by its placeholder — the exact substitution an
+	// unrestrained config-openshift re-apply makes on a converged
+	// cluster — passes
 	// an Established-only check but must FAIL this layer's Verify,
 	// naming the CRD. A re-run of create then converges the real CRD
 	// back and Verify passes again.
@@ -218,7 +221,7 @@ func TestCreateWithOpenshiftAPICRDsLayer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verify after the downgrade recovery: %v", err)
 	}
-	requireAllPassAndLayerChecks(t, results, increment4Layers, "after the downgrade recovery")
+	requireAllPassAndLayerChecks(t, results, crdProfileLayers, "after the downgrade recovery")
 
 	// 7. Delete removes the cache with the rest of the prefix's state:
 	// a later create starts from zero, the PoC's stale-state lesson.
@@ -230,10 +233,10 @@ func TestCreateWithOpenshiftAPICRDsLayer(t *testing.T) {
 	}
 }
 
-// downgradeCRDToPlaceholder reproduces the mechanism of the increment-4
-// review's finding: the config-openshift placeholder CRD server-side
-// applied over the real CRD under the layer's own field manager, which
-// is exactly what the layer's pre-fix Apply did to a converged cluster.
+// downgradeCRDToPlaceholder applies the config-openshift placeholder
+// CRD over the real CRD under the layer's own field manager,
+// reproducing what an unrestrained bootstrap re-apply would do to a
+// converged cluster.
 // It returns the downgraded CRD as the apiserver now stores it.
 func downgradeCRDToPlaceholder(t *testing.T, ctx context.Context, kubeClient *kube.Client, name string) *unstructured.Unstructured {
 	t.Helper()
@@ -253,8 +256,8 @@ func downgradeCRDToPlaceholder(t *testing.T, ctx context.Context, kubeClient *ku
 	if err := kubeClient.Apply(ctx, kube.LayerFieldManager(openshiftapicrds.Name), []*unstructured.Unstructured{placeholder}); err != nil {
 		t.Fatalf("applying the placeholder CRD over the real one: %v", err)
 	}
-	// The downgraded CRD reports Established too — that is the second
-	// half of the review's finding — so wait for that before asserting
+	// The downgraded CRD reports Established too, so wait for that
+	// before asserting
 	// the layer's check fails for the realness reason, not a race.
 	if err := kube.WaitForCRDsEstablished(ctx, kubeClient.Dynamic, 30*time.Second, []string{name}); err != nil {
 		t.Fatalf("waiting for the downgraded CRD to settle: %v", err)
@@ -270,8 +273,7 @@ func downgradeCRDToPlaceholder(t *testing.T, ctx context.Context, kubeClient *ku
 // a config-openshift placeholder under the same name: the real-CRD
 // annotation is present, the root schema defines properties, and the
 // placeholder's root-level x-kubernetes-preserve-unknown-fields marker
-// is gone. These are the exact observations the increment-4 review made
-// about a downgraded cluster, inverted.
+// is gone.
 func requireRealCRD(t *testing.T, crd *unstructured.Unstructured, name, when string) {
 	t.Helper()
 	if crd.GetAnnotations()["api-approved.openshift.io"] == "" {
@@ -303,8 +305,8 @@ func requireRealCRD(t *testing.T, crd *unstructured.Unstructured, name, when str
 // exactly the bytes the build-time pin expects for it.
 func requireStagedCache(t *testing.T, dir string) {
 	t.Helper()
-	if len(openshiftapicrds.ModuleDigests) != len(increment4CRDNames) {
-		t.Fatalf("ModuleDigests has %d entries, want one per CRD (%d)", len(openshiftapicrds.ModuleDigests), len(increment4CRDNames))
+	if len(openshiftapicrds.ModuleDigests) != len(openshiftAPICRDNames) {
+		t.Fatalf("ModuleDigests has %d entries, want one per CRD (%d)", len(openshiftapicrds.ModuleDigests), len(openshiftAPICRDNames))
 	}
 	for name, wantDigest := range openshiftapicrds.ModuleDigests {
 		path := filepath.Join(dir, name+".crd.yaml")
@@ -325,7 +327,7 @@ func requireStagedCache(t *testing.T, dir string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != len(increment4CRDNames) {
-		t.Errorf("cache dir holds %d entries, want exactly the %d manifests", len(entries), len(increment4CRDNames))
+	if len(entries) != len(openshiftAPICRDNames) {
+		t.Errorf("cache dir holds %d entries, want exactly the %d manifests", len(entries), len(openshiftAPICRDNames))
 	}
 }
