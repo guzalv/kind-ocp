@@ -128,18 +128,31 @@ secret, the shrunk resource requests, the disabled collector) stays.
 flags accept one file each, validated before the clusters are touched:
 the file must be a private, caller-owned regular file (a values file
 can carry secrets, so the example refuses a symlinked or
-world-readable one), and the directory holding it must pass the same
+world-readable one), the directory holding it must pass the same
 ancestor policy the example's workspace does — a values file reached
 through a directory other local users can write is refused, because
 the entry could be swapped between the check and the moment helm
-opens it. The path is resolved to its absolute form before helm sees
-it (a relative path — or a file named `-`, which helm reads as stdin —
-would make helm open whatever its own resolution picks), and the
-resolved path must not contain a comma, a double quote, a newline, or
-a carriage return: helm parses each `-f` operand as a CSV record, so
-such a path would make it load a different, unchecked file (the
-example refuses those paths up front). Nothing in the file is ever
-logged.
+opens it — and the file must live **outside the trees the run
+rewrites**: the example's work directory (default
+`~/.local/state/kind-ocp-stackrox-example/`; the generated values
+files are rewritten on every run and each chart's extraction on every
+fetch, so an override inside it would be overwritten or removed by
+the very run that accepted it) and this prefix's kind-ocp state
+directory (`<state root>/<prefix>/`; the expected cluster count, the
+cluster records, and the exported kubeconfigs are rewritten there,
+and `kind-ocp delete` removes the whole tree). A values file with
+more than one name — a hard link — is refused too: one of its names
+may be one of the files the run rewrites in place (a cluster record,
+a kubeconfig), and the run cannot see a file's other names to tell
+the safe links from the clobbering ones; make an independent copy
+(`cp`, not `ln`) and pass the copy. The path is
+resolved to its absolute form before helm sees it (a relative path —
+or a file named `-`, which helm reads as stdin — would make helm open
+whatever its own resolution picks), and the resolved path must not
+contain a comma, a double quote, a newline, or a carriage return: helm
+parses each `-f` operand as a CSV record, so such a path would make it
+load a different, unchecked file (the example refuses those paths up
+front). Nothing in the file is ever logged.
 Your images must be pullable from every cluster (kind nodes have no
 registry access beyond what the daemon and the network allow).
 

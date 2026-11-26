@@ -944,7 +944,14 @@ const expectedClustersCheck = "cluster-count"
 // Only one condition FAILs: a valid expectation with named clusters
 // missing from both the provisioner and state — exactly the
 // vanished-cluster case no other check can see, including the one
-// where every cluster vanished and list selected nothing. Extra
+// where every cluster vanished and list selected nothing. The FAIL's
+// recovery names the expected count and says to re-run the original
+// create command with the same prefix, configuration, and count. A
+// smaller count is a supported downscope — it rewrites the expectation
+// to the smaller count — and it can clear this failure without
+// restoring anything, but only when it excludes every missing cluster:
+// the first cluster (<prefix>-1) is inside every count create can
+// write, so a missing first cluster fails under every downscope. Extra
 // prefix-scoped clusters beyond the expectation are not a FAIL:
 // leftovers from a larger count are a supported state (create never
 // removes them), and each still gets its own lines below.
@@ -993,8 +1000,11 @@ func (c *Client) checkExpectedClusters(infos []ClusterInfo) CheckResult {
 	}
 	return line(StatusFail, fmt.Sprintf(
 		"the last create expected %d cluster(s); missing from both the provisioner and kind-ocp state: %s — "+
-			"re-run create to build the missing cluster(s) (clusters still present are reused when they match)",
-		expected, strings.Join(missing, ", ")))
+			"re-run the original create command with the same prefix, configuration, and --count %d "+
+			"(clusters still present are reused when they match, missing ones are built fresh). "+
+			"A create run with a smaller count would lower the expectation to that count and clear this failure without rebuilding them, "+
+			"but only when the smaller count excludes every missing cluster — no count create can write excludes %s-1",
+		expected, strings.Join(missing, ", "), expected, c.cfg.Prefix))
 }
 
 func (c *Client) checkNodesReady(ctx context.Context, info ClusterInfo, kubeconfigPath string) CheckResult {

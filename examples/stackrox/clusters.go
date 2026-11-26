@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/netip"
 	"net/url"
+	"os"
 	"path/filepath"
 
 	corev1 "k8s.io/api/core/v1"
@@ -98,7 +100,7 @@ func openWorkDir(cfg *config.Config) (string, error) {
 		return "", fmt.Errorf("resolving the kind-ocp state root %s: %w", cfg.StateRoot, err)
 	}
 	anchorNames := fscheck.PathNames(filepath.Dir(stateBase))
-	names := append(anchorNames, filepath.Base(stateBase)+workDirSuffix, cfg.Prefix)
+	names := append(anchorNames, workDirBaseName(stateBase), cfg.Prefix)
 	resolved, err := fscheck.WalkDirNames(names, len(anchorNames), fscheck.WalkOptions{Create: true})
 	if err != nil {
 		return "", fmt.Errorf("preparing the work directory beside the state root %s: %w", stateBase, err)
@@ -112,6 +114,84 @@ func openWorkDir(cfg *config.Config) (string, error) {
 // workspace at …/kind-ocp-stackrox-example, and no state root can
 // derive a workspace that coincides with it.
 const workDirSuffix = "-stackrox-example"
+
+// workDirBaseName names the work directory's base for a state base: the
+// base's own sibling, named after the state base itself with
+// workDirSuffix. This is the one derivation of the workspace's name —
+// openWorkDir's creating walk and the startup override check
+// (workspaceBase) both name the workspace through it, so the tree the
+// check refuses and the tree the run rewrites are the same tree.
+func workDirBaseName(stateBase string) string {
+	return filepath.Base(stateBase) + workDirSuffix
+}
+
+// stateBaseCandidate names the state base for a run without requiring
+// or creating anything: the resolved state base when it exists — the
+// same resolution openWorkDir walks below — and its absolute spelling
+// when it does not (the tree a fresh run is about to create beside).
+// Callers compare by directory identity (os.Stat + os.SameFile), which
+// follows alias spellings on both sides, so a lexical divergence
+// between the candidate and the real tree cannot make one directory
+// pass for two.
+func stateBaseCandidate(stateRoot string) string {
+	if base, err := fscheck.ResolveDir(stateRoot); err == nil {
+		return base
+	}
+	base, _ := filepath.Abs(stateRoot)
+	return base
+}
+
+// workspaceBase names the work directory's base for a state root — the
+// tree the run rewrites (every per-prefix work directory lives under
+// it) — without requiring or creating anything. The startup override
+// check compares against it by directory identity, through the same
+// workDirBaseName openWorkDir creates below.
+func workspaceBase(stateRoot string) string {
+	base := stateBaseCandidate(stateRoot)
+	return filepath.Join(filepath.Dir(base), workDirBaseName(base))
+}
+
+// stateTreePath names this run's per-prefix kind-ocp state directory —
+// <state root>/<prefix>, the tree the façade opens
+// (kindocp.New builds its store from exactly that join) and the run
+// rewrites: the expected-cluster count, the cluster records, the
+// exported kubeconfigs, and the layer caches all live there, and
+// `kind-ocp delete` removes the whole tree — without requiring or
+// creating anything. The startup override check compares against it by
+// directory identity, exactly as it does against the workspace.
+func stateTreePath(stateRoot, prefix string) string {
+	return filepath.Join(stateBaseCandidate(stateRoot), prefix)
+}
+
+// refuseValuesOverrideInTree refuses a values override inside one tree
+// the run rewrites (what names the tree for the refusal). Containment
+// is by directory identity, never by a string prefix: on a
+// case-insensitive volume (macOS, a supported platform) two spellings
+// that differ by case are one directory while remaining two strings —
+// exactly the shape a prefix comparison would pass. Each directory is
+// compared through os.Stat (which follows aliases) and os.SameFile, so
+// the comparison is of the directories themselves. A tree that does
+// not exist matches nothing, which is correct, because no file can be
+// inside it.
+func refuseValuesOverrideInTree(path, tree, what string) error {
+	treeInfo, err := os.Stat(tree)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("checking %s %s: %w", what, tree, err)
+	}
+	for dir := filepath.Dir(path); ; dir = filepath.Dir(dir) {
+		if fi, err := os.Stat(dir); err == nil && os.SameFile(fi, treeInfo) {
+			return fmt.Errorf(
+				"the values file %s is inside %s %s, which the run rewrites — the run would overwrite it; keep values files outside it",
+				path, what, tree)
+		}
+		if filepath.Dir(dir) == dir {
+			return nil
+		}
+	}
+}
 
 // restConfigFor loads a kubeconfig the way an outside consumer does: the
 // explicit path, no ambient context merging. kind-ocp's state kubeconfigs

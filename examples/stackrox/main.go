@@ -28,7 +28,12 @@
 // Values overrides (--central-values, --sensor-values) let an engineer
 // point the releases at their own images without editing the repo; the
 // pinned released charts stay the default path and their digest
-// verification is unchanged.
+// verification is unchanged. An override inside a tree the run
+// rewrites — the example's work directory, or this prefix's kind-ocp
+// state directory — is refused: the file would not survive the run
+// that accepted it. A values file carrying more than one name (a hard
+// link) is refused for the same reason: one of its names may be such a
+// write target, and the check cannot see the other names.
 //
 // Secrets handling: the generated Central admin password and the cluster
 // registration secret are written only to 0600 files (checked private
@@ -86,7 +91,14 @@ func main() {
 	}
 	// The values overrides are validated before the clusters are
 	// touched: a bad path is a startup error, not a mid-deploy one.
-	overrides, err := checkValuesOverrides(*centralValues, *sensorValues)
+	// That includes a path inside either tree the run rewrites — the
+	// example's work directory (generated values files, extracted
+	// charts) and this prefix's kind-ocp state directory (the expected
+	// cluster count, cluster records, kubeconfigs) — and a values file
+	// carrying more than one name, a hard link whose other name may be
+	// one of the in-place write targets: all are refused before
+	// anything runs.
+	overrides, err := checkValuesOverrides(*centralValues, *sensorValues, cfg.StateRoot, cfg.Prefix)
 	if err != nil {
 		fail(err)
 	}

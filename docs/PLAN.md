@@ -418,8 +418,14 @@ generated-name set is allocated to match the count, so a huge value
 can neither be reported as dozens of phantom missing clusters nor
 reach the sized allocation. Only a valid expectation with named
 clusters missing from both the provisioner and state FAILs, naming the
-clusters and the recovery (re-run create: present clusters are reused,
-vanished ones are built fresh). Extra prefix-scoped clusters beyond the
+clusters and the recovery: re-run the original create command with the
+same prefix, configuration, and count — the FAIL names the expected
+count — because re-running create with a smaller count is a supported
+downscope that rewrites the expectation and can clear the failure
+without restoring anything, but only when the smaller count excludes
+every missing cluster: no count create can write excludes
+`<prefix>-1`, so a missing first cluster fails under every downscope.
+Extra prefix-scoped clusters beyond the
 expectation are not a FAIL — leftovers from a larger count are a
 supported state, and each gets its own lines. The named form runs no
 count assertion: a targeted verify during recovery must not fail on a
@@ -1036,8 +1042,13 @@ that pin them, and §3.
   with, on a Config carrying just the prefix and the persisted count —
   against the inventory (the union of provisioner clusters and state
   records, the exact shape that hid a both-vanished cluster) and FAILs
-  naming the missing clusters and the recovery (re-run create: present
-  clusters are reused, vanished ones are built fresh). Old state (no
+  naming the missing clusters and the recovery: re-run the original
+  create command with the same prefix, configuration, and count (the
+  FAIL names the expected count; a create run with a smaller count is
+  a supported downscope that rewrites the expectation and can clear
+  the failure without restoring anything — but only when the smaller
+  count excludes every missing cluster, and no count create can write
+  excludes `<prefix>-1`). Old state (no
   expectation file), an unreadable tree, a value no create could have
   written, or a value that is not an integer at all (a string, a
   fraction, an overflow — `state.ErrCorruptCount`) all degrade to a
@@ -1102,12 +1113,28 @@ that pin them, and §3.
   and the macOS pitfalls surfaced from
   §6.1/§3.4 (the docker.sock symlink and DOCKER_HOST pinning, buildx
   discoverability together with DOCKER_HOST, CGO_ENABLED=0 failing
-  closed on the ACL checks). A "When something goes wrong" section
+  closed on the ACL checks). The quickstart builds checkout-local
+  (`go build -o kind-ocp ./cmd/kind-ocp`, invoked as `./kind-ocp`):
+  with a non-default GOBIN a `go install` lands outside
+  `$(go env GOPATH)/bin`, and the PATH line the quickstart used to
+  show would leave the binary unavailable — an explicit build and
+  invocation needs no PATH reasoning at all. The known-limits list
+  names OpenShift routing (no `Route` API applied, no router to serve
+  one — the applied ingress CRDs are API objects only) and the
+  integrated image registry among what the layers deliberately do not
+  provide, as the increment's out-of-scope list asks. A "When
+  something goes wrong" section
   carries the
   four-branch recovery decision tree (failed create → re-run, bound
   pending records converge; unbound/replaced → delete and re-create;
   delete is idempotent and retryable; unsafe state refusals name their
-  fix), each branch citing the behavior it relies on. A "Performance
+  fix), each branch citing the behavior it relies on — and the
+  vanished-cluster tail names the recovery's precondition: re-run the
+  original create command with the same prefix, configuration, and
+  count, because a smaller count downscopes the expectation and can
+  clear the failure without restoring anything — but only when the
+  smaller count excludes every missing cluster (no count create can
+  write excludes `<prefix>-1`). A "Performance
   and resource budget" section documents measured cold/warm/reconcile
   create, delete, and verify times on the development machine (105 s
   cold, 85 s warm, 8 s reconcile, ~1 s delete, 17 s verify; 58 s
@@ -1147,7 +1174,30 @@ that pin them, and §3.
   — every argument and the helm binary itself, so a copy-paste
   reproduces the run across paths with spaces or shell
   metacharacters — with the warning that re-running it by hand
-  prints diagnostics that can quote values content). The example README
+  prints diagnostics that can quote values content). A fourth
+  hardening from the third review round: an override resolved inside
+  the example's own work directory is refused at startup, before the
+  clusters are touched — the run rewrites that tree (the generated
+  values files on every run, each chart's extraction directory on
+  every fetch), so an override there would be overwritten or removed
+  by the run that accepted it, and helm would receive the generated
+  file and the override as two operands naming one file. The
+  candidate workspace is derived without creating anything
+  (`workspaceBase`: the state root resolved when it exists, its
+  absolute spelling when it does not — the tree a fresh run is about
+  to create beside), and containment is by directory identity
+  (`os.Stat` + `os.SameFile` over the override's ancestors), never a
+  string prefix: on a case-insensitive volume (macOS, a supported
+  platform) two spellings that differ by case are one directory while
+  remaining two strings, exactly the shape a prefix comparison
+  passes. Regressions pin the refusal for the generated-values name,
+  a path under the extracted charts, a workspace that outlived a
+  `kind-ocp delete` of the state root, and a case-colliding spelling
+  — each asserting the refused input stays unchanged and the work
+  directory holds nothing the run would have written — plus the
+  negative control (a user file beside the workspace passes) and the
+  agreement between the pre-check's candidate and the workspace
+  `openWorkDir` actually derives. The example README
   documents the worked override as a runnable shell block (an
   engineer's own Sensor image via `image.main.fullRef`, the chart's
   own image override surface, verified against the pinned chart, with
@@ -1168,7 +1218,106 @@ that pin them, and §3.
   writable-ancestor override paths at startup before any cluster work;
   the helm operand facts behind the CSV refusal were re-verified
   against real helm v4.3.1; the full integration suite re-run green
-  (ok 802 s).
+  (ok 802 s). The third review round's fixes: the count FAIL's
+  recovery names the count it expects the re-run create to carry (a
+  smaller count is a supported downscope that would clear the failure
+  without rebuilding — verified live: the vanished-cluster FAIL names
+  `--count 2`, the same-count re-run rebuilds and returns to all-PASS,
+  delete leaves zero containers); an override resolved inside the
+  example's work directory is refused at startup by identity-based
+  containment (verified live: the generated values name, a
+  case-colliding spelling, and a workspace that outlived a delete of
+  the state root are all refused with the file byte-identical and zero
+  containers touched); the state package's staging and bounded read
+  were folded into their only callers (behavior-preserving — the state
+  suite and 5× -race runs green, the full integration suite re-run);
+  the quickstart builds checkout-local (no GOBIN/PATH reasoning), and
+  the known limits name OpenShift routing and the integrated registry
+  against the applied CRD set.
+  The fifth review round's fixes: generated values files (and the
+  admin password) are replaced atomically — staged in a private
+  `os.CreateTemp` file and renamed over the target, never written
+  through the inode at the target path — so a values file hard-linked
+  to a generated one keeps its bytes and the override it carries
+  survives the run (the in-place write replaced the linked file's
+  custom image and made helm read the generated content twice; the
+  rename also cannot be redirected by a symlink parked at the target
+  between the preflight and the write). An override resolved inside
+  this run's per-prefix kind-ocp state directory is refused at startup
+  by the same identity-based containment the workspace gets — the run
+  rewrites that tree (expected-cluster count, cluster records,
+  kubeconfigs) and `kind-ocp delete` removes it — while the state
+  base outside this prefix's tree and sibling prefixes' trees stay
+  accepted (the run rewrites its own prefix's tree only). The sibling
+  workspace name is derived in one place (`workDirBaseName`) for both
+  the startup check and `openWorkDir`'s creating walk, with the
+  state-tree candidate pinned against `kindocp.New`'s own store root
+  by identity; the two override flags ride one shared check helper;
+  and the count FAIL's downscope warning is qualified in the CLI and
+  docs: a smaller count clears the failure only when it excludes every
+  missing cluster, and no count create can write excludes
+  `<prefix>-1`. The refusal regressions were proven meaningful on a
+  scratch checkout of the pre-fix code (the hard-linked override
+  rewritten, the state-tree override accepted), and the fail-closed
+  path (a stat failure on a tree candidate that is not
+  does-not-exist) and the `--central-values` side of the workspace
+  refusal are now unit-pinned. Verified live on the development
+  machine: the state-tree override at expected-clusters is refused at
+  startup with the file byte-identical and zero containers; the full
+  example converges end to end and a re-run with a sensor override
+  hard-linked to the generated values file accepts it, keeps its bytes
+  (sha identical, the generated file on a new inode holding the fresh
+  document), and deploys the override's resource request — the
+  override wins the helm merge on the real cluster; the count FAIL's
+  qualified warning prints for a vanished tail cluster and for the
+  missing first cluster alike; the full integration suite re-run
+  green.
+  The sixth review round's fixes: a values file carrying more than
+  one name is refused at startup on both flags, by link count. The
+  fifth round's directory-identity containment cannot see a file
+  outside both trees that shares an inode with an in-place write
+  target inside one — the reviewer's probe: a private my-sensor.yaml
+  outside both trees, hard-linked to a cluster record, was accepted
+  at startup and then had its contents replaced by the record write —
+  and the run's in-place writers (kind-ocp's cluster records and
+  exported kubeconfigs) are not something the example can change, so
+  the honest boundary is the override itself: no acceptance
+  criterion requires hard-link support, and the refusal names the
+  remedy, an independent copy (`cp`, not `ln`). The link count is
+  read through the same platform split kind-ocp's ownership checks
+  use (`valueslink_unix.go`/`valueslink_other.go`: enforced on unix,
+  the example's supported runtimes, with a fail-closed error when the
+  count cannot be determined), and both flags ride it through the
+  shared resolveValuesPath check. The atomic replacement of the
+  generated values files stays: it still protects a hard link to a
+  generated file that no flag names, and it still closes the
+  preflight-to-write symlink window. The fifth round's
+  preserve-don't-refuse acceptance pin is flipped to pin the refusal
+  (a future acceptance of multiply-linked overrides would be a
+  deliberate change, not drift), and the regressions cover the record
+  shape and the generated-values shape on both flags with the
+  original bytes untouched through both names, plus the single-link
+  negative control; both refusal subtests were proven failing on the
+  pre-fix code (err=nil, the accepted-then-clobbered shape). The
+  fail-closed regressions for the two tree candidates no longer rely
+  on a mode-000 directory, whose stat a privileged caller survives:
+  each candidate is now spelled under a regular file, so its stat
+  fails with ENOTDIR deterministically, and the state-tree side of
+  the shared branch is pinned beside the workspace side. Verified
+  live on the development machine (Docker Desktop 28.1.1, fresh
+  prefix): the full example converges; the reviewer's probe — a
+  private my-sensor.yaml outside both trees, hard-linked to a live
+  cluster's record.json (one inode, two names) — is refused at
+  startup (exit 1 before any cluster work, container count unchanged)
+  with the refusal naming the flag, the link count, and the
+  independent-copy remedy, and both names still read the original
+  bytes (sha identical); the same 768Mi override as an independent
+  single-link copy is accepted, converges in 45 s, keeps its sha, and
+  the deployed Sensor on the real cluster requests 768Mi — the
+  override wins the helm merge; verify 17 PASS / 0 FAIL / 0 SKIP;
+  delete leaves zero containers and the override file survives; the
+  full integration suite re-run green (13/13 PASS, ok 853 s, zero
+  containers after).
 ## 6. Testing strategy
 
 - Unit (no Docker): config resolution and precedence, per-cluster overrides,

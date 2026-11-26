@@ -1174,7 +1174,8 @@ func TestVerifyFailsWhenAVanishedClusterLeavesNoTrace(t *testing.T) {
 	if count.Status != StatusFail {
 		t.Fatalf("cluster-count = %s (%s), want FAIL", count.Status, count.Detail)
 	}
-	for _, want := range []string{"p-2", "re-run create"} {
+	for _, want := range []string{"p-2", "re-run the original create command", "--count 2",
+		"excludes every missing cluster", "no count create can write excludes p-1"} {
 		if !strings.Contains(count.Detail, want) {
 			t.Errorf("cluster-count detail %q does not name %q", count.Detail, want)
 		}
@@ -1410,7 +1411,8 @@ func TestVerifyFailsWhenEveryClusterVanished(t *testing.T) {
 	if count.Status != StatusFail {
 		t.Fatalf("cluster-count = %s (%s), want FAIL", count.Status, count.Detail)
 	}
-	for _, want := range []string{"p-1", "p-2", "re-run create"} {
+	for _, want := range []string{"p-1", "p-2", "re-run the original create command", "--count 2",
+		"excludes every missing cluster", "no count create can write excludes p-1"} {
 		if !strings.Contains(count.Detail, want) {
 			t.Errorf("cluster-count detail %q does not name %q", count.Detail, want)
 		}

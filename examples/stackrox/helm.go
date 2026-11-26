@@ -60,21 +60,46 @@ type valuesOverrides struct {
 // admin password gets. The parent directory is resolved through the
 // same ancestor policy the workspace uses (see resolveValuesPath), and
 // only the resolved absolute path helm is handed survives the check.
+// A resolved path inside either tree the run rewrites is refused too
+// (see refuseValuesOverrideInTree): the example's work directory
+// (generated values files, extracted charts) and this prefix's kind-ocp
+// state directory (the expected cluster count, cluster records,
+// kubeconfigs — the tree `kind-ocp delete` removes). A values file
+// carrying more than one name is refused as well (see
+// checkIndependentValuesFile): a hard link's other name can be a file
+// the run rewrites in place, and the check cannot see the other names.
 // Validating up front fails a bad path before the clusters are
 // touched; only the paths, never the contents, reach argv or the log.
-func checkValuesOverrides(central, sensor string) (valuesOverrides, error) {
+func checkValuesOverrides(central, sensor, stateRoot, prefix string) (valuesOverrides, error) {
+	workspace := workspaceBase(stateRoot)
+	stateTree := stateTreePath(stateRoot, prefix)
+	check := func(flag, path string) (string, error) {
+		p, err := resolveValuesPath(path)
+		if err != nil {
+			return "", fmt.Errorf("%s: %w", flag, err)
+		}
+		if err := refuseValuesOverrideInTree(p, workspace,
+			"the example's work directory (generated values files, extracted charts)"); err != nil {
+			return "", fmt.Errorf("%s: %w", flag, err)
+		}
+		if err := refuseValuesOverrideInTree(p, stateTree,
+			"this prefix's kind-ocp state directory (the expected cluster count, cluster records, kubeconfigs; kind-ocp delete removes the whole tree)"); err != nil {
+			return "", fmt.Errorf("%s: %w", flag, err)
+		}
+		return p, nil
+	}
 	var o valuesOverrides
 	if central != "" {
-		p, err := resolveValuesPath(central)
+		p, err := check("--central-values", central)
 		if err != nil {
-			return o, fmt.Errorf("--central-values: %w", err)
+			return o, err
 		}
 		o.central = p
 	}
 	if sensor != "" {
-		p, err := resolveValuesPath(sensor)
+		p, err := check("--sensor-values", sensor)
 		if err != nil {
-			return o, fmt.Errorf("--sensor-values: %w", err)
+			return o, err
 		}
 		o.sensor = p
 	}
@@ -92,12 +117,15 @@ func checkValuesOverrides(central, sensor string) (valuesOverrides, error) {
 // opens it. A permissive directory in the chain is therefore a
 // refusal, before the clusters are touched.
 //
-// The leaf is then checked private at the resolved path, and only that
-// absolute path crosses into argv. A relative operand — or a bare "-",
-// which helm v4.3.1 reads as stdin, silently ignoring a local file of
-// that name — would make helm open whatever its own resolution picks,
-// not the file that was checked; the absolute spelling of the same
-// file loads normally (verified against helm v4.3.1).
+// The leaf is then checked private at the resolved path, and that it
+// is one independent file — a hard link's other name can be an
+// in-place write target of this run (see checkIndependentValuesFile).
+// Only that absolute path crosses into argv. A relative operand — or a
+// bare "-", which helm v4.3.1 reads as stdin, silently ignoring a
+// local file of that name — would make helm open whatever its own
+// resolution picks, not the file that was checked; the absolute
+// spelling of the same file loads normally (verified against helm
+// v4.3.1).
 //
 // Last, the resolved path must be one helm loads as exactly that file:
 // see checkHelmValuesPath.
@@ -113,7 +141,26 @@ func resolveValuesPath(path string) (string, error) {
 	if err := fscheck.CheckPrivateFile(resolved); err != nil {
 		return "", err
 	}
+	if err := checkIndependentValuesFile(resolved); err != nil {
+		return "", err
+	}
 	return resolved, nil
+}
+
+// checkIndependentValuesFile refuses a values file whose inode carries
+// more than one name (checkValuesLinkCount reads the count): the run
+// rewrites several files in place — kind-ocp's cluster records and
+// exported kubeconfigs among them — and a hard link makes the checked
+// file and such a target one inode, so the write would replace the
+// contents after the check accepted them. The check cannot enumerate a
+// file's other names, so every multiply-linked values file is refused;
+// an independent copy (cp, not ln) is the remedy the refusal names.
+func checkIndependentValuesFile(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	return checkValuesLinkCount(path, info)
 }
 
 // checkHelmValuesPath refuses a values path that helm would not load
@@ -330,12 +377,39 @@ func writeValuesFile(work, name string, values map[string]any) (string, error) {
 // writeSecretFile writes bytes to a 0600 file, refusing an existing
 // file that is not a private, caller-owned regular file (a symlinked or
 // shared file is refused, not written through — kind-ocp's own boundary
-// policy, reused from internal/fscheck).
+// policy, reused from internal/fscheck). What passes the preflight is
+// then replaced, never written through: the bytes go to a private
+// staging file os.CreateTemp names uniquely in the same directory, and
+// a rename publishes them over the target. A rename replaces the
+// directory entry itself, so nothing is ever written through the inode
+// at path — a symlink parked at the target between the preflight and
+// the write is replaced, not followed, and a hard link to the target
+// keeps its bytes when the run regenerates the file. The override
+// flags refuse a multiply-linked values file at startup (see
+// checkIndependentValuesFile), so the links this protects are the ones
+// no flag ever names — a user file linked to a generated one for
+// inspection survives the run that regenerates it.
 func writeSecretFile(path string, b []byte) error {
 	if err := fscheck.CheckWriteTarget(path); err != nil {
 		return err
 	}
-	return os.WriteFile(path, b, 0o600)
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	// Unconditional and deferred: after a successful rename the staging
+	// name is already gone and removing it is a no-op, while any
+	// failure — write, close, or the rename itself — never leaves this
+	// writer's staging file behind.
+	defer func() { _ = os.Remove(tmp.Name()) }()
+	if _, err := tmp.Write(b); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 // shellQuote renders one argument for POSIX shells, the way kind-ocp's own

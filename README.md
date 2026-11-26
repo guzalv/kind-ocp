@@ -52,15 +52,15 @@ reject pods; the shim cannot.
 ```sh
 # Prerequisites: Docker client + daemon, the buildx CLI plugin (see
 # Prerequisites below), Go 1.27.4+, kubectl for inspection.
-# Until the module is published (owner's call), build from a checkout:
-go install ./cmd/kind-ocp
-export PATH="$PATH:$(go env GOPATH)/bin" # go install puts the binary here
+# Until the module is published (owner's call), build from a checkout
+# and invoke the binary where you built it — no PATH setup needed:
+go build -o kind-ocp ./cmd/kind-ocp
 
-kind-ocp create                  # 2 clusters: kind-ocp-1, kind-ocp-2, profile full
-kind-ocp verify                  # per-check PASS/FAIL/SKIP across all clusters
-kubectl --kubeconfig "$(kind-ocp kubeconfig kind-ocp-1)" get nodes
-kind-ocp list                    # name, context, state, layers per cluster
-kind-ocp delete                  # removes the clusters and all state
+./kind-ocp create                  # 2 clusters: kind-ocp-1, kind-ocp-2, profile full
+./kind-ocp verify                  # per-check PASS/FAIL/SKIP across all clusters
+kubectl --kubeconfig "$(./kind-ocp kubeconfig kind-ocp-1)" get nodes
+./kind-ocp list                    # name, context, state, layers per cluster
+./kind-ocp delete                  # removes the clusters and all state
 ```
 
 Or use it as a library — the CLI is a thin skin over the same façade:
@@ -90,7 +90,7 @@ kind network.
   layer builds its webhook image with `docker build`, which needs the
   `docker-buildx` plugin discoverable by the Docker CLI (profile
   `minimal` does not build images and needs no buildx).
-- **Go 1.27.4 or newer** to build or `go install` (there is no released
+- **Go 1.27.4 or newer** to build from a checkout (there is no released
   binary yet): the `go.mod` directive pins 1.27.4 as the minimum
   toolchain, and an older one is refused.
 - **`kubectl`** for the inspection commands the quickstart itself shows
@@ -240,8 +240,15 @@ Four branches, each resting on a documented behavior:
 
 A cluster that vanished *entirely* — no container, no state record — is
 caught by `verify`'s cluster-count assertion (it FAILs naming the
-cluster); re-running `create` builds it fresh, and the clusters still
-present are reused when they match.
+cluster). Re-run the **original** `create` command — same prefix,
+configuration, and `--count`, which the FAIL line names: clusters still
+present are reused when they match and the missing one is built fresh.
+A create with a *smaller* `--count` is a supported downscope — it
+rewrites the persisted expectation to that count — and would clear the
+failure without rebuilding anything, but only when the smaller count
+excludes every missing cluster: no count create can write excludes
+`<prefix>-1`, so a missing first cluster fails under every downscope.
+Match the count the FAIL line reports.
 
 ## Configuration
 
@@ -369,10 +376,14 @@ cut (adding one is out of scope).
 
 ## Known limitations
 
-- Not OpenShift: no OAuth, console, marketplace, image builds, or
-  MachineConfig remediation; `rhcos4-*` node scans cannot work on kind
-  nodes. The layers cover the API surface and admission behavior the
-  targeted workloads need — no more.
+- Not OpenShift: no OAuth, console, marketplace, image builds,
+  MachineConfig remediation, OpenShift routing, or integrated image
+  registry. Routing is absent as a stack — no `Route` API is applied
+  and no router exists to serve one (the applied `ingress` CRDs are
+  API objects only), and the registry's operator and API are not
+  applied at all. `rhcos4-*` node scans cannot work on kind nodes. The
+  layers cover the API surface and admission behavior the targeted
+  workloads need — no more.
 - Docker only today. The runtime boundary (`provider.ImageBuilder` and
   friends) does not assume Docker; a podman implementation is a follow-up.
 - kind-as-library is pinned (`sigs.k8s.io/kind v0.33.0`); its API is less

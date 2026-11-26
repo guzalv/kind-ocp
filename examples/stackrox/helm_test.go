@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,9 +14,22 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stackrox/kind-ocp/config"
 	"github.com/stackrox/kind-ocp/internal/fscheck"
 	"gopkg.in/yaml.v3"
 )
+
+// mustStateRoot returns an existing state root in its own temp
+// directory, so the work directory checkValuesOverrides derives from it
+// sits in a different tree than any override file the test places.
+func mustStateRoot(t *testing.T) string {
+	t.Helper()
+	root := filepath.Join(t.TempDir(), "kind-ocp")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatalf("creating the state root: %v", err)
+	}
+	return root
+}
 
 func TestWriteCentralValues(t *testing.T) {
 	work := t.TempDir()
@@ -194,13 +209,72 @@ func TestWriteSecretFileRefusesASymlinkedFile(t *testing.T) {
 	}
 }
 
+// A generated values file is replaced, never written through: a user
+// file hard-linked to it (one inode, two names — the shape a previous
+// run's generated file linked from the user's own tree has) keeps its
+// bytes, and the generated path takes the fresh document on a new
+// inode. The in-place write this regression pins against replaced the
+// user's custom image through the shared inode, and helm — handed the
+// generated path and the user's file as two -f operands — read the
+// generated content twice.
+func TestWriteValuesFilesPreserveAHardLinkedFile(t *testing.T) {
+	work := t.TempDir()
+	user := filepath.Join(t.TempDir(), "my-sensor.yaml")
+	original := []byte("image:\n  main:\n    fullRef: my-registry.example.com/stackrox/main:my-branch\n")
+	if err := os.WriteFile(user, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	generated := filepath.Join(work, fmt.Sprintf(sensorValuesFile, "kind-ocp-2"))
+	if err := os.Link(user, generated); err != nil {
+		t.Skipf("the volume does not support hard links (%v); the shared-inode shape cannot be built here", err)
+	}
+
+	path, err := writeSensorValues(work, "kind-ocp-2", "https://172.18.0.2:31443", testCRSManifest)
+	if err != nil {
+		t.Fatalf("writeSensorValues = %v", err)
+	}
+	if path != generated {
+		t.Fatalf("writeSensorValues returned %q, want the generated path %q", path, generated)
+	}
+	// The reviewer's assertion: the original bytes survive the run.
+	if b, err := os.ReadFile(user); err != nil || !bytes.Equal(b, original) {
+		t.Fatalf("the hard-linked user file was rewritten: (%q, %v), want the original bytes untouched", b, err)
+	}
+	fresh, err := os.ReadFile(generated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(fresh, original) {
+		t.Fatal("the generated values file still holds the user's bytes — the run did not regenerate it")
+	}
+	var values map[string]any
+	if err := yaml.Unmarshal(fresh, &values); err != nil || values["clusterName"] != "kind-ocp-2" {
+		t.Fatalf("the generated values file holds %q, want the regenerated document", fresh)
+	}
+	userInfo, err := os.Stat(user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generatedInfo, err := os.Stat(generated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(userInfo, generatedInfo) {
+		t.Fatal("the generated path still names the user's inode — helm would read one file twice")
+	}
+	// The staging file never survives the write.
+	if entries, err := os.ReadDir(work); err != nil || len(entries) != 1 {
+		t.Errorf("the work directory holds %v (%v) after the write, want the values file alone", entries, err)
+	}
+}
+
 // The values overrides ride the same privacy rule as the credentials:
 // a values file can carry secrets, so it must be a private,
 // caller-owned regular file before helm is pointed at it, and a file
 // that is not is refused with the flag that named it.
 func TestCheckValuesOverrides(t *testing.T) {
 	t.Run("no flags, no overrides", func(t *testing.T) {
-		o, err := checkValuesOverrides("", "")
+		o, err := checkValuesOverrides("", "", mustStateRoot(t), "p")
 		if err != nil || o.central != "" || o.sensor != "" {
 			t.Fatalf("checkValuesOverrides() = (%+v, %v), want empty overrides and no error", o, err)
 		}
@@ -214,7 +288,7 @@ func TestCheckValuesOverrides(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		o, err := checkValuesOverrides(central, sensor)
+		o, err := checkValuesOverrides(central, sensor, mustStateRoot(t), "p")
 		if err != nil {
 			t.Fatalf("checkValuesOverrides = %v, want acceptance", err)
 		}
@@ -233,7 +307,7 @@ func TestCheckValuesOverrides(t *testing.T) {
 		if err := os.WriteFile(dash, []byte("image: {}\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		o, err := checkValuesOverrides("-", "")
+		o, err := checkValuesOverrides("-", "", mustStateRoot(t), "p")
 		if err != nil {
 			t.Fatalf("checkValuesOverrides(\"-\") = %v, want the dash file resolved, not refused or passed through", err)
 		}
@@ -263,13 +337,13 @@ func TestCheckValuesOverrides(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer func() { _ = os.Chmod(writable, 0o700) }()
-		_, err := checkValuesOverrides(path, "")
+		_, err := checkValuesOverrides(path, "", mustStateRoot(t), "p")
 		if err == nil || !strings.Contains(err.Error(), "writable") {
 			t.Fatalf("checkValuesOverrides through a writable ancestor = %v, want a refusal naming the writable directory", err)
 		}
 	})
 	t.Run("missing file is refused", func(t *testing.T) {
-		if _, err := checkValuesOverrides(filepath.Join(t.TempDir(), "absent.yaml"), ""); err == nil {
+		if _, err := checkValuesOverrides(filepath.Join(t.TempDir(), "absent.yaml"), "", mustStateRoot(t), "p"); err == nil {
 			t.Fatal("a missing values file must be refused")
 		}
 	})
@@ -278,7 +352,7 @@ func TestCheckValuesOverrides(t *testing.T) {
 		if err := os.WriteFile(path, []byte("image: {}\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		_, err := checkValuesOverrides("", path)
+		_, err := checkValuesOverrides("", path, mustStateRoot(t), "p")
 		if err == nil || !strings.Contains(err.Error(), "--sensor-values") {
 			t.Fatalf("checkValuesOverrides = %v, want a refusal naming --sensor-values", err)
 		}
@@ -293,7 +367,7 @@ func TestCheckValuesOverrides(t *testing.T) {
 		if err := os.Symlink(target, link); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := checkValuesOverrides(link, ""); err == nil {
+		if _, err := checkValuesOverrides(link, "", mustStateRoot(t), "p"); err == nil {
 			t.Fatal("a symlinked values file must be refused, not followed")
 		}
 		if b, err := os.ReadFile(target); err != nil || string(b) != "image: {}\n" {
@@ -313,7 +387,7 @@ func TestCheckValuesOverrides(t *testing.T) {
 		if err := os.WriteFile(path, []byte("image: {}\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		_, err := checkValuesOverrides(path, "")
+		_, err := checkValuesOverrides(path, "", mustStateRoot(t), "p")
 		if err == nil || !strings.Contains(err.Error(), "comma") {
 			t.Fatalf("checkValuesOverrides = %v, want a comma refusal naming the separator", err)
 		}
@@ -343,7 +417,7 @@ func TestCheckValuesOverrides(t *testing.T) {
 				if err := os.WriteFile(path, []byte("image: {}\n"), 0o600); err != nil {
 					t.Fatal(err)
 				}
-				_, err := checkValuesOverrides("", path)
+				_, err := checkValuesOverrides("", path, mustStateRoot(t), "p")
 				if err == nil || !strings.Contains(err.Error(), strconv.QuoteRune(tc.bad)) {
 					t.Fatalf("checkValuesOverrides(%q) = %v, want a refusal naming %q", tc.leaf, err, tc.bad)
 				}
@@ -351,6 +425,415 @@ func TestCheckValuesOverrides(t *testing.T) {
 					t.Fatalf("checkValuesOverrides = %v, want a refusal naming --sensor-values", err)
 				}
 			})
+		}
+	})
+}
+
+// An override may not point into the example's own work directory: the
+// run rewrites that tree — the generated values files on every run,
+// each chart's extraction directory on every fetch — so an override
+// there would be overwritten or removed by the run that accepted it,
+// and helm would receive the generated file and the override as two
+// operands naming one file. Every shape here must be refused at
+// startup, with the refused input left exactly as it was and the work
+// directory holding nothing the run would have written.
+func TestCheckValuesOverridesRefusesTheWorkDirectory(t *testing.T) {
+	assertRefused := func(t *testing.T, flag string, cfg *config.Config, override string, content []byte) {
+		var central, sensor string
+		if flag == "--central-values" {
+			central = override
+		} else {
+			sensor = override
+		}
+		_, err := checkValuesOverrides(central, sensor, cfg.StateRoot, cfg.Prefix)
+		if err == nil || !strings.Contains(err.Error(), "work directory") {
+			t.Fatalf("checkValuesOverrides inside the work directory = %v, want a refusal naming the work directory", err)
+		}
+		if !strings.Contains(err.Error(), flag) {
+			t.Fatalf("the refusal must name the flag: %v", err)
+		}
+		// The refused input stays unchanged, and the refusal itself
+		// writes nothing: the work directory holds the user's file and
+		// nothing else — no generated values, no admin password, no
+		// charts.
+		if b, err := os.ReadFile(override); err != nil || !bytes.Equal(b, content) {
+			t.Errorf("the refused override changed: (%q, %v), want the original bytes untouched", b, err)
+		}
+		if entries, err := os.ReadDir(filepath.Dir(override)); err != nil || len(entries) != 1 {
+			t.Errorf("the work directory holds %v (%v) after the refusal, want only the user's file", entries, err)
+		}
+	}
+	// The reviewer's shape: the generated Sensor values name a previous
+	// run left behind, carrying the user's own image edits.
+	userValues := []byte("image:\n  main:\n    fullRef: my-registry.example.com/stackrox/main:my-branch\n")
+	setup := func(t *testing.T, prefix string) (*config.Config, string) {
+		base := t.TempDir()
+		cfg := mustWorkConfig(t, base, prefix)
+		work, err := openWorkDir(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		override := filepath.Join(work, fmt.Sprintf(sensorValuesFile, prefix+"-2"))
+		if err := os.WriteFile(override, userValues, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return cfg, override
+	}
+
+	t.Run("the generated values path inside the workspace", func(t *testing.T) {
+		cfg, override := setup(t, "refuse")
+		assertRefused(t, "--sensor-values", cfg, override, userValues)
+	})
+	t.Run("the generated central values path, named by --central-values", func(t *testing.T) {
+		// The central flag rides the same refusal as the sensor one;
+		// this pins it so the two cannot drift apart.
+		base := t.TempDir()
+		cfg := mustWorkConfig(t, base, "refuse-central")
+		work, err := openWorkDir(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		override := filepath.Join(work, centralValuesFile)
+		if err := os.WriteFile(override, userValues, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		assertRefused(t, "--central-values", cfg, override, userValues)
+	})
+	t.Run("under the extracted charts", func(t *testing.T) {
+		// fetchCharts clears each chart's extraction directory before
+		// extracting, so an override there would be removed outright.
+		base := t.TempDir()
+		cfg := mustWorkConfig(t, base, "charts")
+		work, err := openWorkDir(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		charts := filepath.Join(work, "charts", "stackrox-central-services")
+		if err := os.MkdirAll(charts, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		override := filepath.Join(charts, "my-central.yaml")
+		if err := os.WriteFile(override, userValues, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		assertRefused(t, "--sensor-values", cfg, override, userValues)
+	})
+	t.Run("after kind-ocp delete removed the state root but the workspace survived", func(t *testing.T) {
+		// The work directory outlives the state tree (kind-ocp delete
+		// removes its own tree only). With the state root gone, the
+		// derivation falls back to the state root's absolute spelling,
+		// and the identity comparison follows the alias spellings
+		// between it and the resolved workspace the previous run
+		// created (macOS temp dirs live under the /var symlink).
+		cfg, override := setup(t, "survive")
+		if err := os.RemoveAll(cfg.StateRoot); err != nil {
+			t.Fatal(err)
+		}
+		assertRefused(t, "--sensor-values", cfg, override, userValues)
+	})
+	t.Run("a case-colliding spelling of the workspace", func(t *testing.T) {
+		base := t.TempDir()
+		if !caseInsensitiveVolume(t, base) {
+			t.Skip("the volume resolves names case-sensitively; a case-colliding spelling cannot denote one directory here")
+		}
+		cfg := mustWorkConfig(t, base, "casetest")
+		work, err := openWorkDir(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Spell the workspace's own base directory in the other case:
+		// on this volume both spellings denote the one directory while
+		// remaining two strings — exactly the shape a string prefix
+		// comparison would pass.
+		spelled := filepath.Join(
+			filepath.Dir(filepath.Dir(work)),
+			strings.ToUpper(filepath.Base(filepath.Dir(work))),
+			filepath.Base(work), "my-sensor.yaml")
+		if err := os.WriteFile(spelled, userValues, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		assertRefused(t, "--sensor-values", cfg, spelled, userValues)
+	})
+	t.Run("a workspace candidate that cannot be checked fails closed", func(t *testing.T) {
+		// A stat failure on the candidate that is not "does not exist"
+		// must be a startup error naming the path, never a silent
+		// pass: the check cannot see the tree, so it cannot say the
+		// override is outside it. The state root is spelled under a
+		// regular file, so the workspace candidate's stat fails with
+		// ENOTDIR — a deterministic failure for every caller,
+		// including a privileged one a mode-000 directory would not
+		// stop.
+		dir := t.TempDir()
+		plain := filepath.Join(dir, "plainfile")
+		if err := os.WriteFile(plain, []byte("not a directory\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		outside := t.TempDir() // readable: only the candidate is blind
+		path := filepath.Join(outside, "my-sensor.yaml")
+		if err := os.WriteFile(path, userValues, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := checkValuesOverrides("", path, filepath.Join(plain, "kind-ocp"), "p")
+		if err == nil || !strings.Contains(err.Error(), "work directory") {
+			t.Fatalf("checkValuesOverrides with an uncheckable work directory = %v, want a startup error naming it", err)
+		}
+		if !strings.Contains(err.Error(), "--sensor-values") {
+			t.Fatalf("the refusal must name the flag: %v", err)
+		}
+	})
+	t.Run("a file beside the work directory is not refused", func(t *testing.T) {
+		// The negative control: the workspace's own parent holds the
+		// state root and the workspace side by side, and a user file
+		// there is outside both — refusing it would be a false
+		// positive.
+		base := t.TempDir()
+		cfg := mustWorkConfig(t, base, "outside")
+		if _, err := openWorkDir(cfg); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(base, "my-sensor.yaml")
+		if err := os.WriteFile(path, userValues, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		o, err := checkValuesOverrides("", path, cfg.StateRoot, cfg.Prefix)
+		if err != nil || o.sensor == "" {
+			t.Fatalf("checkValuesOverrides beside the work directory = (%+v, %v), want acceptance", o, err)
+		}
+	})
+}
+
+// An override may not point into this prefix's kind-ocp state
+// directory either: the run rewrites that tree (the expected-cluster
+// count on every create, the cluster records, the exported
+// kubeconfigs), and `kind-ocp delete` removes it outright. Every shape
+// here must be refused at startup with the file left exactly as it
+// was.
+func TestCheckValuesOverridesRefusesTheStateDirectory(t *testing.T) {
+	// A marked per-prefix state tree, the shape a real create leaves
+	// behind — the walk SetExpectedClusters and every record write go
+	// through accepts it.
+	newStateTree := func(t *testing.T, prefix string) (*config.Config, string) {
+		base := t.TempDir()
+		cfg := mustWorkConfig(t, base, prefix)
+		tree := filepath.Join(cfg.StateRoot, cfg.Prefix)
+		if err := os.MkdirAll(tree, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(tree, "kind-ocp-state.json"), []byte(`{"tool":"kind-ocp"}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return cfg, tree
+	}
+	// The reviewer's shape: valid custom image values parked at the
+	// expected-clusters path — the file SetExpectedClusters replaces
+	// with the count before the first cluster is provisioned.
+	userValues := []byte("image:\n  main:\n    fullRef: my-registry.example.com/stackrox/main:my-branch\n")
+
+	t.Run("the expected-clusters path inside a marked state tree", func(t *testing.T) {
+		cfg, tree := newStateTree(t, "refuse-state")
+		override := filepath.Join(tree, "expected-clusters")
+		if err := os.WriteFile(override, userValues, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := checkValuesOverrides("", override, cfg.StateRoot, cfg.Prefix)
+		if err == nil || !strings.Contains(err.Error(), "state directory") {
+			t.Fatalf("checkValuesOverrides inside the state directory = %v, want a refusal naming the state directory", err)
+		}
+		if !strings.Contains(err.Error(), "--sensor-values") {
+			t.Fatalf("the refusal must name the flag: %v", err)
+		}
+		// The refusal leaves the file exactly as it was.
+		if b, err := os.ReadFile(override); err != nil || !bytes.Equal(b, userValues) {
+			t.Errorf("the refused override changed: (%q, %v), want the original bytes untouched", b, err)
+		}
+	})
+	t.Run("a cluster record inside the state tree, named by --central-values", func(t *testing.T) {
+		cfg, tree := newStateTree(t, "refuse-central")
+		dir := filepath.Join(tree, "clusters", cfg.Prefix+"-1")
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		override := filepath.Join(dir, "record.json")
+		if err := os.WriteFile(override, userValues, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := checkValuesOverrides(override, "", cfg.StateRoot, cfg.Prefix)
+		if err == nil || !strings.Contains(err.Error(), "state directory") {
+			t.Fatalf("checkValuesOverrides inside the state directory = %v, want a refusal naming the state directory", err)
+		}
+		if !strings.Contains(err.Error(), "--central-values") {
+			t.Fatalf("the refusal must name the flag: %v", err)
+		}
+	})
+	t.Run("a case-colliding spelling of the state tree", func(t *testing.T) {
+		base := t.TempDir()
+		if !caseInsensitiveVolume(t, base) {
+			t.Skip("the volume resolves names case-sensitively; a case-colliding spelling cannot denote one directory here")
+		}
+		cfg := mustWorkConfig(t, base, "casetest")
+		if err := os.MkdirAll(filepath.Join(cfg.StateRoot, cfg.Prefix), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		// Spell the state tree's own prefix directory in the other
+		// case: on this volume both spellings denote the one directory
+		// while remaining two strings — the shape only an identity
+		// comparison catches.
+		spelled := filepath.Join(cfg.StateRoot, strings.ToUpper(cfg.Prefix), "my-sensor.yaml")
+		if err := os.WriteFile(spelled, userValues, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := checkValuesOverrides("", spelled, cfg.StateRoot, cfg.Prefix)
+		if err == nil || !strings.Contains(err.Error(), "state directory") {
+			t.Fatalf("checkValuesOverrides through a case-colliding state-tree spelling = %v, want a refusal", err)
+		}
+	})
+	t.Run("a file beside the per-prefix state directory is not refused", func(t *testing.T) {
+		// The negative control: the state base holds this prefix's
+		// tree (and other prefixes' trees) below it, and a user file
+		// in the base itself is outside this run's tree — the run
+		// rewrites only its own prefix's directory.
+		cfg, _ := newStateTree(t, "outside")
+		path := filepath.Join(cfg.StateRoot, "my-sensor.yaml")
+		if err := os.WriteFile(path, userValues, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		o, err := checkValuesOverrides("", path, cfg.StateRoot, cfg.Prefix)
+		if err != nil || o.sensor == "" {
+			t.Fatalf("checkValuesOverrides beside the state directory = (%+v, %v), want acceptance", o, err)
+		}
+	})
+	t.Run("a sibling prefix's state tree is not refused", func(t *testing.T) {
+		// This run rewrites its own prefix's tree only; a sibling
+		// prefix's tree is another run's.
+		cfg, _ := newStateTree(t, "mine")
+		other := filepath.Join(cfg.StateRoot, "other-prefix", "my-sensor.yaml")
+		if err := os.MkdirAll(filepath.Dir(other), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(other, userValues, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		o, err := checkValuesOverrides("", other, cfg.StateRoot, cfg.Prefix)
+		if err != nil || o.sensor == "" {
+			t.Fatalf("checkValuesOverrides inside a sibling prefix's tree = (%+v, %v), want acceptance", o, err)
+		}
+	})
+	t.Run("a state-tree candidate that cannot be checked fails closed", func(t *testing.T) {
+		// The same shared branch on the state-tree side, pinned beside
+		// the workspace side: the state root itself is a regular file,
+		// so the per-prefix candidate's stat fails with ENOTDIR while
+		// the workspace candidate — a sibling of the file — simply
+		// does not exist. The failure is deterministic for every
+		// caller, unlike a mode-000 directory a privileged process
+		// can still stat through.
+		dir := t.TempDir()
+		plain := filepath.Join(dir, "plainfile")
+		if err := os.WriteFile(plain, []byte("not a directory\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(t.TempDir(), "my-sensor.yaml")
+		if err := os.WriteFile(path, userValues, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := checkValuesOverrides("", path, plain, "p")
+		if err == nil || !strings.Contains(err.Error(), "state directory") {
+			t.Fatalf("checkValuesOverrides with an uncheckable state directory = %v, want a startup error naming it", err)
+		}
+		if !strings.Contains(err.Error(), "--sensor-values") {
+			t.Fatalf("the refusal must name the flag: %v", err)
+		}
+	})
+}
+
+// A values override must be one independent file: a hard link's other
+// name can be a file the run rewrites in place — a cluster record or a
+// kubeconfig in the state directory, whose writer replaces the shared
+// inode's contents — and the startup check cannot enumerate a file's
+// other names to tell the safe links from the clobbering ones. Every
+// multiply-linked values file is therefore refused before the clusters
+// are touched, with the file left exactly as it was; the refusal names
+// the remedy, an independent copy (cp, not ln). Directory-identity
+// containment cannot see this shape: the override's own name sits
+// outside both trees while its inode sits inside one through the link.
+func TestCheckValuesOverridesRefusesAHardLinkedFile(t *testing.T) {
+	userValues := []byte("image:\n  main:\n    fullRef: my-registry.example.com/stackrox/main:my-branch\n")
+
+	t.Run("hard-linked to a cluster record, outside both trees", func(t *testing.T) {
+		// The reviewer's probe: a marked per-prefix state tree holding
+		// one cluster record — a file Store.WriteRecord rewrites in
+		// place on every run — and a private user file outside both
+		// trees hard-linked to it. The tree checks pass (the
+		// override's own name is outside), so only the link count can
+		// refuse it.
+		base := t.TempDir()
+		cfg := mustWorkConfig(t, base, "hardlink")
+		recordDir := filepath.Join(cfg.StateRoot, cfg.Prefix, "clusters", cfg.Prefix+"-1")
+		if err := os.MkdirAll(recordDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		user := filepath.Join(t.TempDir(), "my-sensor.yaml")
+		if err := os.WriteFile(user, userValues, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		record := filepath.Join(recordDir, "record.json")
+		if err := os.Link(user, record); err != nil {
+			t.Skipf("the volume does not support hard links (%v); the shared-inode shape cannot be built here", err)
+		}
+		_, err := checkValuesOverrides("", user, cfg.StateRoot, cfg.Prefix)
+		if err == nil || !strings.Contains(err.Error(), "independent copy") {
+			t.Fatalf("checkValuesOverrides on a file hard-linked to a cluster record = %v, want a refusal naming the independent-copy remedy", err)
+		}
+		if !strings.Contains(err.Error(), "--sensor-values") {
+			t.Fatalf("the refusal must name the flag: %v", err)
+		}
+		// Both names still read the original bytes: the refusal is a
+		// startup error, never a write.
+		for _, p := range []string{user, record} {
+			if b, err := os.ReadFile(p); err != nil || !bytes.Equal(b, userValues) {
+				t.Errorf("the hard-linked file changed through %s: (%q, %v), want the original bytes untouched", p, b, err)
+			}
+		}
+	})
+	t.Run("hard-linked to a generated values file, named by --central-values", func(t *testing.T) {
+		// The workspace side rides the same refusal: the generated
+		// values files are replaced atomically, but the other names a
+		// link can carry are not all so kind, and the check cannot
+		// tell — so the generated-values shape is refused like any
+		// other. This pins the deliberate choice from the sixth
+		// review round: no acceptance criterion requires hard-link
+		// support, and a future acceptance would be a deliberate
+		// change, not drift.
+		work := t.TempDir()
+		generated := filepath.Join(work, centralValuesFile)
+		if err := os.WriteFile(generated, []byte("central: {}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		user := filepath.Join(t.TempDir(), "my-central.yaml")
+		if err := os.Link(generated, user); err != nil {
+			t.Skipf("the volume does not support hard links (%v)", err)
+		}
+		_, err := checkValuesOverrides(user, "", mustStateRoot(t), "p")
+		if err == nil || !strings.Contains(err.Error(), "independent copy") {
+			t.Fatalf("checkValuesOverrides on a file hard-linked to a generated values file = %v, want a refusal naming the independent-copy remedy", err)
+		}
+		if !strings.Contains(err.Error(), "--central-values") {
+			t.Fatalf("the refusal must name the flag: %v", err)
+		}
+		if b, err := os.ReadFile(user); err != nil || string(b) != "central: {}\n" {
+			t.Errorf("the hard-linked file changed: (%q, %v), want the original bytes untouched", b, err)
+		}
+	})
+	t.Run("a single-link values file outside both trees is not refused", func(t *testing.T) {
+		// The negative control: the refusal is scoped to files with
+		// more than one name — a plain private file outside both
+		// trees still passes.
+		path := filepath.Join(t.TempDir(), "my-sensor.yaml")
+		if err := os.WriteFile(path, userValues, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		o, err := checkValuesOverrides("", path, mustStateRoot(t), "p")
+		if err != nil || o.sensor == "" {
+			t.Fatalf("checkValuesOverrides on a single-link file = (%+v, %v), want acceptance", o, err)
 		}
 	})
 }
@@ -380,7 +863,7 @@ func TestUpgradeInstallOrdersValuesFiles(t *testing.T) {
 	// The override goes through the flag validation first: what the
 	// runner receives — and what argv must carry — is the resolved
 	// absolute path, never the raw spelling the user typed.
-	overrides, err := checkValuesOverrides("", override)
+	overrides, err := checkValuesOverrides("", override, mustStateRoot(t), "p")
 	if err != nil {
 		t.Fatalf("checkValuesOverrides = %v", err)
 	}

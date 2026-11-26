@@ -13,6 +13,8 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/stackrox/kind-ocp/config"
+	"github.com/stackrox/kind-ocp/kindocp"
+	"github.com/stackrox/kind-ocp/provider"
 )
 
 func mustConfig(t *testing.T, prefix, stateRoot string) *config.Config {
@@ -296,6 +298,73 @@ func TestOpenWorkDirRefusesAWorkspaceAliasedByCase(t *testing.T) {
 	// The refusal wrote nothing into the state tree the alias named.
 	if entries, err := os.ReadDir(cfg.StateRoot); err != nil || len(entries) != 0 {
 		t.Errorf("the state root holds %v (%v) after the refusal, want nothing — refusals do not write", entries, err)
+	}
+}
+
+// The pre-check's candidate must be the workspace the run actually
+// uses: workspaceBase, without creating anything, names (by directory
+// identity) the base openWorkDir derives and rewrites. The override
+// refusal rides on this agreement.
+func TestWorkspaceBaseNamesTheDerivedWorkspace(t *testing.T) {
+	base := t.TempDir()
+	cfg := mustWorkConfig(t, base, "base-test")
+	work, err := openWorkDir(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := workspaceBase(cfg.StateRoot)
+	got, err := os.Stat(candidate)
+	if err != nil {
+		t.Fatalf("workspaceBase(%q) = %q, which does not exist: %v", cfg.StateRoot, candidate, err)
+	}
+	want, err := os.Stat(filepath.Dir(work))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(got, want) {
+		t.Errorf("workspaceBase(%q) = %q, want the base of the derived workspace %q", cfg.StateRoot, candidate, filepath.Dir(work))
+	}
+}
+
+// stubProvisioner keeps kindocp.New Docker-free: nothing is
+// provisioned, the client is only asked where its state tree is.
+type stubProvisioner struct{}
+
+func (stubProvisioner) Create(context.Context, provider.CreateOptions) (bool, error) {
+	return false, nil
+}
+func (stubProvisioner) Delete(context.Context, string, string) error           { return nil }
+func (stubProvisioner) List(context.Context) ([]string, error)                 { return nil, nil }
+func (stubProvisioner) ExportKubeconfig(context.Context, string, string) error { return nil }
+
+// The state-tree candidate must name the directory kind-ocp itself
+// opens for this prefix: the façade derives its store from
+// cfg.StateRoot and cfg.Prefix (kindocp.New), and the startup override
+// refusal rides on that agreement.
+func TestStateTreePathNamesTheKindOCPStateDirectory(t *testing.T) {
+	base := t.TempDir()
+	cfg := mustWorkConfig(t, base, "agree")
+	client, err := kindocp.New(kindocp.Options{Config: cfg, Provisioner: stubProvisioner{}})
+	if err != nil {
+		t.Fatalf("kindocp.New = %v", err)
+	}
+	// The tree kind-ocp owns for this prefix, created the way the
+	// store's first write does: 0700 under the state base.
+	root := client.StateRoot()
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	candidate := stateTreePath(cfg.StateRoot, cfg.Prefix)
+	got, err := os.Stat(candidate)
+	if err != nil {
+		t.Fatalf("stateTreePath(%q, %q) = %q, which does not exist: %v", cfg.StateRoot, cfg.Prefix, candidate, err)
+	}
+	want, err := os.Stat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(got, want) {
+		t.Errorf("stateTreePath(%q, %q) = %q, want the kind-ocp state directory %q", cfg.StateRoot, cfg.Prefix, candidate, root)
 	}
 }
 
