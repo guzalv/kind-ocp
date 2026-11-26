@@ -282,7 +282,7 @@ jobs:
         with:
           count: '2'
           profile: full
-          prefix: rox-e2e # optional; default ko-<run id>
+          prefix: rox-e2e # optional; default ko-<run id>-<random>
       - name: Consume the clusters
         env:
           # One cluster, directly:
@@ -310,10 +310,10 @@ jobs:
 |---|---|---|
 | `count` | `''` | Empty passes no `--count`; the config file or the built-in default (2) governs. |
 | `profile` | `''` | Empty passes no `--profile` (default `full`). |
-| `prefix` | `''` | Empty derives `ko-<run id>`. Lowercase alphanumeric and `-`, 1-40 chars. |
+| `prefix` | `''` | Empty derives `ko-<run id>-<random>`, unique per invocation. Lowercase alphanumeric and `-`, 1-40 chars. |
 | `state_root` | `''` | Empty derives `<RUNNER_TEMP>/kind-ocp`. Always wins over the config file. Must be a single line (CR/LF refused). |
-| `config` | `''` | Path to a kind-ocp config file, resolved against the GitHub workspace — the directory composite-action steps run in; a job-level `defaults.run.working-directory` does not reach them. Empty disables file lookup. |
-| `kind_ocp_version` | `v0.1.1` | The released version `go install` builds. |
+| `config` | `''` | Path to a kind-ocp config file, resolved against the GitHub workspace — the directory composite-action steps run in; a job-level `defaults.run.working-directory` does not reach them. Empty disables file lookup. Must be a single line (CR/LF refused). |
+| `kind_ocp_version` | `v0.1.1` | The released version `go install` builds. Must be a single line (CR/LF refused). |
 | `go_version` | `1.27.4` | Must satisfy the release's go.mod minimum. |
 
 | Output | Value |
@@ -323,7 +323,9 @@ jobs:
 | `clusters` | Single-line JSON keyed by cluster name: `{"<name>": {"kubeconfig": <path>, "context": <name>}}`. Emitted after create succeeds, before verify runs. |
 
 `delete` takes `prefix` (required), `state_root`, `kind_ocp_version`,
-and `go_version` (same defaults), and produces no outputs.
+and `go_version` (same defaults), and produces no outputs. `prefix`,
+`state_root`, and `kind_ocp_version` must be single lines (CR/LF
+refused), like their create-side counterparts.
 
 ### Caveats
 

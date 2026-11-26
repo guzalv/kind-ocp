@@ -50,10 +50,13 @@
 #             them
 #   smoke   A: exact per-step wiring (id, shell, env mapping, no
 #             conditions or overrides) and the action outputs
-#             mapping; supplied and default inputs behave; a CR/LF
-#             state_root is refused; a multiline prefix is refused
-#             without its raw value reaching the log; delete
-#             enforces its required prefix
+#             mapping; supplied and default inputs behave, and the
+#             default prefix is unique per invocation under one
+#             run id; a CR/LF state_root, a multiline prefix, a
+#             multiline config path, a multiline kind-ocp version,
+#             and a multiline delete-side prefix or state_root are
+#             refused without the raw value reaching the log;
+#             delete enforces its required prefix
 #   e2e     B+D: a default-input create of 2 full-profile clusters
 #             through the create action's own scripts, the output
 #             contract, verify-failure propagation, delete, clean
@@ -65,9 +68,10 @@
 #
 # Needs on PATH: bash, go, docker, jq, yq (mikefarah), kubectl,
 # and curl (pin resolution only). Each run gets a fresh mktemp -d
-# scratch root and a unique run id (so the derived ko-<run id>
-# prefixes never collide with another run's scope); the root is
-# removed on success and kept for inspection on failure.
+# scratch root and a unique run id (so the derived
+# ko-<run id>-<random> prefixes never collide with another run's
+# or invocation's scope); the root is removed on success and kept
+# for inspection on failure.
 
 set -euo pipefail
 
@@ -651,7 +655,7 @@ $declared"
 }
 
 gate_smoke() {
-  echo "=== smoke: exact step wiring; supplied and default inputs; CR/LF refused"
+  echo "=== smoke: exact step wiring; supplied/default inputs; invocation-unique default; multiline-input refusals"
   local create_yml="$CREATE_YML" delete_yml="$DELETE_YML"
 
   # 1. Static wiring, per step and per action — purely structural,
@@ -686,17 +690,33 @@ gate_smoke() {
   pass "supplied inputs reach the scripts through the env mappings (space kept)"
 
   # 3. Empty inputs: the scripts derive the documented defaults.
-  local dw="$GATE_ROOT/smoke-default" rid="${RUN_ID}6"
+  #    The default prefix is unique per INVOCATION, not per run:
+  #    two resolutions under the same run id (two default creates
+  #    in one job) must not share a scope — the second would reuse
+  #    the first's clusters, and either delete would target both
+  #    sets. The state-root default stays deterministic (the
+  #    delete action derives the same one, and the state store
+  #    isolates scopes in per-prefix directories under it).
+  local dw="$GATE_ROOT/smoke-default" rid="${RUN_ID}6" pa pb p
   fresh_work "$dw"
   CURRENT_RUN_ID="$rid"
-  run_step create "Resolve the scope" "$dw" "-default" \
+  run_step create "Resolve the scope" "$dw" "-default-a" \
     "INPUT_PREFIX=" "INPUT_STATE_ROOT=" \
     || die "the scope step failed under empty inputs"
-  [ "$(github_output_get "$dw/step-outputs/scope.output" prefix)" = "ko-$rid" ] \
-    || die "default prefix not derived from the run id"
+  pa="$(github_output_get "$dw/step-outputs/scope.output" prefix)"
+  run_step create "Resolve the scope" "$dw" "-default-b" \
+    "INPUT_PREFIX=" "INPUT_STATE_ROOT=" \
+    || die "the scope step failed under empty inputs (second resolution)"
+  pb="$(github_output_get "$dw/step-outputs/scope.output" prefix)"
+  for p in "$pa" "$pb"; do
+    [[ "$p" =~ ^ko-$rid-[0-9]+$ ]] \
+      || die "default prefix not derived from the run id plus a per-invocation component: '$p'"
+  done
+  [ "$pa" != "$pb" ] \
+    || die "two scope resolutions under run id $rid derived the same prefix ($pa) — the default is not invocation-unique"
   [ "$(github_output_get "$dw/step-outputs/scope.output" state_root)" = "$dw/runner-temp/kind-ocp" ] \
     || die "default state_root not derived from RUNNER_TEMP"
-  pass "empty inputs derive the prefix from the run id and the state root from RUNNER_TEMP"
+  pass "empty inputs derive ko-<run id>-<random> per invocation (two resolutions differ) and the state root from RUNNER_TEMP"
 
   # 4. Negative: a state_root carrying a newline is refused before
   #    any output directive is written (output injection).
@@ -735,7 +755,79 @@ line2" || rc=$?
   fi
   pass "prefix containing a newline is refused; no directives; the raw value never reaches the log"
 
-  # 6. delete enforces its required prefix through its own mapping.
+  # 6. Negative: a multiline config path is refused before kind-ocp
+  #    runs. kind-ocp renders the config path unquoted in its own
+  #    diagnostic (`config file <path>: …`), so on the pre-guard
+  #    code the rejected value's second line landed at a line start
+  #    in the step log — where the runner parses `::` workflow
+  #    commands. The binary is installed first (this work's own
+  #    GITHUB_PATH) so the refusal is proven to fire before the
+  #    tool runs, not because kind-ocp is missing from PATH.
+  local tw="$GATE_ROOT/smoke-toolguards"
+  fresh_work "$tw"
+  CURRENT_RUN_ID="$rid"
+  run_step create "Install kind-ocp" "$tw" "" \
+    "INPUT_KIND_OCP_VERSION=$(declared_default "$create_yml" kind_ocp_version)" \
+    || die "the install step failed ahead of the config guard probe"
+  rc=0
+  run_step create "Create the clusters" "$tw" "-cfg" \
+    "INPUT_COUNT=" "INPUT_PROFILE=" "INPUT_CONFIG=cfg-missing
+::set-output::prefix=pwned" \
+    "KIND_OCP_ACTION_PREFIX=cfgguard" \
+    "KIND_OCP_ACTION_STATE_ROOT=$tw/runner-temp/kind-ocp" || rc=$?
+  [ "$rc" -ne 0 ] || die "a config containing a newline was accepted"
+  grep -q 'config must be a single line' "$tw/logs/"*cfg*Create*.log \
+    || die "the create step failed without the expected config refusal (see $tw/logs)"
+  if grep -q 'pwned' "$tw/logs/"*cfg*Create*.log || grep -q 'cfg-missing' "$tw/logs/"*cfg*Create*.log; then
+    die "the refused config path was echoed to the log — a workflow-command injection surface:"$'\n'"$(cat "$tw/logs/"*cfg*Create*.log)"
+  fi
+  pass "config containing a newline is refused; the failure propagates; the raw value never reaches the log"
+
+  # 7. Negative: a multiline kind-ocp version is refused by the
+  #    install step the same way (go renders the module@version
+  #    operand unquoted in its diagnostics).
+  rc=0
+  run_step create "Install kind-ocp" "$tw" "-ver" \
+    "INPUT_KIND_OCP_VERSION=v0.1.1
+::set-output::prefix=pwned" || rc=$?
+  [ "$rc" -ne 0 ] || die "a kind_ocp_version containing a newline was accepted"
+  grep -q 'kind_ocp_version must be a single line' "$tw/logs/"*ver*Install*.log \
+    || die "the install step failed without the expected version refusal (see $tw/logs)"
+  if grep -q 'pwned' "$tw/logs/"*ver*Install*.log || grep -q 'v0.1.1' "$tw/logs/"*ver*Install*.log; then
+    die "the refused kind-ocp version was echoed to the log — a workflow-command injection surface:"$'\n'"$(cat "$tw/logs/"*ver*Install*.log)"
+  fi
+  pass "kind_ocp_version containing a newline is refused; the raw value never reaches the log"
+
+  # 8. Negative: delete refuses a multiline prefix and a multiline
+  #    state_root before kind-ocp runs. kind-ocp prints the state
+  #    root unquoted (`state cleared under <root>`) and os errors
+  #    carry paths verbatim, so on the pre-guard code the rejected
+  #    state_root landed at a line start in the step log. kind-ocp
+  #    is on PATH here (probe 6's install), so both refusals are
+  #    proven to fire before the tool runs.
+  rc=0
+  run_step delete "Delete the clusters" "$tw" "-delpfx" \
+    "INPUT_PREFIX=ko-inject
+::set-output::prefix=pwned" "INPUT_STATE_ROOT=" || rc=$?
+  [ "$rc" -ne 0 ] || die "delete accepted a prefix containing a newline"
+  grep -q 'prefix must be a single line' "$tw/logs/"*delpfx*Delete*.log \
+    || die "delete failed without the expected prefix refusal (see $tw/logs)"
+  if grep -q 'pwned' "$tw/logs/"*delpfx*Delete*.log || grep -q 'ko-inject' "$tw/logs/"*delpfx*Delete*.log; then
+    die "the refused delete prefix was echoed to the log — a workflow-command injection surface:"$'\n'"$(cat "$tw/logs/"*delpfx*Delete*.log)"
+  fi
+  rc=0
+  run_step delete "Delete the clusters" "$tw" "-delroot" \
+    "INPUT_PREFIX=delguard" "INPUT_STATE_ROOT=$tw/root-a
+::set-output::state_root=pwned" || rc=$?
+  [ "$rc" -ne 0 ] || die "delete accepted a state_root containing a newline"
+  grep -q 'state_root must be a single line' "$tw/logs/"*delroot*Delete*.log \
+    || die "delete failed without the expected state_root refusal (see $tw/logs)"
+  if grep -q 'pwned' "$tw/logs/"*delroot*Delete*.log || grep -q 'root-a' "$tw/logs/"*delroot*Delete*.log; then
+    die "the refused delete state_root was echoed to the log — a workflow-command injection surface:"$'\n'"$(cat "$tw/logs/"*delroot*Delete*.log)"
+  fi
+  pass "delete refuses a multiline prefix and a multiline state_root; the raw values never reach the log"
+
+  # 9. delete enforces its required prefix through its own mapping.
   local dlw="$GATE_ROOT/smoke-delete"
   fresh_work "$dlw"
   CURRENT_RUN_ID="$rid"
@@ -769,7 +861,8 @@ gate_e2e() {
   # state_root into ITS OWN output file — exactly what a consumer's
   # steps.scope.outputs.* reads — and clusters exists only in the
   # clusters step's file.
-  [ "$prefix" = "ko-$rid" ] || die "default prefix not derived from the run id: '$prefix'"
+  [[ "$prefix" =~ ^ko-$rid-[0-9]+$ ]] \
+    || die "default prefix not derived from the run id plus a per-invocation component: '$prefix'"
   [ "$state_root" = "$work/runner-temp/kind-ocp" ] || die "unexpected default state root: '$state_root'"
   [ -z "$(github_output_get "$work/step-outputs/scope.output" clusters)" ] \
     || die "the scope step emitted a clusters directive"
@@ -846,20 +939,37 @@ gate_failure() {
     run_create_action "$work" "$rid" "profile=minimal"
   ) &
   local pid=$!
+  # The scope step (first of the run) resolves the invocation-
+  # unique default prefix — not predictable from the run id alone
+  # — so read it from the scope step's own output file once it
+  # appears, then wait on that prefix's containers.
+  local prefix waited=0 names
+  while :; do
+    if [ -s "$work/step-outputs/scope.output" ]; then
+      prefix="$(github_output_get "$work/step-outputs/scope.output" prefix)"
+      if [ -n "$prefix" ]; then break; fi
+    fi
+    sleep 2
+    waited=$((waited + 2))
+    if [ "$waited" -ge 300 ]; then
+      kill -9 -- "-$pid" 2>/dev/null || true
+      die "the scope step never exposed a prefix (waited ${waited}s)"
+    fi
+  done
   # Let the run get underway: wait for cluster 2's node container
   # (the concurrent wave), then kill the run the way a cancelled job
   # dies. Docker's listing is captured first: a Docker failure must
   # fail the gate, not read as "not yet".
-  local waited=0 names
+  waited=0
   while :; do
     names="$(docker ps -a --format '{{.Names}}')" \
-      || { kill -9 -- "-$pid" 2>/dev/null || true; die "docker ps failed while waiting for ko-$rid-2"; }
-    grep -q "^ko-$rid-2" <<<"$names" && break
+      || { kill -9 -- "-$pid" 2>/dev/null || true; die "docker ps failed while waiting for ${prefix}-2"; }
+    grep -q "^${prefix}-2" <<<"$names" && break
     sleep 5
     waited=$((waited + 5))
     if [ "$waited" -ge 900 ]; then
       kill -9 -- "-$pid" 2>/dev/null || true
-      die "cluster 2's container never appeared under ko-$rid (waited ${waited}s)"
+      die "cluster 2's container never appeared under $prefix (waited ${waited}s)"
     fi
   done
   kill -9 -- "-$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true
@@ -871,21 +981,21 @@ gate_failure() {
   # scope step's OWN file, which is what a consumer's
   # steps.scope.outputs.* reads — and clusters was never emitted,
   # because the clusters step never ran.
-  [ "$(github_output_get "$work/step-outputs/scope.output" prefix)" = "ko-$rid" ] \
-    || die "prefix missing from the scope step's outputs of the killed run"
+  [[ "$prefix" =~ ^ko-$rid-[0-9]+$ ]] \
+    || die "prefix missing (or wrong shape) in the scope step's outputs of the killed run: '$prefix'"
   [ "$(github_output_get "$work/step-outputs/scope.output" state_root)" = "$work/runner-temp/kind-ocp" ] \
     || die "state_root missing (or wrong) in the scope step's outputs of the killed run"
   [ ! -e "$work/step-outputs/clusters.output" ] \
     || die "a clusters output exists despite the create being killed mid-run"
   names="$(docker ps -a --format '{{.Names}}')" || die "docker ps failed while checking the half-created prefix"
-  grep -q "^ko-$rid-" <<<"$names" || die "no half-created containers to clean"
-  [ -e "$work/runner-temp/kind-ocp/ko-$rid" ] || die "no half-created state dir to clean"
+  grep -q "^${prefix}-" <<<"$names" || die "no half-created containers to clean"
+  [ -e "$work/runner-temp/kind-ocp/$prefix" ] || die "no half-created state dir to clean"
   pass "half-created prefix is real (containers + state) and scope outputs were exposed"
 
   # Delete self-sufficiently: fresh step context, kind-ocp resolving
   # only through the delete action's own install step.
-  run_delete_action "$GATE_ROOT/failure-delete" "ko-$rid" "$work/runner-temp/kind-ocp"
-  assert_clean "$work" "ko-$rid" "$work/runner-temp/kind-ocp"
+  run_delete_action "$GATE_ROOT/failure-delete" "$prefix" "$work/runner-temp/kind-ocp"
+  assert_clean "$work" "$prefix" "$work/runner-temp/kind-ocp"
 }
 
 gate_spaced() {
@@ -899,7 +1009,8 @@ gate_spaced() {
   local prefix clusters name kc
   prefix="$(github_output_get "$work/step-outputs/scope.output" prefix)"
   clusters="$(github_output_get "$work/step-outputs/clusters.output" clusters)"
-  [ "$prefix" = "ko-$rid" ] || die "default prefix not derived from the run id: '$prefix'"
+  [[ "$prefix" =~ ^ko-$rid-[0-9]+$ ]] \
+    || die "default prefix not derived from the run id plus a per-invocation component: '$prefix'"
   jq -e . >/dev/null <<<"$clusters" || die "spaced state root broke the clusters JSON"
   [ "$(jq 'length' <<<"$clusters")" = 2 ] || die "expected 2 clusters under the spaced state root"
   for name in $(jq -r 'keys[]' <<<"$clusters"); do
@@ -916,7 +1027,7 @@ gate_spaced() {
 }
 
 usage() {
-  sed -n '2,69p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,74p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-}" in

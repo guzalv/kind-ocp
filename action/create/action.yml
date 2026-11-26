@@ -21,6 +21,16 @@
 #     workflow commands from stderr too, so a rejected multiline
 #     prefix echoed back could inject one (a legacy set-output
 #     writing the prefix output the always() delete consumes).
+#   - The same rule covers tool diagnostics that embed an input
+#     verbatim: kind-ocp renders the config path unquoted
+#     (`config file <path>: …`) and go renders the module@version
+#     operand unquoted, so a multiline value would put its later
+#     lines at line starts in the step log, where the runner
+#     parses `::` workflow commands. Both inputs are refused
+#     unless single-line, with the same fixed messages. count,
+#     profile, and the prefix need no such guard: their tools
+#     quote them (%q), which renders a newline escaped on one
+#     line.
 #   - Outputs are single-line `key=value` directives. A state_root
 #     carrying CR or LF is refused outright (spaces stay supported),
 #     so no value can inject extra output lines.
@@ -57,8 +67,10 @@ inputs:
   prefix:
     description: >-
       Cluster name prefix; clusters are <prefix>-<i>. Empty derives
-      ko-<run id>. Must satisfy kind-ocp's prefix rules: lowercase
-      alphanumeric and '-', 1-40 chars.
+      ko-<run id>-<random>, unique per invocation, so two default
+      creates in one job never share a scope. Must satisfy
+      kind-ocp's prefix rules: lowercase alphanumeric and '-',
+      1-40 chars.
     default: ''
   state_root:
     description: >-
@@ -72,11 +84,13 @@ inputs:
       workspace — the directory this action's steps run in; a
       job-level defaults.run.working-directory does not reach
       composite-action steps. Empty passes --config '' (no
-      config-file lookup at all).
+      config-file lookup at all). Must be a single line (CR/LF
+      refused).
     default: ''
   kind_ocp_version:
     description: >-
       Released kind-ocp version the action installs with go install.
+      Must be a single line (CR/LF refused).
     default: 'v0.1.1'
   go_version:
     description: >-
@@ -112,7 +126,16 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        prefix="${INPUT_PREFIX:-ko-${GITHUB_RUN_ID:?GITHUB_RUN_ID is not set}}"
+        # The default prefix must be unique per invocation, not per
+        # run: two default creates in one job share GITHUB_RUN_ID,
+        # and a shared prefix would let the second reuse the first's
+        # clusters and either delete target both sets. Two bash
+        # RANDOM draws (30 bits) per resolution keep them distinct;
+        # an explicit prefix is preserved verbatim (deterministic,
+        # caller-chosen). The delete action requires create's
+        # prefix output instead of deriving one, so this stays
+        # local to create.
+        prefix="${INPUT_PREFIX:-ko-${GITHUB_RUN_ID:?GITHUB_RUN_ID is not set}-${RANDOM}${RANDOM}}"
         state_root="${INPUT_STATE_ROOT:-${RUNNER_TEMP:?RUNNER_TEMP is not set}/kind-ocp}"
 
         # Mirror config.ValidatePrefix (^[a-z0-9]([-a-z0-9]*[a-z0-9])?$,
@@ -170,6 +193,16 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
+        # go renders the module@version operand unquoted in its own
+        # diagnostics, so a multiline kind_ocp_version would put its
+        # later lines at line starts in this step's log — where the
+        # runner parses `::` workflow commands. Refuse the shape;
+        # never echo it.
+        case "${INPUT_KIND_OCP_VERSION:-}" in
+          *$'\r'*|*$'\n'*)
+            echo "kind_ocp_version must be a single line (no CR or LF)" >&2
+            exit 1 ;;
+        esac
         # GOBIN pinned to a runner-local directory, and that same
         # directory published below: an ambient GOBIN (a calling
         # workflow's, or the runner's) must not decide where the
@@ -189,6 +222,16 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
+        # kind-ocp renders the config path unquoted in its own
+        # diagnostic (`config file <path>: …`), so a multiline
+        # value would put its later lines at line starts in this
+        # step's log — where the runner parses `::` workflow
+        # commands. Refuse the shape; never echo it.
+        case "${INPUT_CONFIG:-}" in
+          *$'\r'*|*$'\n'*)
+            echo "config must be a single line (no CR or LF)" >&2
+            exit 1 ;;
+        esac
         # The action's contract is its inputs, not the runner's
         # ambient environment: neutralize any KIND_OCP_* the calling
         # workflow carries.
@@ -207,6 +250,13 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
+        # See "Create the clusters": a multiline config path must
+        # be refused before it can reach kind-ocp's diagnostics.
+        case "${INPUT_CONFIG:-}" in
+          *$'\r'*|*$'\n'*)
+            echo "config must be a single line (no CR or LF)" >&2
+            exit 1 ;;
+        esac
         unset KIND_OCP_CONFIG KIND_OCP_PREFIX KIND_OCP_COUNT KIND_OCP_PROFILE
         command -v jq >/dev/null 2>&1 || {
           echo "jq is required to compose the clusters output (preinstalled on GitHub-hosted runners)" >&2
@@ -243,6 +293,13 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
+        # See "Create the clusters": a multiline config path must
+        # be refused before it can reach kind-ocp's diagnostics.
+        case "${INPUT_CONFIG:-}" in
+          *$'\r'*|*$'\n'*)
+            echo "config must be a single line (no CR or LF)" >&2
+            exit 1 ;;
+        esac
         unset KIND_OCP_CONFIG KIND_OCP_PREFIX KIND_OCP_COUNT KIND_OCP_PROFILE
         args=(--config "${INPUT_CONFIG:-}" --prefix "$KIND_OCP_ACTION_PREFIX" --state-root "$KIND_OCP_ACTION_STATE_ROOT")
         # Any FAIL exits non-zero and fails the step.

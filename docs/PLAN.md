@@ -725,9 +725,11 @@ cluster (a deliberate scope cut).
   it); installs the pinned `kind-ocp` release (go install at a tag);
   runs `create` + `verify`; and emits a JSON output keyed by cluster
   name carrying kubeconfig paths and contexts — never credential
-  content. The prefix defaults to a unique per-invocation value derived
-  from the run ID: a name prefix is not isolation on a shared Docker
-  daemon, so the actions assume ephemeral hosted runners. `delete`
+  content. The prefix defaults to a value unique per invocation —
+  the run ID plus a random component (`ko-<run id>-<random>`) — so
+  two default creates in one job never share a scope: a name
+  prefix is not isolation on a shared Docker daemon, so the
+  actions assume ephemeral hosted runners. `delete`
   runs `kind-ocp delete` and is designed for `if: always()`. No
   caching initially — restoring a cache directory leaves the state
   prefix populated without its marker, which the state store refuses.
@@ -800,9 +802,12 @@ Components:
   the two setup-go pins cannot drift apart. Scenarios: `yaml`
   (parse; pins resolve; injection, wiring, and step-sequence
   invariants), `smoke` (exact per-step wiring and the action
-  outputs mapping; supplied and default inputs behave; a CR/LF
-  state_root is refused before any output directive is written;
-  delete enforces its required prefix), `e2e` (default-input
+  outputs mapping; supplied and default inputs behave, and the
+  default prefix is unique per invocation under one run id; a
+  CR/LF state_root, a multiline prefix, a multiline config path,
+  a multiline kind-ocp version, and a multiline delete-side
+  prefix or state_root are refused without the raw value reaching
+  the log; delete enforces its required prefix), `e2e` (default-input
   create of 2 full-profile clusters, the full output contract,
   verify-failure propagation via a sabotaged check, a
   credential-leak grep over step logs and outputs, the planted
@@ -814,7 +819,8 @@ Components:
   kubeconfigs usable). It plants ambient `KIND_OCP_*` values
   around every step to prove the scripts neutralize them, gives
   every run a fresh mktemp scratch root and a unique run id
-  (derived prefixes never collide across runs), and keeps the
+  (derived prefixes never collide across runs or invocations),
+  and keeps the
   scratch root for inspection on failure. Not used by CI; the move
   handoff moves it to `tools/`.
 
@@ -833,9 +839,15 @@ Contract decisions:
   every expansion. `local-gate.sh yaml` enforces the no-`${{ }}`
   invariant; the gate's `smoke` scenario fails if a mapping is
   removed or points at the wrong input.
-- The prefix default is `ko-<run id>` (a name prefix is not
-  isolation; on an ephemeral runner uniqueness needs only run
-  identity). The scope step validates it by mirroring
+- The prefix default is `ko-<run id>-<random>` (the run id plus
+  two bash `RANDOM` draws — 30 bits): the run id alone is not
+  invocation-unique, and two default creates in one job would
+  share a scope — the second reusing the first's clusters, either
+  delete targeting both sets. An explicit prefix is preserved
+  verbatim; a name prefix is not isolation, and on an ephemeral
+  runner run identity plus per-invocation entropy is all the
+  uniqueness a default needs. The scope step validates it by
+  mirroring
   `config.ValidatePrefix` with shell globs — not a line-oriented
   regex, which could let a value containing a newline match one
   clean line and inject arbitrary lines into GITHUB_OUTPUT.
@@ -849,6 +861,19 @@ Contract decisions:
   no value can inject extra output lines. The state-root default
   is `<RUNNER_TEMP>/kind-ocp`: runner-private, wiped between jobs,
   and a location nothing should cache.
+- Inputs whose value a tool echoes verbatim in its own
+  diagnostics are refused unless single-line, on both actions:
+  the config path (kind-ocp renders `config file <path>: …`
+  unquoted), the kind-ocp version (go renders the module@version
+  operand unquoted), and the delete-side prefix and state root
+  (kind-ocp prints `state cleared under <root>` unquoted, and os
+  errors carry paths verbatim). The runner parses `::` workflow
+  commands from the step log, so a multiline value echoed through
+  a tool's diagnostic injects exactly like a refusal echo would;
+  the refusals use fixed messages and never echo the value.
+  count, profile, and the create-side prefix need no such guard
+  because their tools quote them (%q renders a newline escaped on
+  one line).
 - The install steps pin `GOBIN` to `<RUNNER_TEMP>/kind-ocp-bin`
   and publish that same directory through GITHUB_PATH: an ambient
   `GOBIN` (the calling workflow's, or the runner's) must not
