@@ -28,16 +28,20 @@ The pin table itself lives in the root README ("Defaults and pins").
 ## Lint toolchain
 
 `make lint` needs a golangci-lint binary built with a Go at least as
-new as the module's `go` directive (currently 1.27.4). A binary built
-with an older Go refuses to load the module — the v0.1.0 clean-machine
-install test hit exactly that with a golangci-lint built with go1.25.
-Check yours with `golangci-lint --version`, which prints the Go it was
-built with; when it is too old, install one built with go1.27.4 or
-newer — building the same version from source with the local toolchain
+new as the module's language version — the minor version of the `go`
+directive, currently 1.27. The patch release is not the boundary: a
+binary built with go1.27.2 lints this go1.27.4 module fine (the
+language is the same, and the go command switches to the module's
+toolchain via GOTOOLCHAIN). A binary built with an older minor refuses
+to load the module — the v0.1.0 clean-machine install test hit exactly
+that with a golangci-lint built with go1.25. Check yours with
+`golangci-lint --version`, which prints the Go it was built with; when
+it is too old, build the pinned version from source with a current
+local toolchain
 (`go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0`)
-is the reliable way, since a prebuilt release carries whatever Go its
-maintainers built it with. CI installs the pinned version through the
-golangci-lint action (see the workflow).
+— the reliable way to control the build Go, since a prebuilt release
+carries whatever Go its maintainers built it with. CI installs the
+pinned version through the golangci-lint action (see the workflow).
 
 ## CI
 

@@ -710,6 +710,14 @@ convention): the seven packages fail before the fix and the full
 suite passes after it, run under `umask 002` with `TMPDIR` pointed at
 a user-owned group-writable non-sticky directory.
 
+The review pass tightened the remedies: the chmod operand is
+shell-quoted, so a state-root chain containing spaces pastes into a
+shell as printed, and a directory with both write bits set (0777) is
+told `chmod go-w` — `chmod g-w` alone would leave it 0757, still
+refused. The maintenance doc's lint-toolchain requirement states the
+real boundary, the `go` directive's language (minor) version: a
+go1.27.2-built binary lints this go1.27.4 module fine.
+
 ## 6. Testing strategy
 
 - Unit (no Docker): config resolution and precedence, per-cluster overrides,

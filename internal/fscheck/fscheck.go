@@ -34,6 +34,8 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+
+	"github.com/guzalv/kind-ocp/internal/shell"
 )
 
 // CheckPrivateFile verifies that path is a regular file, owned by the
@@ -150,13 +152,20 @@ func CheckAncestorDir(path string) error {
 	if mode&fs.ModeSticky == 0 {
 		// Without the sticky bit, write access for anyone but the
 		// owner means another local user can substitute entries.
-		if perm&0o020 != 0 {
+		// The remedy clears exactly the write bits that are set —
+		// go-w when both are, so the one command leaves the policy
+		// satisfied — and quotes the path, so a directory name
+		// with spaces pastes into a shell as printed.
+		switch perm & 0o022 {
+		case 0o022:
+			return fmt.Errorf("%w: %s is group- and world-writable (mode %04o); fix with chmod go-w %s",
+				ErrUnsafeAncestor, path, perm, shell.Quote(path))
+		case 0o020:
 			return fmt.Errorf("%w: %s is group-writable (mode %04o); fix with chmod g-w %s",
-				ErrUnsafeAncestor, path, perm, path)
-		}
-		if perm&0o002 != 0 {
+				ErrUnsafeAncestor, path, perm, shell.Quote(path))
+		case 0o002:
 			return fmt.Errorf("%w: %s is world-writable (mode %04o); fix with chmod o-w %s",
-				ErrUnsafeAncestor, path, perm, path)
+				ErrUnsafeAncestor, path, perm, shell.Quote(path))
 		}
 	}
 	return checkAncestorACL(path)

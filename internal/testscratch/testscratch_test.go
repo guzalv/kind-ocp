@@ -85,6 +85,18 @@ func TestHermeticRepointsAPolicyRefusedChain(t *testing.T) {
 	if _, err := fscheck.ResolveDir(scratch); err != nil {
 		t.Errorf("ResolveDir(scratch) = %v, want the replacement chain accepted", err)
 	}
+	// And the re-point must not weaken what the policy refuses: a
+	// directory under the chain that triggered it still fails
+	// ResolveDir afterwards. The helper fixes where tests scratch,
+	// not what the boundary refuses — the wired packages' own
+	// refusal regressions pin that end to end.
+	refused := filepath.Join(bad, "p")
+	if err := os.Mkdir(refused, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fscheck.ResolveDir(refused); err == nil {
+		t.Error("ResolveDir below the refused chain = nil after the re-point, want the refusal to stand")
+	}
 }
 
 // On a healthy ambient chain nothing changes: no re-point, no
@@ -111,21 +123,5 @@ func TestHermeticLeavesAHealthyChainAlone(t *testing.T) {
 	}
 	if got := os.Getenv("TMPDIR"); got != base {
 		t.Errorf("TMPDIR = %q, want it untouched at %q", got, base)
-	}
-}
-
-// A deliberately unsafe construction inside a scratch base still fails
-// the policy after the re-point: the helper fixes where tests scratch,
-// not what the boundary refuses (the B2 guarantee — the seven
-// packages' own refusal regressions pin it end to end).
-func TestHermeticDoesNotWeakenDeliberateRefusals(t *testing.T) {
-	restoreEnv(t)
-	bad := makeBadChain(t)
-	state := filepath.Join(bad, "p")
-	if err := os.Mkdir(state, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := fscheck.ResolveDir(state); err == nil {
-		t.Fatal("ResolveDir below a group-writable non-sticky ancestor = nil, want the refusal")
 	}
 }

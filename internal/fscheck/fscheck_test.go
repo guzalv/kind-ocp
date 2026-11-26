@@ -173,15 +173,36 @@ func TestCheckAncestorDir(t *testing.T) {
 		}
 	})
 
-	t.Run("world-writable dir is rejected", func(t *testing.T) {
-		// 0777 is group-writable too; either rejection names the
-		// problem and carries its chmod remedy. The sticky-bit subtest
-		// covers the passing case.
+	t.Run("group- and world-writable dir is rejected with one fix", func(t *testing.T) {
+		// 0777 sets both write bits: the remedy must clear them
+		// together — chmod g-w alone would leave 0757, still
+		// world-writable — and applying the printed command must
+		// leave the directory acceptable to the policy.
 		d := makeDir(t, filepath.Join(dir, "a777"), 0o777)
 		err := CheckAncestorDir(d)
-		wantErr(t, err, "writable")
-		if !strings.Contains(err.Error(), "chmod g-w "+d) && !strings.Contains(err.Error(), "chmod o-w "+d) {
-			t.Errorf("CheckAncestorDir(0777) = %v, want a chmod remedy naming %s", err, d)
+		wantErr(t, err, "group- and world-writable")
+		if !errors.Is(err, ErrUnsafeAncestor) {
+			t.Errorf("CheckAncestorDir(0777) = %v, want an ErrUnsafeAncestor chain", err)
+		}
+		if !strings.Contains(err.Error(), "chmod go-w "+d) {
+			t.Errorf("CheckAncestorDir(0777) = %v, want the chmod go-w remedy naming %s", err, d)
+		}
+		if err := os.Chmod(d, 0o777&^0o022); err != nil {
+			t.Fatal(err)
+		}
+		if err := CheckAncestorDir(d); err != nil {
+			t.Errorf("CheckAncestorDir after the recommended fix = %v, want nil", err)
+		}
+	})
+
+	t.Run("spaced path remedy is quoted", func(t *testing.T) {
+		// The remedy must paste into a shell as printed: a path
+		// containing spaces is rendered as a single-quoted word.
+		d := makeDir(t, filepath.Join(dir, "has space"), 0o775)
+		err := CheckAncestorDir(d)
+		wantErr(t, err, "group-writable")
+		if !strings.Contains(err.Error(), "chmod g-w '"+d+"'") {
+			t.Errorf("CheckAncestorDir(0775 spaced) = %v, want the chmod g-w remedy single-quoting %s", err, d)
 		}
 	})
 
