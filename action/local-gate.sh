@@ -35,11 +35,12 @@
 # values are planted around every step: the scripts must neutralize
 # the first and override the second.
 #
-# The gate calls the actions' run steps through explicit name
-# sequences (CREATE_RUN_STEPS / DELETE_RUN_STEPS); the yaml scenario
-# checks those sequences against the action.yml files, so a step
-# added to an action without a gate call fails the gate instead of
-# never running.
+# The step arrays (CREATE_RUN_STEPS / DELETE_RUN_STEPS) are the
+# single source of the gate's call sequence: the yaml scenario
+# asserts each array equals the action.yml's declared run steps,
+# and the drivers iterate the arrays, so a step the action declares
+# is either missing from its array (yaml fails) or has no driver
+# branch (the run dies) — it cannot silently never run.
 #
 # Scenarios (argument; `all` runs them in order):
 #   yaml    A: staged YAML parses; remote pins resolve on GitHub;
@@ -124,9 +125,10 @@ P_END=' }}'
 # The GITHUB_RUN_ID of the current action run.
 CURRENT_RUN_ID="$RUN_ID"
 
-# The gate's explicit step sequences: every run step of each action,
-# by name, in order. The yaml scenario asserts the sequences equal
-# the action.yml run steps.
+# The gate's step sequences: every run step of each action, by
+# name, in order — the single source of the call sequence. The
+# yaml scenario asserts each array equals the action.yml's run
+# steps; the drivers iterate the arrays.
 CREATE_RUN_STEPS=(
   "Resolve the scope"
   "Install kind-ocp"
@@ -374,24 +376,24 @@ with_input() {
 run_step() {
   local action="$1" want="$2" work="$3" tag="$4"
   shift 4
-  local yml steps_json n i idx=-1 step script id out log rc=0 kv
+  local yml step script id out log rc=0 kv
   local expected_keys supplied_keys
   yml="$ACTIONS_DIR/$action/action.yml"
-  steps_json="$work/.steps-$action.json"
-  yq -o=json '.runs.steps' "$yml" >"$steps_json" \
+  # Name selection: ONE yq query by name — strenv reads GATE_STEP
+  # from this command's environment. Wrapping the matches in an
+  # array yields a single JSON document, and requiring EXACTLY one
+  # match makes a duplicated step name fail here instead of
+  # silently running whichever answered first.
+  step="$(GATE_STEP="$want" yq -o=json \
+    '[.runs.steps[] | select(.name == strenv(GATE_STEP))]' "$yml")" \
     || die "cannot read the steps of $yml"
-  n="$(jq 'length' <"$steps_json")"
-  for ((i = 0; i < n; i++)); do
-    if [ "$(jq -r ".[$i].name // empty" <"$steps_json")" = "$want" ]; then
-      idx=$i; break
-    fi
-  done
-  [ "$idx" -ge 0 ] || die "no step named '$want' in $yml"
-  step="$(jq -c ".[$idx]" <"$steps_json")"
+  [ "$(jq 'length' <<<"$step")" -eq 1 ] \
+    || die "$yml: expected exactly one step named '$want' (found $(jq 'length' <<<"$step"))"
+  step="$(jq -c '.[0]' <<<"$step")"
   check_step "$action" "$step" "$yml"
   script="$(jq -r '.run' <<<"$step")"
   id="$(jq -r '.id // ""' <<<"$step")"
-  out="$work/step-outputs/${id:-$idx}.output"
+  out="$work/step-outputs/${id:-$(printf '%s' "$want" | tr ' /' '__')}.output"
   # The supplied values must cover exactly the recorded key set.
   # Keys are taken per argument (values may span lines — the CR/LF
   # probe supplies one), so a missing or extra mapping is a gate-side
@@ -405,7 +407,7 @@ $expected_keys
 --- supplied ---
 $supplied_keys"
   : >"$out"
-  log="$work/logs/$(printf '%02d%s-%s' "$((idx + 1))" "$tag" "$want" | tr ' /' '__').log"
+  log="$work/logs/$tag$(printf '%s' "$want" | tr ' /' '__').log"
   echo "--- step: $want"
   (
     for kv in "$@"; do
@@ -436,15 +438,18 @@ $supplied_keys"
 }
 
 # run_create_action WORK RUN_ID [WITH...] — the create action's run
-# steps, called by name in order (Set up Go is uses:; the harness
-# provides Go, standing in for actions/setup-go). WITH entries
-# (KEY=VALUE) stand for a consumer's `with:`; inputs without an
-# override fall back to the action.yml's declared defaults. The
-# scope step's own outputs feed the later steps, exactly what the
-# asserted `${{ steps.scope.outputs.* }}` env wiring delivers on a
-# real runner. Returns the first failing step's exit status, or 0.
+# steps, in CREATE_RUN_STEPS order. The array is the single source
+# of the call sequence (see its comment); this driver iterates it,
+# and a step of the array without a branch below dies instead of
+# never running. (Set up Go is uses:; the harness provides Go,
+# standing in for actions/setup-go.) WITH entries (KEY=VALUE)
+# stand for a consumer's `with:`; inputs without an override fall
+# back to the action.yml's declared defaults. The scope step's own
+# outputs feed the later steps, exactly what the asserted
+# `${{ steps.scope.outputs.* }}` env wiring delivers on a real
+# runner. Returns the first failing step's exit status, or 0.
 run_create_action() {
-  local work="$1" yml="$CREATE_YML"
+  local work="$1" yml="$CREATE_YML" step
   CURRENT_RUN_ID="$2"
   shift 2
   fresh_work "$work"
@@ -455,43 +460,68 @@ run_create_action() {
   profile="$(with_input "$yml" profile "$@")" || return 1
   config="$(with_input "$yml" config "$@")" || return 1
   version="$(with_input "$yml" kind_ocp_version "$@")" || return 1
-  run_step create "Resolve the scope" "$work" "" \
-    "INPUT_PREFIX=$prefix" "INPUT_STATE_ROOT=$state_root" || return $?
-  local scope_prefix scope_root
-  scope_prefix="$(github_output_get "$work/step-outputs/scope.output" prefix)" || return 1
-  scope_root="$(github_output_get "$work/step-outputs/scope.output" state_root)" || return 1
-  [ -n "$scope_prefix" ] || die "the scope step emitted no prefix"
-  [ -n "$scope_root" ] || die "the scope step emitted no state_root"
-  run_step create "Install kind-ocp" "$work" "" \
-    "INPUT_KIND_OCP_VERSION=$version" || return $?
-  local scope_env=(
-    "KIND_OCP_ACTION_PREFIX=$scope_prefix"
-    "KIND_OCP_ACTION_STATE_ROOT=$scope_root"
-  )
-  run_step create "Create the clusters" "$work" "" \
-    "INPUT_COUNT=$count" "INPUT_PROFILE=$profile" "INPUT_CONFIG=$config" \
-    "${scope_env[@]}" || return $?
-  run_step create "Emit the clusters output" "$work" "" \
-    "INPUT_CONFIG=$config" "${scope_env[@]}" || return $?
-  run_step create "Verify the clusters" "$work" "" \
-    "INPUT_CONFIG=$config" "${scope_env[@]}" || return $?
+  local scope_prefix scope_root scope_env
+  for step in "${CREATE_RUN_STEPS[@]}"; do
+    case "$step" in
+      "Resolve the scope")
+        run_step create "$step" "$work" "" \
+          "INPUT_PREFIX=$prefix" "INPUT_STATE_ROOT=$state_root" || return $?
+        scope_prefix="$(github_output_get "$work/step-outputs/scope.output" prefix)" || return 1
+        scope_root="$(github_output_get "$work/step-outputs/scope.output" state_root)" || return 1
+        [ -n "$scope_prefix" ] || die "the scope step emitted no prefix"
+        [ -n "$scope_root" ] || die "the scope step emitted no state_root"
+        scope_env=(
+          "KIND_OCP_ACTION_PREFIX=$scope_prefix"
+          "KIND_OCP_ACTION_STATE_ROOT=$scope_root"
+        )
+        ;;
+      "Install kind-ocp")
+        run_step create "$step" "$work" "" \
+          "INPUT_KIND_OCP_VERSION=$version" || return $?
+        ;;
+      "Create the clusters")
+        run_step create "$step" "$work" "" \
+          "INPUT_COUNT=$count" "INPUT_PROFILE=$profile" "INPUT_CONFIG=$config" \
+          "${scope_env[@]}" || return $?
+        ;;
+      "Emit the clusters output" | "Verify the clusters")
+        run_step create "$step" "$work" "" \
+          "INPUT_CONFIG=$config" "${scope_env[@]}" || return $?
+        ;;
+      *)
+        die "create step '$step' has no driver branch — the gate's recorded call sequence is stale"
+        ;;
+    esac
+  done
 }
 
-# run_delete_action WORK PREFIX STATE_ROOT — the delete action's run
-# steps from a fresh step context (empty GITHUB_PATH, so kind-ocp
-# resolves only through the delete action's own install step), fed
-# like the consumer's if: always() pattern: create's outputs as
-# inputs.
+# run_delete_action WORK PREFIX STATE_ROOT — the delete action's
+# run steps, in DELETE_RUN_STEPS order (the single source of the
+# call sequence, as with run_create_action), from a fresh step
+# context (empty GITHUB_PATH, so kind-ocp resolves only through
+# the delete action's own install step), fed like the consumer's
+# if: always() pattern: create's outputs as inputs.
 run_delete_action() {
-  local work="$1" prefix="$2" state_root="$3" yml="$DELETE_YML" version
+  local work="$1" prefix="$2" state_root="$3" yml="$DELETE_YML" version step
   CURRENT_RUN_ID="${RUN_ID}9"
   fresh_work "$work"
   version="$(declared_default "$yml" kind_ocp_version)" || return 1
-  run_step delete "Install kind-ocp" "$work" "" "INPUT_KIND_OCP_VERSION=$version" \
-    || die "the delete action failed at 'Install kind-ocp' (see the step log above)"
-  run_step delete "Delete the clusters" "$work" "" \
-    "INPUT_PREFIX=$prefix" "INPUT_STATE_ROOT=$state_root" \
-    || die "the delete action failed at 'Delete the clusters' (see the step log above)"
+  for step in "${DELETE_RUN_STEPS[@]}"; do
+    case "$step" in
+      "Install kind-ocp")
+        run_step delete "$step" "$work" "" "INPUT_KIND_OCP_VERSION=$version" \
+          || die "the delete action failed at '$step' (see the step log above)"
+        ;;
+      "Delete the clusters")
+        run_step delete "$step" "$work" "" \
+          "INPUT_PREFIX=$prefix" "INPUT_STATE_ROOT=$state_root" \
+          || die "the delete action failed at '$step' (see the step log above)"
+        ;;
+      *)
+        die "delete step '$step' has no driver branch — the gate's recorded call sequence is stale"
+        ;;
+    esac
+  done
 }
 
 # assert_clean WORK PREFIX STATE_ROOT — no <prefix>-* containers, no
@@ -602,9 +632,11 @@ $bad"
   [ -z "$repos" ] || die "one repo pinned at multiple SHAs across the actions and the self-test:
 $repos"
   pass "every remote pin resolves on GitHub; one SHA per repo across the actions and the self-test"
-  # The gate's explicit step sequences must list every run step the
-  # actions declare, in order: a step added to an action.yml without
-  # a gate call fails here instead of silently never running.
+  # The gate's step arrays are the single source of the driver
+  # call sequence (the drivers iterate them): a step the action
+  # declares is either missing from its array — fails HERE — or
+  # has no driver branch — dies at the first run. It cannot
+  # silently never run.
   local declared
   declared="$(yq -r '.runs.steps[] | select(.run != null) | .name' "$CREATE_YML")"
   [ "$declared" = "$(printf '%s\n' "${CREATE_RUN_STEPS[@]}")" ] \
@@ -614,7 +646,7 @@ $declared"
   [ "$declared" = "$(printf '%s\n' "${DELETE_RUN_STEPS[@]}")" ] \
     || die "$DELETE_YML: the declared run steps and the gate's DELETE_RUN_STEPS differ:
 $declared"
-  pass "the gate's explicit step sequences cover every declared run step, in order"
+  pass "the step arrays (the drivers' call sequence, iterated) equal the declared run steps, in order"
 }
 
 gate_smoke() {
@@ -861,7 +893,7 @@ gate_spaced() {
 }
 
 usage() {
-  sed -n '2,68p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,69p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-}" in

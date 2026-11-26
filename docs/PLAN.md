@@ -784,10 +784,14 @@ Components:
   GITHUB_OUTPUT file read explicitly (what the asserted
   `${{ steps.scope.outputs.* }}` wiring delivers on a real
   runner), and inputs a scenario does not pin fall back to the
-  action.yml's declared defaults. The gate calls the steps through
-  explicit name sequences checked against the action.yml files,
-  so a step added without a gate call fails instead of never
-  running. Its `yaml` scenario also resolves every remote `uses:`
+  action.yml's declared defaults. Its step arrays
+  (CREATE_RUN_STEPS / DELETE_RUN_STEPS) are the single source of
+  the call sequence — the `yaml` scenario asserts each array
+  equals the action.yml's declared run steps, and the drivers
+  iterate the arrays — so a step the action declares cannot
+  silently never run: missing from the array fails `yaml`;
+  present in the array but without a driver branch dies at the
+  first run. Its `yaml` scenario also resolves every remote `uses:`
   pin against api.github.com — a correctly-shaped SHA can still
   name no commit, and a review round caught exactly such a typo in
   the delete action's setup-go pin — over the two actions and the
