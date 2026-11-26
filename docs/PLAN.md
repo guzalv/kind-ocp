@@ -562,6 +562,7 @@ the table.
 | 8 | CO fitness proof + CI | `internal/verify/compliance` (semantics and gate behavior: §6); scc-admission image build moved behind `provider.ImageBuilder` — no layer invokes a container-runtime CLI directly; CI: lint + unit on every PR, integration behind the `integration` label, `workflow_dispatch`, nightly; actions SHA-pinned, workflow-level `contents: read`, no secrets. | `internal/verify/compliance` tests; `.github/workflows/ci.yaml` |
 | 9 | StackRox example | `examples/stackrox` — recipe design and boundary rules: §5.1. | example unit tests (no Docker, no helm, no network) |
 | 10 | Usability and honesty pass | Expected-vs-inventory count assertion (§3.6) with its regressions; example values-override flags and their refusal rules (§5.1); README honesty, prerequisites, recovery decision tree, performance budget (the README is the artifact; numbers in §6). | `kindocp` count-assertion regressions; `examples/stackrox` override regressions |
+| 11 | Cold-machine findings | Refusal remedies + umask-002 docs; hermetic test scratch chains (§5.3); unselected-profile layer validation; scc-shortname, lint-toolchain, disk-footprint docs (§5.3). | §5.3 |
 
 ### 5.1 StackRox example (increment 9)
 
@@ -645,6 +646,50 @@ their refusal rules (operands with comma/quote/newline/CR, overrides
 inside the workspace or the run's state tree, hard-linked files,
 case-colliding spellings) are pinned by regressions in
 `examples/stackrox`.
+
+### 5.3 Cold-machine findings (increment 11)
+
+Findings from the first clean-machine install test (v0.1.0, Ubuntu,
+umask 002 — the Debian usergroups default). The state-tree privacy
+policy is correct by design and stays; the gap is that its refusals
+meet the most common Linux default with no remedy offered.
+
+- **State root on umask-002 distros (the defect)**: `~/.local` exists
+  0775 (created by other tooling under umask 002), so the default state
+  root `~/.local/state/kind-ocp` is refused: "is group-writable". A
+  fresh machine is fine — the walk creates a missing `~/.local` as
+  0700 — but the refusal must carry its remedy (chmod g-w the
+  offending path, or point --state-root / XDG_STATE_HOME elsewhere),
+  and the README prerequisites must warn umask-002 users before they
+  hit it.
+- **Test hermeticity, same root cause**: 7 of 23 unit-test packages
+  (internal/cli, internal/state, internal/fscheck,
+  internal/provider/kind, kindocp, test/publicapi, examples/stackrox)
+  fail when the ambient TMPDIR chain contains a user-owned
+  group-writable non-sticky directory. The suites must be hermetic
+  against the ambient chain: a shared test helper that, when the
+  TMPDIR chain fails the ancestor policy, re-points the package's
+  scratch base to a 0700 directory directly under the system /tmp
+  (sticky — the policy deliberately tolerates it). Prove with the full
+  suite run under umask 002 with a group-writable TMPDIR.
+- **`kubectl get scc` shortname**: the pinned upstream SCC CRD
+  declares no shortNames, and adding one would diverge from the
+  digest-verified bytes. Document in the README (use the full
+  `securitycontextconstraints`); no code change.
+- **Unselected-profile validation**: a custom profile in the config
+  file whose layer list names an unknown layer errors only when that
+  profile is selected (`layers.LayerNamesForProfile`). Validate every
+  defined profile's layer names in the create path, so a typo in an
+  unselected profile fails fast. Regressions for selected and
+  unselected shapes.
+- **lint toolchain**: golangci-lint binaries built with go1.25 cannot
+  lint a go1.27.4 module. Document in docs/maintenance.md: install
+  golangci-lint built with go1.27.4.
+- **Disk footprint**: the README performance section states per-cluster
+  numbers but no total and no small-disk warning. Add both: a default
+  2-cluster run costs ~5 GB of images plus ~1.5 GB per cluster in
+  volumes, and a small disk caps the practical cluster count well
+  below the 64 limit.
 
 ## 6. Testing strategy
 
