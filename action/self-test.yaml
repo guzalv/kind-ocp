@@ -75,8 +75,13 @@ jobs:
           test "$(jq 'length' <<<"$CLUSTERS")" -eq 2
           # Values are paths and contexts, never credential content:
           # exactly the two documented keys, and no kubeconfig fields.
+          # (An explicit failing branch, not `! grep`: with set -e a
+          # negated command never fails the step.)
           jq -e 'to_entries | all(.value | (keys | sort) == ["context", "kubeconfig"])' <<<"$CLUSTERS" >/dev/null
-          ! grep -Eq 'client-certificate-data|client-key-data|token:' <<<"$CLUSTERS"
+          if grep -Eq 'client-certificate-data|client-key-data|token:' <<<"$CLUSTERS"; then
+            echo "the clusters output carries credential-looking content" >&2
+            exit 1
+          fi
           # Keys are exactly the clusters kind-ocp lists (kind-ocp is
           # on PATH: the create action's GITHUB_PATH write).
           listed="$(kind-ocp list --config '' --prefix "$PREFIX" --state-root "$STATE_ROOT" | awk 'NR>1 {print $1}' | sort)"
@@ -115,12 +120,18 @@ jobs:
           STATE_ROOT: ${{ steps.create.outputs.state_root }}
         run: |
           set -euo pipefail
-          # No <prefix>-<n> containers remain (kind names the node
-          # containers <cluster>-control-plane, so the pattern is
-          # prefix-shaped but not end-anchored; grep -c prints 0 and
-          # exits 1 on no match, which the || true keeps off set -e).
-          containers="$(docker ps -a --format '{{.Names}}' | grep -c "^${PREFIX}-[0-9]+" || true)"
-          test "$containers" -eq 0
+          # No <prefix>-* containers remain. The listing is captured
+          # first, so a Docker failure stays fatal (no pipe, no
+          # masking); PREFIX is validated [a-z0-9-]+ by the create
+          # action, so the anchor carries no regex metacharacters,
+          # and any name starting prefix-dash fails the step.
+          names="$(docker ps -a --format '{{.Names}}')"
+          leftovers="$(grep "^${PREFIX}-" <<<"$names" || true)"
+          if [ -n "$leftovers" ]; then
+            echo "::error::containers remain under prefix ${PREFIX}:"
+            printf '%s\n' "$leftovers"
+            exit 1
+          fi
           # kind-ocp lists nothing under the prefix (header only).
           rows="$(kind-ocp list --config '' --prefix "$PREFIX" --state-root "$STATE_ROOT" | tail -n +2 | wc -l | tr -d '[:space:]')"
           test "$rows" -eq 0

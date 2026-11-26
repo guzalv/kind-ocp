@@ -5,18 +5,21 @@
 # the matching delete action cleans up under `if: always()`.
 #
 # Security posture, fixed by design:
-#   - No `${{ }}` interpolation inside any `run:` script: every
-#     caller-controlled value crosses as an environment variable
-#     (automatic INPUT_* for the action's underscore-named inputs,
-#     step `env:` for values resolved by earlier steps), so input
-#     bytes are never parsed as shell language.
-#   - Every `run:` script sets `euo pipefail` and quotes every
-#     expansion; kind-ocp's and the tools' exit codes propagate.
+#   - No `${{ }}` interpolation inside any `run:` script. Composite
+#     run steps do not get automatic INPUT_* variables (GitHub
+#     documents this), so every input crosses through a step `env:`
+#     mapping (`INPUT_<NAME>: ${{ inputs.<name> }}`) and every value
+#     resolved by an earlier step through `env:` as well: input bytes
+#     are environment values, never script language, and the scripts
+#     quote every expansion.
+#   - Every `run:` script sets `euo pipefail`; kind-ocp's and the
+#     tools' exit codes propagate.
 #   - The prefix is validated with shell globs, not a line-oriented
 #     regex: a value containing a newline must not slip a
 #     line-oriented match through into GITHUB_OUTPUT.
-#   - Outputs are written in heredoc-delimiter form, so a value
-#     containing a newline cannot inject extra output lines.
+#   - Outputs are single-line `key=value` directives. A state_root
+#     carrying CR or LF is refused outright (spaces stay supported),
+#     so no value can inject extra output lines.
 #
 # STAGED FILE — this is the complete action, byte-for-byte, but it
 # does not live at its operative path yet: the automated sessions
@@ -95,6 +98,11 @@ runs:
   steps:
     - name: Resolve the scope
       id: scope
+      env:
+        # Composite run steps get no automatic INPUT_* variables;
+        # the env mapping is the wiring that carries each input in.
+        INPUT_PREFIX: ${{ inputs.prefix }}
+        INPUT_STATE_ROOT: ${{ inputs.state_root }}
       shell: bash
       run: |
         set -euo pipefail
@@ -117,17 +125,21 @@ runs:
           exit 1
         fi
 
+        # Outputs are single-line key=value directives, so a state
+        # root carrying CR or LF could inject further directives
+        # into GITHUB_OUTPUT — refuse it (spaces stay supported).
+        case "$state_root" in
+          *$'\r'*|*$'\n'*)
+            echo "state_root must be a single line (no CR or LF)" >&2
+            exit 1 ;;
+        esac
+
         # Emitted before anything that can fail, so an if: always()
         # delete can clean up a half-created prefix even when this
-        # action dies during setup. Heredoc-delimiter form: a value
-        # containing a newline cannot inject extra output lines.
+        # action dies during setup.
         {
-          echo "prefix<<KINDOCP_CREATE_EOF"
-          printf '%s\n' "$prefix"
-          echo "KINDOCP_CREATE_EOF"
-          echo "state_root<<KINDOCP_CREATE_EOF"
-          printf '%s\n' "$state_root"
-          echo "KINDOCP_CREATE_EOF"
+          printf 'prefix=%s\n' "$prefix"
+          printf 'state_root=%s\n' "$state_root"
         } >> "$GITHUB_OUTPUT"
 
     - name: Set up Go
@@ -141,14 +153,25 @@ runs:
         cache: false
 
     - name: Install kind-ocp
+      env:
+        INPUT_KIND_OCP_VERSION: ${{ inputs.kind_ocp_version }}
       shell: bash
       run: |
         set -euo pipefail
-        go install "github.com/guzalv/kind-ocp/cmd/kind-ocp@${INPUT_KIND_OCP_VERSION:?kind_ocp_version input is empty}"
-        echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+        # GOBIN pinned to a runner-local directory, and that same
+        # directory published below: an ambient GOBIN (a calling
+        # workflow's, or the runner's) must not decide where the
+        # binary lands or which one runs.
+        install_dir="${RUNNER_TEMP:?RUNNER_TEMP is not set}/kind-ocp-bin"
+        mkdir -p "$install_dir"
+        GOBIN="$install_dir" go install "github.com/guzalv/kind-ocp/cmd/kind-ocp@${INPUT_KIND_OCP_VERSION:?kind_ocp_version input is empty}"
+        printf '%s\n' "$install_dir" >> "$GITHUB_PATH"
 
     - name: Create the clusters
       env:
+        INPUT_COUNT: ${{ inputs.count }}
+        INPUT_PROFILE: ${{ inputs.profile }}
+        INPUT_CONFIG: ${{ inputs.config }}
         KIND_OCP_ACTION_PREFIX: ${{ steps.scope.outputs.prefix }}
         KIND_OCP_ACTION_STATE_ROOT: ${{ steps.scope.outputs.state_root }}
       shell: bash
@@ -166,6 +189,7 @@ runs:
     - name: Emit the clusters output
       id: clusters
       env:
+        INPUT_CONFIG: ${{ inputs.config }}
         KIND_OCP_ACTION_PREFIX: ${{ steps.scope.outputs.prefix }}
         KIND_OCP_ACTION_STATE_ROOT: ${{ steps.scope.outputs.state_root }}
       shell: bash
@@ -189,14 +213,19 @@ runs:
           json="$(jq -c --arg name "$name" --arg kubeconfig "$kubeconfig" --arg context "kind-$name" \
             '. + {($name): {kubeconfig: $kubeconfig, context: $context}}' <<<"$json")"
         done < <(printf '%s\n' "$listing" | awk 'NR>1 {print $1}')
-        {
-          echo "clusters<<KINDOCP_CLUSTERS_EOF"
-          printf '%s\n' "$json"
-          echo "KINDOCP_CLUSTERS_EOF"
-        } >> "$GITHUB_OUTPUT"
+        # Single-line by construction (jq -c over names and a
+        # CR/LF-checked state root); asserted so GITHUB_OUTPUT keeps
+        # exactly one directive per line.
+        case "$json" in
+          *$'\r'*|*$'\n'*)
+            echo "internal error: the clusters JSON is not single-line" >&2
+            exit 1 ;;
+        esac
+        printf 'clusters=%s\n' "$json" >> "$GITHUB_OUTPUT"
 
     - name: Verify the clusters
       env:
+        INPUT_CONFIG: ${{ inputs.config }}
         KIND_OCP_ACTION_PREFIX: ${{ steps.scope.outputs.prefix }}
         KIND_OCP_ACTION_STATE_ROOT: ${{ steps.scope.outputs.state_root }}
       shell: bash

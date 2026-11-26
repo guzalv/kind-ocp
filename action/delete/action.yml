@@ -59,13 +59,25 @@ runs:
         cache: false
 
     - name: Install kind-ocp
+      env:
+        INPUT_KIND_OCP_VERSION: ${{ inputs.kind_ocp_version }}
       shell: bash
       run: |
         set -euo pipefail
-        go install "github.com/guzalv/kind-ocp/cmd/kind-ocp@${INPUT_KIND_OCP_VERSION:?kind_ocp_version input is empty}"
-        echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+        # See action/create: GOBIN pinned to a runner-local
+        # directory, and that same directory published below, so an
+        # ambient GOBIN cannot decide where the binary lands.
+        install_dir="${RUNNER_TEMP:?RUNNER_TEMP is not set}/kind-ocp-bin"
+        mkdir -p "$install_dir"
+        GOBIN="$install_dir" go install "github.com/guzalv/kind-ocp/cmd/kind-ocp@${INPUT_KIND_OCP_VERSION:?kind_ocp_version input is empty}"
+        printf '%s\n' "$install_dir" >> "$GITHUB_PATH"
 
     - name: Delete the clusters
+      env:
+        # Composite run steps get no automatic INPUT_* variables; the
+        # env mapping is the wiring that carries each input in.
+        INPUT_PREFIX: ${{ inputs.prefix }}
+        INPUT_STATE_ROOT: ${{ inputs.state_root }}
       shell: bash
       run: |
         set -euo pipefail

@@ -767,31 +767,47 @@ Components:
   `uses:` paths are the final operative ones (`./.github/actions/…`),
   so the move needs no content edits.
 - `action/local-gate.sh` — the local gate: runs the actions' own
-  `run:` scripts the way a runner would (INPUT_* environment, the
-  GITHUB_OUTPUT / GITHUB_PATH files with path entries applied
-  between steps, the `steps.<id>.outputs.*` context) against the
-  local Docker daemon. Scenarios: `yaml` (parse + pin and injection
-  invariants), `e2e` (the full output contract, verify-failure
-  propagation via a sabotaged check, a credential-leak grep over
-  step logs and outputs), `failure` (a create killed mid-run still
-  exposed prefix/state_root and emitted no clusters; a delete run
-  from a fresh step context cleans the half-created prefix), and
-  `spaced` (a state root containing a space keeps the JSON valid
-  and the kubeconfigs usable). It also plants ambient `KIND_OCP_*`
-  values around every step to prove the scripts neutralize them.
-  Not used by CI; the move handoff removes it.
+  `run:` scripts with the environment their own `env:` mappings
+  declare. It never fabricates input variables — composite run
+  steps get no automatic INPUT_* on a real runner (GitHub documents
+  this), so the gate resolves every INPUT_* from the action.yml's
+  step `env:` mappings (a scenario supplies what a consumer's
+  `with:` would set; an unsupplied input falls back to the
+  action.yml default), which means a removed mapping fails the gate
+  instead of hiding behind injected variables. Scenarios: `yaml`
+  (parse + pin and injection invariants), `smoke` (the input wiring
+  is complete and canonical; supplied and default inputs behave; a
+  CR/LF state_root is refused before any output directive is
+  written; delete enforces its required prefix), `e2e` (default-input
+  create of 2 full-profile clusters, the full output contract,
+  verify-failure propagation via a sabotaged check, a credential-leak
+  grep over step logs and outputs, the planted ambient GOBIN staying
+  unused), `failure` (a create killed mid-run — its own process
+  group only — still exposed prefix/state_root and emitted no
+  clusters; a delete run from a fresh step context cleans the
+  half-created prefix), and `spaced` (a state root containing a
+  space keeps the JSON valid and the kubeconfigs usable). It plants
+  ambient `KIND_OCP_*` values around every step to prove the
+  scripts neutralize them, gives every run a fresh mktemp scratch
+  root and a unique run id (derived prefixes never collide across
+  runs), and keeps the scratch root for inspection on failure. Not
+  used by CI; the move handoff moves it to `tools/`.
 
 Contract decisions:
 
-- Input names use underscores (`state_root`), never dashes:
-  composite-action inputs reach `run:` steps as `INPUT_<NAME>`
-  environment variables, and `INPUT_STATE-ROOT` is unreferenceable
-  in bash.
-- No `${{ }}` inside any `run:` script. Caller-controlled values
-  cross as environment variables only (automatic INPUT_* for inputs,
-  step `env:` blocks for values resolved by earlier steps), so input
-  bytes are never parsed as shell language. `local-gate.sh yaml`
-  enforces the invariant.
+- Input names use underscores (`state_root`), never dashes: the
+  step `env:` mappings below publish them as `INPUT_<NAME>`
+  environment variables, and `INPUT_STATE-ROOT` would be
+  unreferenceable in bash.
+- No `${{ }}` inside any `run:` script. Composite run steps get no
+  automatic INPUT_* variables (GitHub documents this), so every
+  input crosses through a step `env:` mapping
+  (`INPUT_<NAME>: ${{ inputs.<name> }}`) and every value resolved
+  by an earlier step through `env:` as well — input bytes are
+  environment values, never script language, and the scripts quote
+  every expansion. `local-gate.sh yaml` enforces the no-`${{ }}`
+  invariant; the gate's `smoke` scenario fails if a mapping is
+  removed or points at the wrong input.
 - The prefix default is `ko-<run id>` (a name prefix is not
   isolation; on an ephemeral runner uniqueness needs only run
   identity). The scope step validates it by mirroring
@@ -801,11 +817,19 @@ Contract decisions:
   kind-ocp re-validates; the mirror is the early, clear refusal.
 - `prefix` and `state_root` are written to GITHUB_OUTPUT before
   anything that can fail, so an `if: always()` delete can clean a
-  half-created prefix even when create dies during setup. They are
-  written in heredoc-delimiter form, so no value can inject output
-  lines. The state-root default is `<RUNNER_TEMP>/kind-ocp`:
-  runner-private, wiped between jobs, and a location nothing should
-  cache.
+  half-created prefix even when create dies during setup. Outputs
+  are single-line `key=value` directives: a `state_root` carrying
+  CR or LF is refused outright (spaces stay supported), and the
+  `clusters` JSON is asserted single-line before it is written, so
+  no value can inject extra output lines. The state-root default
+  is `<RUNNER_TEMP>/kind-ocp`: runner-private, wiped between jobs,
+  and a location nothing should cache.
+- The install steps pin `GOBIN` to `<RUNNER_TEMP>/kind-ocp-bin`
+  and publish that same directory through GITHUB_PATH: an ambient
+  `GOBIN` (the calling workflow's, or the runner's) must not
+  decide where the binary lands or which one runs. The local gate
+  plants an ambient GOBIN around every step and asserts it stays
+  empty.
 - `clusters` is composed by the action (`jq -c`) from
   `kind-ocp list` (the keys) and `kind-ocp kubeconfig <name>` (the
   paths), with `context` = `kind-<name>` — kind's naming invariant,
@@ -823,16 +847,17 @@ Contract decisions:
   when the inputs are non-empty, so the config file or the built-in
   defaults govern them.
 - No buildx setup step — a deliberate deviation from the roadmap
-  sketch. `docker/setup-buildx-action` defaults to the
-  docker-container driver with `use: true`, and the webhook build
-  (`Provisioner.BuildImage`) runs a plain `docker build
-  --provenance=false` with no `--load`, which requires the built
-  image in the daemon store. GitHub-hosted ubuntu runners ship the
-  buildx CLI plugin preinstalled, and this repo's own integration
-  CI builds the webhook image on ubuntu-latest with no buildx
-  setup — the same environment the self-test runs in. A
-  docker-container builder would break the build; a no-op setup
-  step would add a third-party action for nothing.
+  sketch. GitHub-hosted ubuntu runners ship the buildx CLI plugin
+  preinstalled, and plain `docker build` (which the webhook build,
+  `Provisioner.BuildImage`, runs with `--provenance=false` and no
+  `--load`) uses the default builder that writes into the daemon
+  store. This repo's own integration CI builds the webhook image
+  on ubuntu-latest with no buildx setup — the same environment the
+  self-test runs in — so a setup step would add a third-party
+  action for nothing. (A caller that switches the default builder
+  to a docker-container-driver builder changes where `docker
+  build` puts images; that is the caller's configuration, not
+  something this action needs to manage.)
 - Every `run:` script sets `euo pipefail` and quotes every
   expansion; tool exit codes propagate (the sabotage re-run in the
   local gate proves verify's non-zero exit fails the step).
@@ -845,8 +870,14 @@ Contract decisions:
 - The self-test grants `contents: read`, checks out with
   `persist-credentials: false`, runs dispatch + nightly only (no
   `pull_request`, never `pull_request_target`), and sets an explicit
-  timeout. Its post-delete assertions run only when the delete step
-  itself succeeded, so a failed delete is reported as itself, not as
-  a confusing assertion failure.
+  timeout. Its assertions avoid two `set -e` traps: the
+  credential-absence and leftover-container checks use explicit
+  failing branches (`! grep` never fails a step under `set -e`),
+  and the container check captures Docker's listing first so a
+  Docker failure stays fatal, matching on the literal prefix plus
+  `-` instead of a `[0-9]+` pattern basic grep cannot express. Its
+  post-delete assertions run only when the delete step itself
+  succeeded, so a failed delete is reported as itself, not as a
+  confusing assertion failure.
 - Local gating cannot prove Linux-runner behavior; the handoff's
   final step dispatches the self-test remotely and requires green.

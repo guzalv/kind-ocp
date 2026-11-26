@@ -29,10 +29,16 @@ The pin table itself lives in the root README ("Defaults and pins").
   `action/delete/action.yml`), the `go_version` default (must satisfy
   the pinned release's go.mod minimum), and the SHA-pinned
   `actions/setup-go` / `actions/checkout` commits there — the same pin
-  discipline as ci.yaml (commit SHA plus version comment). A bump is:
-  edit the files, run `action/local-gate.sh all` (needs Docker), and —
-  after the staged move into `.github/` — dispatch the self-test
-  workflow remotely and require green.
+  discipline as ci.yaml (commit SHA plus version comment). Inputs
+  reach the `run:` scripts only through step `env:` mappings
+  (`INPUT_<NAME>: ${{ inputs.<name> }}`) — composite run steps get no
+  automatic INPUT_* variables — and outputs are single-line
+  `key=value` directives with CR/LF inputs refused; keep both
+  invariants when editing. A bump is: edit the files, run
+  `action/local-gate.sh all` (needs Docker; its `smoke` scenario
+  fails if an input mapping is lost), and — after the staged move
+  into `.github/` — dispatch the self-test workflow remotely and
+  require green.
 
 ## Lint toolchain
 

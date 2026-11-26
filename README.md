@@ -258,10 +258,11 @@ them, and emits per-cluster kubeconfig paths and contexts — never
 credential content. `delete` is self-sufficient (it installs kind-ocp
 itself, so it works under `if: always()` even when create failed
 during its own setup) and idempotent. The pair ships in the v0.1.2
-release (`guzalv/kind-ocp/action/{create,delete}@v0.1.2`); until that
-tag is cut the actions are staged under [`action/`](action) in this
-repository, gated by [action/local-gate.sh](action/local-gate.sh) and
-an ubuntu-latest self-test workflow
+release (`guzalv/kind-ocp/.github/actions/{create,delete}@v0.1.2`);
+until that tag is cut the actions are staged under
+[`action/`](action) in this repository, gated by
+[action/local-gate.sh](action/local-gate.sh) and an ubuntu-latest
+self-test workflow
 ([action/self-test.yaml](action/self-test.yaml), dispatch + nightly).
 
 ```yaml
@@ -277,7 +278,7 @@ jobs:
           persist-credentials: false
       - name: Create the kind-ocp clusters
         id: kindocp
-        uses: guzalv/kind-ocp/action/create@v0.1.2
+        uses: guzalv/kind-ocp/.github/actions/create@v0.1.2
         with:
           count: '2'
           profile: full
@@ -297,7 +298,7 @@ jobs:
           done
       - name: Delete the clusters
         if: always() && steps.kindocp.outputs.prefix != ''
-        uses: guzalv/kind-ocp/action/delete@v0.1.2
+        uses: guzalv/kind-ocp/.github/actions/delete@v0.1.2
         with:
           prefix: ${{ steps.kindocp.outputs.prefix }}
           state_root: ${{ steps.kindocp.outputs.state_root }}
@@ -310,7 +311,7 @@ jobs:
 | `count` | `''` | Empty passes no `--count`; the config file or the built-in default (2) governs. |
 | `profile` | `''` | Empty passes no `--profile` (default `full`). |
 | `prefix` | `''` | Empty derives `ko-<run id>`. Lowercase alphanumeric and `-`, 1-40 chars. |
-| `state_root` | `''` | Empty derives `<RUNNER_TEMP>/kind-ocp`. Always wins over the config file. |
+| `state_root` | `''` | Empty derives `<RUNNER_TEMP>/kind-ocp`. Always wins over the config file. Must be a single line (CR/LF refused). |
 | `config` | `''` | Path to a kind-ocp config file, resolved against the job's working directory. Empty disables file lookup. |
 | `kind_ocp_version` | `v0.1.1` | The released version `go install` builds. |
 | `go_version` | `1.27.4` | Must satisfy the release's go.mod minimum. |
@@ -346,10 +347,11 @@ and `go_version` (same defaults), and produces no outputs.
 - `prefix` and `state_root` inputs always win over any config-file
   values; `count` and `profile` pass through only when non-empty, so
   a config file can govern them.
-- No buildx setup step is needed or wanted: GitHub-hosted ubuntu
-  runners ship the buildx CLI plugin the full profile's webhook
-  build needs, and a docker-container-driver builder would not load
-  the built image into the daemon store.
+- No buildx setup step: GitHub-hosted ubuntu runners ship the
+  buildx CLI plugin the full profile's webhook build needs, and
+  plain `docker build` runs against the default builder that writes
+  into the daemon store — the same setup this repo's integration
+  CI builds the webhook image with on ubuntu-latest.
 - Nothing beyond the job's default runtime token is used; a
   `contents: read` job works.
 
