@@ -714,3 +714,28 @@ cluster (a deliberate scope cut).
   integration only (weaker webhook coverage than the fake-apiserver unit tests — avoid).
 - CI cost of the CO proof → single job, label-gated on PRs, nightly (§2).
 - macOS quirks (inotify, sysctl) → warnings, never failures.
+
+## 7. Roadmap
+
+- [ ] **Consumer GitHub Actions.** Let GitHub-Actions jobs in other
+  repos (StackRox, Compliance Operator) stand up kind-ocp clusters
+  through reusable actions. Shape: a `create`/`delete` composite pair.
+  `create` takes the cluster count, profile, prefix, state root, and
+  config file; sets up buildx (the full profile's webhook build needs
+  it); installs the pinned `kind-ocp` release (go install at a tag);
+  runs `create` + `verify`; and emits a JSON output keyed by cluster
+  name carrying kubeconfig paths and contexts — never credential
+  content. The prefix defaults to a unique per-invocation value derived
+  from the run ID: a name prefix is not isolation on a shared Docker
+  daemon, so the actions assume ephemeral hosted runners. `delete`
+  runs `kind-ocp delete` and is designed for `if: always()`. No
+  caching initially — restoring a cache directory leaves the state
+  prefix populated without its marker, which the state store refuses.
+  Deliverables stage under `action/` (create, delete, and a self-test
+  workflow that consumes the pair end to end on ubuntu-latest, dispatch
+  and nightly): the `.github/` tree is protected for workflow
+  sessions, so moving the staged files into `.github/actions/` and
+  `.github/workflows/` is an authorized-session step after the gates
+  pass, followed by dispatching the self-test on the remote. A README
+  section documents consumer usage. N>2 clusters needs larger
+  runners.
