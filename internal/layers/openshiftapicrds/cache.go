@@ -14,9 +14,9 @@ import (
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
-	"github.com/stackrox/kind-ocp/internal/fscheck"
-	"github.com/stackrox/kind-ocp/internal/kube"
-	"github.com/stackrox/kind-ocp/layers"
+	"github.com/guzalv/kind-ocp/internal/fscheck"
+	"github.com/guzalv/kind-ocp/internal/kube"
+	"github.com/guzalv/kind-ocp/layers"
 )
 
 // The CRD cache. Apply needs the same 18 manifests for every cluster it

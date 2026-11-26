@@ -22,13 +22,13 @@ import (
 
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/stackrox/kind-ocp/config"
-	"github.com/stackrox/kind-ocp/internal/builtin"
-	"github.com/stackrox/kind-ocp/internal/kube"
-	kindprov "github.com/stackrox/kind-ocp/internal/provider/kind"
-	"github.com/stackrox/kind-ocp/internal/state"
-	"github.com/stackrox/kind-ocp/layers"
-	"github.com/stackrox/kind-ocp/provider"
+	"github.com/guzalv/kind-ocp/config"
+	"github.com/guzalv/kind-ocp/internal/builtin"
+	"github.com/guzalv/kind-ocp/internal/kube"
+	kindprov "github.com/guzalv/kind-ocp/internal/provider/kind"
+	"github.com/guzalv/kind-ocp/internal/state"
+	"github.com/guzalv/kind-ocp/layers"
+	"github.com/guzalv/kind-ocp/provider"
 )
 
 // Options configures a Client. Config is required. Registry and Provisioner

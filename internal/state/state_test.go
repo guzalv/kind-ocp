@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stackrox/kind-ocp/internal/fscheck"
+	"github.com/guzalv/kind-ocp/internal/fscheck"
 )
 
 func TestOpenIsLazyAndEnsureCreatesPerms(t *testing.T) {

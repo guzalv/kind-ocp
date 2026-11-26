@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/stackrox/kind-ocp/internal/fscheck"
+	"github.com/guzalv/kind-ocp/internal/fscheck"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"

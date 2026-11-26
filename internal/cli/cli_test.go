@@ -14,11 +14,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/stackrox/kind-ocp/config"
-	"github.com/stackrox/kind-ocp/internal/shell"
-	"github.com/stackrox/kind-ocp/kindocp"
-	"github.com/stackrox/kind-ocp/layers"
-	"github.com/stackrox/kind-ocp/provider"
+	"github.com/guzalv/kind-ocp/config"
+	"github.com/guzalv/kind-ocp/internal/shell"
+	"github.com/guzalv/kind-ocp/kindocp"
+	"github.com/guzalv/kind-ocp/layers"
+	"github.com/guzalv/kind-ocp/provider"
 )
 
 // cliFakeProvisioner is the in-memory provisioner behind CLI tests. When

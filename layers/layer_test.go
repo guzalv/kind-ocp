@@ -6,7 +6,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/stackrox/kind-ocp/config"
+	"github.com/guzalv/kind-ocp/config"
 )
 
 type fakeLayer struct {

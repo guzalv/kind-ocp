@@ -26,8 +26,8 @@ import (
 	"k8s.io/client-go/rest"
 	k8stesting "k8s.io/client-go/testing"
 
-	"github.com/stackrox/kind-ocp/layers"
-	"github.com/stackrox/kind-ocp/provider"
+	"github.com/guzalv/kind-ocp/layers"
+	"github.com/guzalv/kind-ocp/provider"
 )
 
 // probeCall records one ProbeTCPFromNode invocation.

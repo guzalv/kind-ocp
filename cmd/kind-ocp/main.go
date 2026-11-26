@@ -4,7 +4,7 @@ package main
 import (
 	"os"
 
-	"github.com/stackrox/kind-ocp/internal/cli"
+	"github.com/guzalv/kind-ocp/internal/cli"
 )
 
 func main() {

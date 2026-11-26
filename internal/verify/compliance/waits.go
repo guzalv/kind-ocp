@@ -15,7 +15,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/stackrox/kind-ocp/internal/kube"
+	"github.com/guzalv/kind-ocp/internal/kube"
 )
 
 // The custom resources the proof reads, as resource paths. The kinds

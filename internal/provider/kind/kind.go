@@ -24,8 +24,8 @@ import (
 	"sigs.k8s.io/kind/pkg/cluster/nodeutils"
 	"sigs.k8s.io/kind/pkg/log"
 
-	"github.com/stackrox/kind-ocp/internal/fscheck"
-	"github.com/stackrox/kind-ocp/provider"
+	"github.com/guzalv/kind-ocp/internal/fscheck"
+	"github.com/guzalv/kind-ocp/provider"
 )
 
 // Provisioner provisions clusters with kind.

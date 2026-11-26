@@ -116,7 +116,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/stackrox/kind-ocp/internal/verify/compliance"
+	"github.com/guzalv/kind-ocp/internal/verify/compliance"
 )
 
 // craneModule and craneVersion pin the one external tool the

@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stackrox/kind-ocp/layers"
+	"github.com/guzalv/kind-ocp/layers"
 )
 
 func TestCRDURL(t *testing.T) {

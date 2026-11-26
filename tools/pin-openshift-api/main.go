@@ -51,7 +51,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/stackrox/kind-ocp/internal/layers/openshiftapicrds"
+	"github.com/guzalv/kind-ocp/internal/layers/openshiftapicrds"
 )
 
 // modulePath is the pinned module this tool resolves.

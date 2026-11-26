@@ -21,10 +21,10 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/stackrox/kind-ocp/config"
-	"github.com/stackrox/kind-ocp/internal/state"
-	"github.com/stackrox/kind-ocp/layers"
-	"github.com/stackrox/kind-ocp/provider"
+	"github.com/guzalv/kind-ocp/config"
+	"github.com/guzalv/kind-ocp/internal/state"
+	"github.com/guzalv/kind-ocp/layers"
+	"github.com/guzalv/kind-ocp/provider"
 )
 
 // fakeProvisioner is an in-memory provider.Provisioner. Its maps and

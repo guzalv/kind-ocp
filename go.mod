@@ -1,4 +1,4 @@
-module github.com/stackrox/kind-ocp
+module github.com/guzalv/kind-ocp
 
 go 1.27.4
 

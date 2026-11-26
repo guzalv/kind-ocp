@@ -4,7 +4,7 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/stackrox/kind-ocp/layers"
+	"github.com/guzalv/kind-ocp/layers"
 )
 
 // The registry's names are the apply order for profile "full"; this test

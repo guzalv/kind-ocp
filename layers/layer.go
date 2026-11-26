@@ -13,7 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/stackrox/kind-ocp/config"
+	"github.com/guzalv/kind-ocp/config"
 	"gopkg.in/yaml.v3"
 )
 

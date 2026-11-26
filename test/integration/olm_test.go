@@ -12,9 +12,9 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/stackrox/kind-ocp/config"
-	"github.com/stackrox/kind-ocp/internal/kube"
-	"github.com/stackrox/kind-ocp/kindocp"
+	"github.com/guzalv/kind-ocp/config"
+	"github.com/guzalv/kind-ocp/internal/kube"
+	"github.com/guzalv/kind-ocp/kindocp"
 )
 
 // TestCreateWithOLMLayer exercises increment 2's layer end to end on a

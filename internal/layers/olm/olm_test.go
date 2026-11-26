@@ -20,8 +20,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/stackrox/kind-ocp/internal/kube"
-	"github.com/stackrox/kind-ocp/layers"
+	"github.com/guzalv/kind-ocp/internal/kube"
+	"github.com/guzalv/kind-ocp/layers"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 

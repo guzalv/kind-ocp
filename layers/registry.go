@@ -3,7 +3,7 @@ package layers
 import (
 	"fmt"
 
-	"github.com/stackrox/kind-ocp/internal/safename"
+	"github.com/guzalv/kind-ocp/internal/safename"
 )
 
 // Registry holds layer implementations in registration order, which is the

@@ -20,9 +20,9 @@ import (
 	"gopkg.in/yaml.v3"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
-	"github.com/stackrox/kind-ocp/internal/kube"
-	"github.com/stackrox/kind-ocp/internal/layers/openshiftapicrds"
-	"github.com/stackrox/kind-ocp/layers"
+	"github.com/guzalv/kind-ocp/internal/kube"
+	"github.com/guzalv/kind-ocp/internal/layers/openshiftapicrds"
+	"github.com/guzalv/kind-ocp/layers"
 )
 
 // The ported object set, pinned. These are the exact contents reviewed

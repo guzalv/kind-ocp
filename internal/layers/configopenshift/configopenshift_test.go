@@ -18,7 +18,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
-	"github.com/stackrox/kind-ocp/layers"
+	"github.com/guzalv/kind-ocp/layers"
 )
 
 // The ported asset sets, pinned. These are the exact contents reviewed

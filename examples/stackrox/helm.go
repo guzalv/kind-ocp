@@ -14,8 +14,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/stackrox/kind-ocp/config"
-	"github.com/stackrox/kind-ocp/internal/fscheck"
+	"github.com/guzalv/kind-ocp/config"
+	"github.com/guzalv/kind-ocp/internal/fscheck"
 )
 
 // adminPasswordFile and the values file names, all under the work

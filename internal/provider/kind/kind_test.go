@@ -14,7 +14,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/stackrox/kind-ocp/internal/fscheck"
+	"github.com/guzalv/kind-ocp/internal/fscheck"
 	kindlog "sigs.k8s.io/kind/pkg/log"
 )
 

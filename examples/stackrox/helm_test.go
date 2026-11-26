@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stackrox/kind-ocp/config"
-	"github.com/stackrox/kind-ocp/internal/fscheck"
+	"github.com/guzalv/kind-ocp/config"
+	"github.com/guzalv/kind-ocp/internal/fscheck"
 	"gopkg.in/yaml.v3"
 )
 

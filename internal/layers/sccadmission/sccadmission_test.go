@@ -24,9 +24,9 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/stackrox/kind-ocp/internal/kube"
-	"github.com/stackrox/kind-ocp/internal/shell"
-	"github.com/stackrox/kind-ocp/layers"
+	"github.com/guzalv/kind-ocp/internal/kube"
+	"github.com/guzalv/kind-ocp/internal/shell"
+	"github.com/guzalv/kind-ocp/layers"
 )
 
 // fakeAPIServer is an in-memory apiserver carrying the API surface the

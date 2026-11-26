@@ -14,8 +14,8 @@ import (
 
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/stackrox/kind-ocp/internal/state"
-	"github.com/stackrox/kind-ocp/layers"
+	"github.com/guzalv/kind-ocp/internal/state"
+	"github.com/guzalv/kind-ocp/layers"
 )
 
 // concurrentLayer is a recording layer safe for the concurrent wave:

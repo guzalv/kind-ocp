@@ -52,7 +52,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/stackrox/kind-ocp/config"
+	"github.com/guzalv/kind-ocp/config"
 )
 
 // Phase timeouts. Each is a fixed budget like the Compliance Operator

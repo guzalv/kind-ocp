@@ -43,17 +43,16 @@ reject pods; the shim cannot.
 ## Quickstart
 
 ```sh
-# Prerequisites: Docker client + daemon, the buildx CLI plugin (see
-# Prerequisites below), Go 1.27.4+, kubectl for inspection.
-# Build from a checkout and invoke the binary where you built it —
-# no PATH setup needed:
-go build -o kind-ocp ./cmd/kind-ocp
+# Prerequisites: Docker client + daemon, the buildx CLI plugin, Go
+# 1.27.4+, kubectl for inspection — see Prerequisites below.
+go install github.com/guzalv/kind-ocp@v0.1.0
+# (installs to $(go env GOPATH)/bin — make sure it is on your PATH)
 
-./kind-ocp create                  # 2 clusters: kind-ocp-1, kind-ocp-2, profile full
-./kind-ocp verify                  # per-check PASS/FAIL/SKIP across all clusters
-kubectl --kubeconfig "$(./kind-ocp kubeconfig kind-ocp-1)" get nodes
-./kind-ocp list                    # name, context, state, layers per cluster
-./kind-ocp delete                  # removes the clusters and all state
+kind-ocp create                    # 2 clusters: kind-ocp-1, kind-ocp-2, profile full
+kind-ocp verify                    # per-check PASS/FAIL/SKIP across all clusters
+kubectl --kubeconfig "$(kind-ocp kubeconfig kind-ocp-1)" get nodes
+kind-ocp list                      # name, context, state, layers per cluster
+kind-ocp delete                    # removes the clusters and all state
 ```
 
 Or use it as a library — the CLI is a thin skin over the same façade:
@@ -316,7 +315,7 @@ concurrency limiter, so the practical bound is the daemon's capacity.
 - The scc-admission webhook's `failurePolicy` is `Ignore` (a wedged
   webhook degrades to OpenShift-absent behavior rather than blocking pod
   creation); its scope is the namespaces it is configured to watch.
-- The module path `github.com/stackrox/kind-ocp` is provisional until the
+- The module path `github.com/guzalv/kind-ocp` is provisional until the
   publishing location is confirmed; renaming is mechanical.
 
 ## Repository layout and history

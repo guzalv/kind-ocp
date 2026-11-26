@@ -19,10 +19,10 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/stackrox/kind-ocp/config"
-	"github.com/stackrox/kind-ocp/internal/kube"
-	kindprov "github.com/stackrox/kind-ocp/internal/provider/kind"
-	"github.com/stackrox/kind-ocp/kindocp"
+	"github.com/guzalv/kind-ocp/config"
+	"github.com/guzalv/kind-ocp/internal/kube"
+	kindprov "github.com/guzalv/kind-ocp/internal/provider/kind"
+	"github.com/guzalv/kind-ocp/kindocp"
 )
 
 // testLogger is the integration suite's logger: kind's progress and

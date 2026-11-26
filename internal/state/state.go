@@ -62,8 +62,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/stackrox/kind-ocp/internal/fscheck"
-	"github.com/stackrox/kind-ocp/internal/safename"
+	"github.com/guzalv/kind-ocp/internal/fscheck"
+	"github.com/guzalv/kind-ocp/internal/safename"
 )
 
 // Record is the per-cluster state written by create. It is the source of

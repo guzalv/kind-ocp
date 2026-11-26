@@ -17,9 +17,9 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
-	"github.com/stackrox/kind-ocp/config"
-	"github.com/stackrox/kind-ocp/internal/fscheck"
-	"github.com/stackrox/kind-ocp/kindocp"
+	"github.com/guzalv/kind-ocp/config"
+	"github.com/guzalv/kind-ocp/internal/fscheck"
+	"github.com/guzalv/kind-ocp/kindocp"
 )
 
 // resolveConfig resolves the example's flags through kind-ocp's own

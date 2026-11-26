@@ -28,6 +28,6 @@ package openshiftapicrds
 // reads, while the linker drops the types from the binary: the import
 // pins a version, it does not add code.
 
-//go:generate go run github.com/stackrox/kind-ocp/tools/pin-openshift-api
+//go:generate go run github.com/guzalv/kind-ocp/tools/pin-openshift-api
 
 import _ "github.com/openshift/api/config/v1"

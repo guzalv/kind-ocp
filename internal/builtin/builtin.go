@@ -15,13 +15,13 @@
 package builtin
 
 import (
-	"github.com/stackrox/kind-ocp/internal/layers/configopenshift"
-	"github.com/stackrox/kind-ocp/internal/layers/nodelabels"
-	"github.com/stackrox/kind-ocp/internal/layers/olm"
-	"github.com/stackrox/kind-ocp/internal/layers/openshiftapicrds"
-	"github.com/stackrox/kind-ocp/internal/layers/platformobjects"
-	"github.com/stackrox/kind-ocp/internal/layers/sccadmission"
-	"github.com/stackrox/kind-ocp/layers"
+	"github.com/guzalv/kind-ocp/internal/layers/configopenshift"
+	"github.com/guzalv/kind-ocp/internal/layers/nodelabels"
+	"github.com/guzalv/kind-ocp/internal/layers/olm"
+	"github.com/guzalv/kind-ocp/internal/layers/openshiftapicrds"
+	"github.com/guzalv/kind-ocp/internal/layers/platformobjects"
+	"github.com/guzalv/kind-ocp/internal/layers/sccadmission"
+	"github.com/guzalv/kind-ocp/layers"
 )
 
 // NewRegistry returns a registry with every builtin layer registered, in

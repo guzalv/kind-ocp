@@ -12,9 +12,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/stackrox/kind-ocp/config"
-	"github.com/stackrox/kind-ocp/kindocp"
-	"github.com/stackrox/kind-ocp/provider"
+	"github.com/guzalv/kind-ocp/config"
+	"github.com/guzalv/kind-ocp/kindocp"
+	"github.com/guzalv/kind-ocp/provider"
 )
 
 func mustConfig(t *testing.T, prefix, stateRoot string) *config.Config {

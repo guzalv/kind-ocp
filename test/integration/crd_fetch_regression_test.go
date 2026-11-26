@@ -16,10 +16,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
-	"github.com/stackrox/kind-ocp/config"
-	"github.com/stackrox/kind-ocp/internal/kube"
-	"github.com/stackrox/kind-ocp/internal/layers/openshiftapicrds"
-	"github.com/stackrox/kind-ocp/kindocp"
+	"github.com/guzalv/kind-ocp/config"
+	"github.com/guzalv/kind-ocp/internal/kube"
+	"github.com/guzalv/kind-ocp/internal/layers/openshiftapicrds"
+	"github.com/guzalv/kind-ocp/kindocp"
 )
 
 // fetchRegressionLayers is the two layers whose interaction the F-1
@@ -183,7 +183,7 @@ func TestSecondCreateWithoutCacheAndNetwork(t *testing.T) {
 func buildKindOcp(t *testing.T) string {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "kind-ocp")
-	cmd := exec.Command("go", "build", "-o", bin, "github.com/stackrox/kind-ocp/cmd/kind-ocp")
+	cmd := exec.Command("go", "build", "-o", bin, "github.com/guzalv/kind-ocp/cmd/kind-ocp")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("building the kind-ocp CLI: %v:\n%s", err, out)
 	}

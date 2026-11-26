@@ -23,12 +23,12 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/stackrox/kind-ocp/config"
-	"github.com/stackrox/kind-ocp/internal/builtin"
-	"github.com/stackrox/kind-ocp/internal/kube"
-	kindprov "github.com/stackrox/kind-ocp/internal/provider/kind"
-	"github.com/stackrox/kind-ocp/kindocp"
-	"github.com/stackrox/kind-ocp/layers"
+	"github.com/guzalv/kind-ocp/config"
+	"github.com/guzalv/kind-ocp/internal/builtin"
+	"github.com/guzalv/kind-ocp/internal/kube"
+	kindprov "github.com/guzalv/kind-ocp/internal/provider/kind"
+	"github.com/guzalv/kind-ocp/kindocp"
+	"github.com/guzalv/kind-ocp/layers"
 )
 
 func dockerAvailable() bool {

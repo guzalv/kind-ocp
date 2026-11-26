@@ -17,11 +17,11 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
-	"github.com/stackrox/kind-ocp/assets"
-	"github.com/stackrox/kind-ocp/config"
-	"github.com/stackrox/kind-ocp/internal/kube"
-	"github.com/stackrox/kind-ocp/internal/layers/openshiftapicrds"
-	"github.com/stackrox/kind-ocp/kindocp"
+	"github.com/guzalv/kind-ocp/assets"
+	"github.com/guzalv/kind-ocp/config"
+	"github.com/guzalv/kind-ocp/internal/kube"
+	"github.com/guzalv/kind-ocp/internal/layers/openshiftapicrds"
+	"github.com/guzalv/kind-ocp/kindocp"
 )
 
 // increment4Layers is everything the openshift-api-crds layer builds on,

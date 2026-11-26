@@ -17,10 +17,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/stackrox/kind-ocp/config"
-	"github.com/stackrox/kind-ocp/kindocp"
-	"github.com/stackrox/kind-ocp/layers"
-	"github.com/stackrox/kind-ocp/provider"
+	"github.com/guzalv/kind-ocp/config"
+	"github.com/guzalv/kind-ocp/kindocp"
+	"github.com/guzalv/kind-ocp/layers"
+	"github.com/guzalv/kind-ocp/provider"
 )
 
 // smokeProvisioner is a caller-supplied provisioner: an in-memory cluster

@@ -91,9 +91,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 
-	"github.com/stackrox/kind-ocp/assets"
-	"github.com/stackrox/kind-ocp/internal/kube"
-	"github.com/stackrox/kind-ocp/layers"
+	"github.com/guzalv/kind-ocp/assets"
+	"github.com/guzalv/kind-ocp/internal/kube"
+	"github.com/guzalv/kind-ocp/layers"
 )
 
 // Name is the layer's stable identifier, as referenced by profiles and

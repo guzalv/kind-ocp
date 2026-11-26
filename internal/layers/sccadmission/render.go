@@ -25,8 +25,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/stackrox/kind-ocp/assets"
-	"github.com/stackrox/kind-ocp/internal/kube"
+	"github.com/guzalv/kind-ocp/assets"
+	"github.com/guzalv/kind-ocp/internal/kube"
 )
 
 // The names of everything the layer installs. Fixed, not settings: they

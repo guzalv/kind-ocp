@@ -8,8 +8,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/stackrox/kind-ocp/config"
-	"github.com/stackrox/kind-ocp/internal/verify/compliance"
+	"github.com/guzalv/kind-ocp/config"
+	"github.com/guzalv/kind-ocp/internal/verify/compliance"
 )
 
 // TestComplianceOperatorFitness is the CO fitness proof, run per

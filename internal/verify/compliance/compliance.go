@@ -85,7 +85,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/stackrox/kind-ocp/internal/kube"
+	"github.com/guzalv/kind-ocp/internal/kube"
 )
 
 // DefaultCatalogServerImage is the digest-pinned image the proof's

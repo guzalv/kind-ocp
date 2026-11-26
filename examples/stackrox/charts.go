@@ -15,7 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/stackrox/kind-ocp/internal/fscheck"
+	"github.com/guzalv/kind-ocp/internal/fscheck"
 )
 
 // The StackRox chart pins. The chart tarballs are the pinned unit: each is

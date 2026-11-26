@@ -27,7 +27,7 @@ import (
 // A new legitimate consumer would have to change this test — which is
 // the point: the boundary is a decision, and decisions get reviewed.
 func TestNothingImportsTheProofOutsideItsConsumers(t *testing.T) {
-	const self = "github.com/stackrox/kind-ocp/internal/verify/compliance"
+	const self = "github.com/guzalv/kind-ocp/internal/verify/compliance"
 	// This package's directory, from which relative paths resolve.
 	const repoRoot = "../../.."
 
