@@ -1,0 +1,128 @@
+# kind-ocp action self-test (docs/PLAN.md §7-§8): consumes the
+# create/delete composite actions end to end on an ephemeral
+# ubuntu-latest runner — the Linux-runner proof the local gate
+# (action/local-gate.sh, macOS + Docker Desktop) cannot provide.
+# Dispatch and nightly only: it creates two full-profile clusters
+# (the scc-admission layer's webhook image build included) and costs
+# real runner minutes.
+#
+# Security posture, fixed by review and shared with ci.yaml:
+#   - Every action is SHA-pinned to the commit the version comment
+#     names; a floating tag cannot change what runs here.
+#   - Workflow-level permission grant is `contents: read` and no job
+#     grants more; the job holds no secrets and writes nothing.
+#   - Dispatch and schedule only — no pull_request (and never
+#     pull_request_target), so no untrusted code path reaches this
+#     workflow.
+#   - Runners are GitHub-hosted and therefore ephemeral; the job
+#     needs nothing from this repository beyond its code.
+#
+# STAGED FILE — this is the complete workflow, byte-for-byte, but it
+# does not live at its operative path yet: the automated sessions
+# that develop this repo run under a sandbox that refuses writes to
+# `.github/` (a protected configuration path there), and evading
+# that refusal is not an option. Move it into place from a normal
+# (non-automated) session, following action/MOVE.md:
+#
+#   mkdir -p .github/workflows
+#   git mv action/self-test.yaml .github/workflows/action-self-test.yaml
+#
+# — and delete this paragraph.
+name: action-self-test
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Nightly at 04:41 UTC: a quiet, arbitrary minute offset from
+    # ci.yaml's 04:17 so the two never collide on a runner burst.
+    - cron: "41 4 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  self-test:
+    name: action self-test (create, consume, delete)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing after the checkout needs the token; leaving it out
+          # keeps it off the runner and out of the job's git config.
+          persist-credentials: false
+
+      - name: Create the clusters
+        id: create
+        uses: ./.github/actions/create
+        with:
+          count: '2'
+          # full exercises the scc-admission webhook image build (the
+          # docker/buildx path) on top of the plain kind lifecycle.
+          profile: full
+
+      - name: Assert the create output
+        # Runs only when create succeeded (the default condition);
+        # every later step is responsible for its own if: always().
+        env:
+          CLUSTERS: ${{ steps.create.outputs.clusters }}
+          PREFIX: ${{ steps.create.outputs.prefix }}
+          STATE_ROOT: ${{ steps.create.outputs.state_root }}
+        run: |
+          set -euo pipefail
+          # The output parses as JSON and carries exactly two clusters.
+          test "$(jq 'length' <<<"$CLUSTERS")" -eq 2
+          # Values are paths and contexts, never credential content:
+          # exactly the two documented keys, and no kubeconfig fields.
+          jq -e 'to_entries | all(.value | (keys | sort) == ["context", "kubeconfig"])' <<<"$CLUSTERS" >/dev/null
+          ! grep -Eq 'client-certificate-data|client-key-data|token:' <<<"$CLUSTERS"
+          # Keys are exactly the clusters kind-ocp lists (kind-ocp is
+          # on PATH: the create action's GITHUB_PATH write).
+          listed="$(kind-ocp list --config '' --prefix "$PREFIX" --state-root "$STATE_ROOT" | awk 'NR>1 {print $1}' | sort)"
+          test "$listed" = "$(jq -r 'keys[]' <<<"$CLUSTERS" | sort)"
+          # Every kubeconfig exists and serves its context with all
+          # nodes Ready. Names are [a-z0-9-]+, so word splitting over
+          # the keys is safe; paths and contexts stay quoted.
+          for name in $(jq -r 'keys[]' <<<"$CLUSTERS"); do
+            kubeconfig="$(jq -r --arg name "$name" '.[$name].kubeconfig' <<<"$CLUSTERS")"
+            context="$(jq -r --arg name "$name" '.[$name].context' <<<"$CLUSTERS")"
+            test -f "$kubeconfig"
+            nodes="$(kubectl --kubeconfig "$kubeconfig" --context "$context" get nodes --no-headers)"
+            total="$(wc -l <<<"$nodes" | tr -d '[:space:]')"
+            ready="$(awk '$2 == "Ready"' <<<"$nodes" | wc -l | tr -d '[:space:]')"
+            test "$total" -gt 0
+            test "$ready" -eq "$total"
+          done
+
+      - name: Delete the clusters
+        id: delete
+        # always(): cleanup must run when the create or assert steps
+        # failed; the guard skips only the case where create never
+        # resolved a scope at all (nothing to clean).
+        if: always() && steps.create.outputs.prefix != ''
+        uses: ./.github/actions/delete
+        with:
+          prefix: ${{ steps.create.outputs.prefix }}
+          state_root: ${{ steps.create.outputs.state_root }}
+
+      - name: Assert the deletion
+        # Runs only when the delete step itself succeeded: a failed
+        # delete is the job's failure, not this assertion's.
+        if: always() && steps.delete.outcome == 'success'
+        env:
+          PREFIX: ${{ steps.create.outputs.prefix }}
+          STATE_ROOT: ${{ steps.create.outputs.state_root }}
+        run: |
+          set -euo pipefail
+          # No <prefix>-<n> containers remain (kind names the node
+          # containers <cluster>-control-plane, so the pattern is
+          # prefix-shaped but not end-anchored; grep -c prints 0 and
+          # exits 1 on no match, which the || true keeps off set -e).
+          containers="$(docker ps -a --format '{{.Names}}' | grep -c "^${PREFIX}-[0-9]+" || true)"
+          test "$containers" -eq 0
+          # kind-ocp lists nothing under the prefix (header only).
+          rows="$(kind-ocp list --config '' --prefix "$PREFIX" --state-root "$STATE_ROOT" | tail -n +2 | wc -l | tr -d '[:space:]')"
+          test "$rows" -eq 0
+          # The per-prefix state directory is gone.
+          test ! -e "$STATE_ROOT/$PREFIX"

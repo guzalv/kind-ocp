@@ -717,7 +717,7 @@ cluster (a deliberate scope cut).
 
 ## 7. Roadmap
 
-- [ ] **Consumer GitHub Actions.** Let GitHub-Actions jobs in other
+- [x] **Consumer GitHub Actions.** Let GitHub-Actions jobs in other
   repos (StackRox, Compliance Operator) stand up kind-ocp clusters
   through reusable actions. Shape: a `create`/`delete` composite pair.
   `create` takes the cluster count, profile, prefix, state root, and
@@ -739,3 +739,114 @@ cluster (a deliberate scope cut).
   pass, followed by dispatching the self-test on the remote. A README
   section documents consumer usage. N>2 clusters needs larger
   runners.
+
+  Delivered. Design record: §8 (one deviation from the sketch above:
+  no buildx setup step, with evidence). The staged move into
+  `.github/` is tracked by `action/MOVE.md`.
+
+## 8. Consumer GitHub Actions — design record
+
+The §7 roadmap item as built. Everything stages under `action/`
+because `.github/` is protected for the automated sessions that
+develop this repo; the authorized-session move (paths, the stale
+STAGED FILE block in ci.yaml, the v0.1.2 tag, the remote self-test
+dispatch) is `action/MOVE.md`.
+
+Components:
+
+- `action/create/action.yml` — composite action: resolve the scope →
+  set up Go → `go install` the pinned release → `kind-ocp create` →
+  emit the clusters output → `kind-ocp verify`.
+- `action/delete/action.yml` — self-sufficient (its own setup and
+  install steps), idempotent `kind-ocp delete --config '' --prefix
+  <p> --state-root <r>`.
+- `action/self-test.yaml` — the remote proof: dispatch + nightly,
+  ubuntu-latest, create (count 2, full profile — the webhook image
+  build included) → assert the output contract → delete under
+  `if: always()` fed by create's outputs → assert the cleanup. Its
+  `uses:` paths are the final operative ones (`./.github/actions/…`),
+  so the move needs no content edits.
+- `action/local-gate.sh` — the local gate: runs the actions' own
+  `run:` scripts the way a runner would (INPUT_* environment, the
+  GITHUB_OUTPUT / GITHUB_PATH files with path entries applied
+  between steps, the `steps.<id>.outputs.*` context) against the
+  local Docker daemon. Scenarios: `yaml` (parse + pin and injection
+  invariants), `e2e` (the full output contract, verify-failure
+  propagation via a sabotaged check, a credential-leak grep over
+  step logs and outputs), `failure` (a create killed mid-run still
+  exposed prefix/state_root and emitted no clusters; a delete run
+  from a fresh step context cleans the half-created prefix), and
+  `spaced` (a state root containing a space keeps the JSON valid
+  and the kubeconfigs usable). It also plants ambient `KIND_OCP_*`
+  values around every step to prove the scripts neutralize them.
+  Not used by CI; the move handoff removes it.
+
+Contract decisions:
+
+- Input names use underscores (`state_root`), never dashes:
+  composite-action inputs reach `run:` steps as `INPUT_<NAME>`
+  environment variables, and `INPUT_STATE-ROOT` is unreferenceable
+  in bash.
+- No `${{ }}` inside any `run:` script. Caller-controlled values
+  cross as environment variables only (automatic INPUT_* for inputs,
+  step `env:` blocks for values resolved by earlier steps), so input
+  bytes are never parsed as shell language. `local-gate.sh yaml`
+  enforces the invariant.
+- The prefix default is `ko-<run id>` (a name prefix is not
+  isolation; on an ephemeral runner uniqueness needs only run
+  identity). The scope step validates it by mirroring
+  `config.ValidatePrefix` with shell globs — not a line-oriented
+  regex, which could let a value containing a newline match one
+  clean line and inject arbitrary lines into GITHUB_OUTPUT.
+  kind-ocp re-validates; the mirror is the early, clear refusal.
+- `prefix` and `state_root` are written to GITHUB_OUTPUT before
+  anything that can fail, so an `if: always()` delete can clean a
+  half-created prefix even when create dies during setup. They are
+  written in heredoc-delimiter form, so no value can inject output
+  lines. The state-root default is `<RUNNER_TEMP>/kind-ocp`:
+  runner-private, wiped between jobs, and a location nothing should
+  cache.
+- `clusters` is composed by the action (`jq -c`) from
+  `kind-ocp list` (the keys) and `kind-ocp kubeconfig <name>` (the
+  paths), with `context` = `kind-<name>` — kind's naming invariant,
+  asserted against live clusters by the self-test. Adding `--json`
+  to the CLI is a non-goal; the action consumes list's first column
+  only, which is its name field by construction.
+- `clusters` is emitted after create succeeds and before verify
+  runs: a failed verify still leaves it populated for debugging
+  steps, and the step's failure is the contract either way.
+- Ambient `KIND_OCP_*` is unset in every script that invokes
+  kind-ocp: the action's contract is its inputs, not the runner's
+  environment. `--config ''` is passed whenever no config input is
+  given. `prefix` and `state_root` are always explicit flags (they
+  win over any config file); `count` and `profile` are added only
+  when the inputs are non-empty, so the config file or the built-in
+  defaults govern them.
+- No buildx setup step — a deliberate deviation from the roadmap
+  sketch. `docker/setup-buildx-action` defaults to the
+  docker-container driver with `use: true`, and the webhook build
+  (`Provisioner.BuildImage`) runs a plain `docker build
+  --provenance=false` with no `--load`, which requires the built
+  image in the daemon store. GitHub-hosted ubuntu runners ship the
+  buildx CLI plugin preinstalled, and this repo's own integration
+  CI builds the webhook image on ubuntu-latest with no buildx
+  setup — the same environment the self-test runs in. A
+  docker-container builder would break the build; a no-op setup
+  step would add a third-party action for nothing.
+- Every `run:` script sets `euo pipefail` and quotes every
+  expansion; tool exit codes propagate (the sabotage re-run in the
+  local gate proves verify's non-zero exit fails the step).
+- Third-party actions are SHA-pinned with version comments —
+  `actions/setup-go` v7.1.0 inside both composite actions and
+  `actions/checkout` v7.0.1 in the self-test, the same commits
+  ci.yaml pins. `setup-go` runs with `cache: false`: the caller
+  need not be a Go project, and keying a cache on the caller's
+  go.sum is pointless on an ephemeral runner.
+- The self-test grants `contents: read`, checks out with
+  `persist-credentials: false`, runs dispatch + nightly only (no
+  `pull_request`, never `pull_request_target`), and sets an explicit
+  timeout. Its post-delete assertions run only when the delete step
+  itself succeeded, so a failed delete is reported as itself, not as
+  a confusing assertion failure.
+- Local gating cannot prove Linux-runner behavior; the handoff's
+  final step dispatches the self-test remotely and requires green.

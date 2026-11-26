@@ -1,0 +1,78 @@
+# kind-ocp consumer action: delete (docs/PLAN.md §8). Deletes the
+# kind-ocp clusters of one prefix and its per-prefix state directory.
+# Self-sufficient — it installs the pinned kind-ocp release itself —
+# so it works under `if: always()` even when the create action failed
+# during its own setup. Idempotent: absent clusters and absent state
+# are not errors, so a re-run continues where a stopped one left off.
+#
+# Security posture: same as action/create (no `${{ }}` in `run:`,
+# `euo pipefail`, quoted expansions, ambient KIND_OCP_* neutralized).
+#
+# STAGED FILE — this is the complete action, byte-for-byte, but it
+# does not live at its operative path yet: the automated sessions
+# that develop this repo run under a sandbox that refuses writes to
+# `.github/` (a protected configuration path there), and evading
+# that refusal is not an option. Move it into place from a normal
+# (non-automated) session, following action/MOVE.md:
+#
+#   mkdir -p .github/actions
+#   git mv action/delete .github/actions/delete
+#
+# — and delete this paragraph.
+name: 'kind-ocp delete'
+description: >-
+  Delete the kind-ocp clusters of one prefix and its state root.
+  Self-sufficient and idempotent; designed for `if: always()`.
+
+inputs:
+  prefix:
+    description: >-
+      Cluster name prefix to delete (every <prefix>-<i> cluster and
+      the per-prefix state directory). Required.
+    required: true
+  state_root:
+    description: >-
+      kind-ocp state root the create action used. Empty derives
+      <RUNNER_TEMP>/kind-ocp, the create action's default; pass
+      create's state_root output whenever create used a custom one.
+    default: ''
+  kind_ocp_version:
+    description: >-
+      Released kind-ocp version the action installs with go install.
+      Keep aligned with the create action's input (the defaults are).
+    default: 'v0.1.1'
+  go_version:
+    description: >-
+      Go toolchain for the install; must satisfy the pinned release's
+      go.mod minimum.
+    default: '1.27.4'
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Go
+      uses: actions/setup-go@d8cbb8045d7f43706b9177cbeb36c1f91a6644d5 # v7.1.0
+      with:
+        go-version: ${{ inputs.go_version }}
+        # See action/create: caching against the caller's go.sum is
+        # pointless here, and the caller need not be a Go project.
+        cache: false
+
+    - name: Install kind-ocp
+      shell: bash
+      run: |
+        set -euo pipefail
+        go install "github.com/guzalv/kind-ocp/cmd/kind-ocp@${INPUT_KIND_OCP_VERSION:?kind_ocp_version input is empty}"
+        echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+    - name: Delete the clusters
+      shell: bash
+      run: |
+        set -euo pipefail
+        unset KIND_OCP_CONFIG KIND_OCP_PREFIX KIND_OCP_COUNT KIND_OCP_PROFILE
+        # Same default the create action derives, so a same-job
+        # delete cleans up a default-scope create.
+        state_root="${INPUT_STATE_ROOT:-${RUNNER_TEMP:?RUNNER_TEMP is not set}/kind-ocp}"
+        # --config '' pins the lookup off: cleanup must not depend on
+        # whatever KIND_OCP_CONFIG the calling workflow carries.
+        kind-ocp delete --config '' --prefix "${INPUT_PREFIX:?prefix input is required}" --state-root "$state_root"

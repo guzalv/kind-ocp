@@ -24,6 +24,15 @@ The pin table itself lives in the root README ("Defaults and pins").
 - **StackRox charts (example)**: record the new version and digest from
   `https://charts.stackrox.io/index.yaml` in `examples/stackrox/charts.go`
   and run the example once.
+- **Consumer actions (action/)**: the `kind_ocp_version` input default
+  (kept identical in `action/create/action.yml` and
+  `action/delete/action.yml`), the `go_version` default (must satisfy
+  the pinned release's go.mod minimum), and the SHA-pinned
+  `actions/setup-go` / `actions/checkout` commits there — the same pin
+  discipline as ci.yaml (commit SHA plus version comment). A bump is:
+  edit the files, run `action/local-gate.sh all` (needs Docker), and —
+  after the staged move into `.github/` — dispatch the self-test
+  workflow remotely and require green.
 
 ## Lint toolchain
 

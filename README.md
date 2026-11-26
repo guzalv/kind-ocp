@@ -249,6 +249,110 @@ ungenerated cluster names are validation errors. `delete`, `list`,
 `verify`, and `kubeconfig` never read create-only values, so a create-only
 mistake never blocks cleanup.
 
+## GitHub Actions (consumer CI)
+
+Jobs in other repositories can stand up kind-ocp clusters through the
+create/delete composite-action pair. `create` installs the pinned
+kind-ocp release with `go install`, creates the clusters, verifies
+them, and emits per-cluster kubeconfig paths and contexts — never
+credential content. `delete` is self-sufficient (it installs kind-ocp
+itself, so it works under `if: always()` even when create failed
+during its own setup) and idempotent. The pair ships in the v0.1.2
+release (`guzalv/kind-ocp/action/{create,delete}@v0.1.2`); until that
+tag is cut the actions are staged under [`action/`](action) in this
+repository, gated by [action/local-gate.sh](action/local-gate.sh) and
+an ubuntu-latest self-test workflow
+([action/self-test.yaml](action/self-test.yaml), dispatch + nightly).
+
+```yaml
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@<sha> # your repository's pin
+        with:
+          persist-credentials: false
+      - name: Create the kind-ocp clusters
+        id: kindocp
+        uses: guzalv/kind-ocp/action/create@v0.1.2
+        with:
+          count: '2'
+          profile: full
+          prefix: rox-e2e # optional; default ko-<run id>
+      - name: Consume the clusters
+        env:
+          # One cluster, directly:
+          KUBECONFIG_1: ${{ fromJSON(steps.kindocp.outputs.clusters)['rox-e2e-1'].kubeconfig }}
+          # Or every cluster:
+          CLUSTERS: ${{ steps.kindocp.outputs.clusters }}
+        run: |
+          set -euo pipefail
+          kubectl --kubeconfig "$KUBECONFIG_1" --context kind-rox-e2e-1 get nodes
+          for name in $(jq -r 'keys[]' <<<"$CLUSTERS"); do
+            kubeconfig="$(jq -r --arg n "$name" '.[$n].kubeconfig' <<<"$CLUSTERS")"
+            kubectl --kubeconfig "$kubeconfig" --context "kind-$name" get nodes
+          done
+      - name: Delete the clusters
+        if: always() && steps.kindocp.outputs.prefix != ''
+        uses: guzalv/kind-ocp/action/delete@v0.1.2
+        with:
+          prefix: ${{ steps.kindocp.outputs.prefix }}
+          state_root: ${{ steps.kindocp.outputs.state_root }}
+```
+
+### `create` inputs and outputs
+
+| Input | Default | Notes |
+|---|---|---|
+| `count` | `''` | Empty passes no `--count`; the config file or the built-in default (2) governs. |
+| `profile` | `''` | Empty passes no `--profile` (default `full`). |
+| `prefix` | `''` | Empty derives `ko-<run id>`. Lowercase alphanumeric and `-`, 1-40 chars. |
+| `state_root` | `''` | Empty derives `<RUNNER_TEMP>/kind-ocp`. Always wins over the config file. |
+| `config` | `''` | Path to a kind-ocp config file, resolved against the job's working directory. Empty disables file lookup. |
+| `kind_ocp_version` | `v0.1.1` | The released version `go install` builds. |
+| `go_version` | `1.27.4` | Must satisfy the release's go.mod minimum. |
+
+| Output | Value |
+|---|---|
+| `prefix` | The effective cluster name prefix. |
+| `state_root` | The effective state root. |
+| `clusters` | Single-line JSON keyed by cluster name: `{"<name>": {"kubeconfig": <path>, "context": <name>}}`. Emitted after create succeeds, before verify runs. |
+
+`delete` takes `prefix` (required), `state_root`, `kind_ocp_version`,
+and `go_version` (same defaults), and produces no outputs.
+
+### Caveats
+
+- Ephemeral GitHub-hosted runners only. A name prefix is not
+  isolation on a shared Docker daemon; two jobs on one self-hosted
+  runner can collide.
+- Create and delete must run in the same job: the state-root default
+  derives from `RUNNER_TEMP`, which differs across jobs. The pattern
+  above feeds create's outputs to delete and needs nothing else.
+- Keep `kind_ocp_version` and `go_version` aligned between create and
+  delete (the defaults are).
+- N > 2 clusters needs larger runners; the standard runner's CPU and
+  RAM must absorb the per-cluster ~1 GiB RAM (see
+  [Performance and resource budget](#performance-and-resource-budget)).
+- No caching, deliberately: a restored state directory lacks kind-ocp's
+  ownership marker, and the state store refuses an unmarked tree — the
+  marker is what proves the tree is kind-ocp's to delete.
+- `clusters` is emitted once create succeeds, before verify: a failed
+  verify still leaves it populated for debugging steps under
+  `if: always()`; the step fails either way.
+- `prefix` and `state_root` inputs always win over any config-file
+  values; `count` and `profile` pass through only when non-empty, so
+  a config file can govern them.
+- No buildx setup step is needed or wanted: GitHub-hosted ubuntu
+  runners ship the buildx CLI plugin the full profile's webhook
+  build needs, and a docker-container-driver builder would not load
+  the built image into the daemon store.
+- Nothing beyond the job's default runtime token is used; a
+  `contents: read` job works.
+
 ## Defaults and pins
 
 Every external input is pinned; every pin is overridable through config
@@ -267,6 +371,9 @@ struct for its own.
 | scc-admission scope | watched namespace `openshift-compliance`, injected UID `1001` | `layers.scc-admission.*` |
 | CO catalog (proof only) | committed manifests in `internal/verify/compliance/catalog`, every image digest-pinned, served by `ghcr.io/complianceascode/compliance-operator-catalog@sha256:b5ad7b09…` | `make pin-compliance-catalog` |
 | StackRox charts (example only) | `stackrox-{central,secured-cluster-services} 500.0.0`, tarballs SHA-256-verified | constants in `examples/stackrox/charts.go` |
+| kind-ocp release (consumer actions) | `v0.1.1` via `go install` | `kind_ocp_version` action input |
+| Go toolchain (consumer actions) | `1.27.4` (the pinned release's go.mod minimum) | `go_version` action input |
+| actions used by the consumer actions | `actions/setup-go v7.1.0` (create + delete), `actions/checkout v7.0.1` (self-test), SHA-pinned | edit `action/` (see [docs/maintenance.md](docs/maintenance.md)) |
 
 Bump procedures for every pin, and the CI policy, live in
 [docs/maintenance.md](docs/maintenance.md).

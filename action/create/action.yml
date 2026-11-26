@@ -1,0 +1,208 @@
+# kind-ocp consumer action: create (docs/PLAN.md §8). Installs the
+# pinned kind-ocp release, creates the configured clusters, verifies
+# them, and emits kubeconfig paths and contexts per cluster — never
+# credential content. Designed for ephemeral GitHub-hosted runners;
+# the matching delete action cleans up under `if: always()`.
+#
+# Security posture, fixed by design:
+#   - No `${{ }}` interpolation inside any `run:` script: every
+#     caller-controlled value crosses as an environment variable
+#     (automatic INPUT_* for the action's underscore-named inputs,
+#     step `env:` for values resolved by earlier steps), so input
+#     bytes are never parsed as shell language.
+#   - Every `run:` script sets `euo pipefail` and quotes every
+#     expansion; kind-ocp's and the tools' exit codes propagate.
+#   - The prefix is validated with shell globs, not a line-oriented
+#     regex: a value containing a newline must not slip a
+#     line-oriented match through into GITHUB_OUTPUT.
+#   - Outputs are written in heredoc-delimiter form, so a value
+#     containing a newline cannot inject extra output lines.
+#
+# STAGED FILE — this is the complete action, byte-for-byte, but it
+# does not live at its operative path yet: the automated sessions
+# that develop this repo run under a sandbox that refuses writes to
+# `.github/` (a protected configuration path there), and evading
+# that refusal is not an option. Move it into place from a normal
+# (non-automated) session, following action/MOVE.md:
+#
+#   mkdir -p .github/actions
+#   git mv action/create .github/actions/create
+#
+# — and delete this paragraph.
+name: 'kind-ocp create'
+description: >-
+  Create N OCP-like kind clusters (default 2, profile full) with the
+  pinned kind-ocp release, verify them, and emit kubeconfig paths and
+  contexts per cluster.
+
+inputs:
+  count:
+    description: >-
+      Number of clusters to create. Empty (the default) passes no
+      --count flag, so the config file or the built-in default (2)
+      governs.
+    default: ''
+  profile:
+    description: >-
+      Layer profile for create (full, minimal, or a custom profile
+      defined in the config file). Empty passes no flag.
+    default: ''
+  prefix:
+    description: >-
+      Cluster name prefix; clusters are <prefix>-<i>. Empty derives
+      ko-<run id>. Must satisfy kind-ocp's prefix rules: lowercase
+      alphanumeric and '-', 1-40 chars.
+    default: ''
+  state_root:
+    description: >-
+      kind-ocp state root. Empty derives <RUNNER_TEMP>/kind-ocp.
+      Always passed explicitly, so it wins over any config-file
+      value.
+    default: ''
+  config:
+    description: >-
+      Path to a kind-ocp config file, resolved against the calling
+      job's working directory. Empty passes --config '' (no
+      config-file lookup at all).
+    default: ''
+  kind_ocp_version:
+    description: >-
+      Released kind-ocp version the action installs with go install.
+    default: 'v0.1.1'
+  go_version:
+    description: >-
+      Go toolchain for the install; must satisfy the pinned release's
+      go.mod minimum.
+    default: '1.27.4'
+
+outputs:
+  prefix:
+    description: The effective cluster name prefix.
+    value: ${{ steps.scope.outputs.prefix }}
+  state_root:
+    description: The effective kind-ocp state root.
+    value: ${{ steps.scope.outputs.state_root }}
+  clusters:
+    description: >-
+      Single-line JSON object keyed by cluster name; each value is
+      {"kubeconfig": <path>, "context": <name>}. Emitted after create
+      succeeds and before verify runs, so a failed verify still
+      leaves it populated for debugging steps under if: always().
+    value: ${{ steps.clusters.outputs.clusters }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve the scope
+      id: scope
+      shell: bash
+      run: |
+        set -euo pipefail
+        prefix="${INPUT_PREFIX:-ko-${GITHUB_RUN_ID:?GITHUB_RUN_ID is not set}}"
+        state_root="${INPUT_STATE_ROOT:-${RUNNER_TEMP:?RUNNER_TEMP is not set}/kind-ocp}"
+
+        # Mirror config.ValidatePrefix (^[a-z0-9]([-a-z0-9]*[a-z0-9])?$,
+        # 1-40 chars). Shell globs, not grep: grep matches line by
+        # line, so a value containing a newline could pass on one
+        # clean line and then inject arbitrary lines into
+        # GITHUB_OUTPUT. kind-ocp re-validates; this is the early,
+        # clear refusal.
+        case "$prefix" in
+          ''|*[!a-z0-9-]*|-*|*-)
+            echo "prefix '$prefix' is not a valid cluster name prefix (lowercase alphanumeric and '-', 1-40 chars, no leading or trailing '-')" >&2
+            exit 1 ;;
+        esac
+        if [ "${#prefix}" -gt 40 ]; then
+          echo "prefix '$prefix' is longer than 40 characters" >&2
+          exit 1
+        fi
+
+        # Emitted before anything that can fail, so an if: always()
+        # delete can clean up a half-created prefix even when this
+        # action dies during setup. Heredoc-delimiter form: a value
+        # containing a newline cannot inject extra output lines.
+        {
+          echo "prefix<<KINDOCP_CREATE_EOF"
+          printf '%s\n' "$prefix"
+          echo "KINDOCP_CREATE_EOF"
+          echo "state_root<<KINDOCP_CREATE_EOF"
+          printf '%s\n' "$state_root"
+          echo "KINDOCP_CREATE_EOF"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Set up Go
+      uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+      with:
+        go-version: ${{ inputs.go_version }}
+        # The install below downloads the kind-ocp module; keying a
+        # cache on the calling repository's go.sum (which need not
+        # exist — a consumer of this action does not have to be a Go
+        # project) is pointless on an ephemeral runner.
+        cache: false
+
+    - name: Install kind-ocp
+      shell: bash
+      run: |
+        set -euo pipefail
+        go install "github.com/guzalv/kind-ocp/cmd/kind-ocp@${INPUT_KIND_OCP_VERSION:?kind_ocp_version input is empty}"
+        echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+    - name: Create the clusters
+      env:
+        KIND_OCP_ACTION_PREFIX: ${{ steps.scope.outputs.prefix }}
+        KIND_OCP_ACTION_STATE_ROOT: ${{ steps.scope.outputs.state_root }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        # The action's contract is its inputs, not the runner's
+        # ambient environment: neutralize any KIND_OCP_* the calling
+        # workflow carries.
+        unset KIND_OCP_CONFIG KIND_OCP_PREFIX KIND_OCP_COUNT KIND_OCP_PROFILE
+        args=(--config "${INPUT_CONFIG:-}" --prefix "$KIND_OCP_ACTION_PREFIX" --state-root "$KIND_OCP_ACTION_STATE_ROOT")
+        if [ -n "${INPUT_COUNT:-}" ]; then args+=(--count "$INPUT_COUNT"); fi
+        if [ -n "${INPUT_PROFILE:-}" ]; then args+=(--profile "$INPUT_PROFILE"); fi
+        kind-ocp create "${args[@]}"
+
+    - name: Emit the clusters output
+      id: clusters
+      env:
+        KIND_OCP_ACTION_PREFIX: ${{ steps.scope.outputs.prefix }}
+        KIND_OCP_ACTION_STATE_ROOT: ${{ steps.scope.outputs.state_root }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        unset KIND_OCP_CONFIG KIND_OCP_PREFIX KIND_OCP_COUNT KIND_OCP_PROFILE
+        command -v jq >/dev/null 2>&1 || {
+          echo "jq is required to compose the clusters output (preinstalled on GitHub-hosted runners)" >&2
+          exit 1
+        }
+        args=(--config "${INPUT_CONFIG:-}" --prefix "$KIND_OCP_ACTION_PREFIX" --state-root "$KIND_OCP_ACTION_STATE_ROOT")
+        # Captured before the loop (not piped into it): a list
+        # failure must stay fatal under set -e and pipefail.
+        listing="$(kind-ocp list "${args[@]}")"
+        json='{}'
+        while read -r name; do
+          [ -n "$name" ] || continue
+          kubeconfig="$(kind-ocp kubeconfig "${args[@]}" "$name")"
+          # context is kind's own naming invariant for a cluster
+          # name; the self-test asserts it against a live cluster.
+          json="$(jq -c --arg name "$name" --arg kubeconfig "$kubeconfig" --arg context "kind-$name" \
+            '. + {($name): {kubeconfig: $kubeconfig, context: $context}}' <<<"$json")"
+        done < <(printf '%s\n' "$listing" | awk 'NR>1 {print $1}')
+        {
+          echo "clusters<<KINDOCP_CLUSTERS_EOF"
+          printf '%s\n' "$json"
+          echo "KINDOCP_CLUSTERS_EOF"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Verify the clusters
+      env:
+        KIND_OCP_ACTION_PREFIX: ${{ steps.scope.outputs.prefix }}
+        KIND_OCP_ACTION_STATE_ROOT: ${{ steps.scope.outputs.state_root }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        unset KIND_OCP_CONFIG KIND_OCP_PREFIX KIND_OCP_COUNT KIND_OCP_PROFILE
+        args=(--config "${INPUT_CONFIG:-}" --prefix "$KIND_OCP_ACTION_PREFIX" --state-root "$KIND_OCP_ACTION_STATE_ROOT")
+        # Any FAIL exits non-zero and fails the step.
+        kind-ocp verify "${args[@]}"
