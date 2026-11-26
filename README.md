@@ -45,7 +45,7 @@ reject pods; the shim cannot.
 ```sh
 # Prerequisites: Docker client + daemon, the buildx CLI plugin, Go
 # 1.27.4+, kubectl for inspection — see Prerequisites below.
-go install github.com/guzalv/kind-ocp@v0.1.0
+go install github.com/guzalv/kind-ocp/cmd/kind-ocp@v0.1.0
 # (installs to $(go env GOPATH)/bin — make sure it is on your PATH)
 
 kind-ocp create                    # 2 clusters: kind-ocp-1, kind-ocp-2, profile full
