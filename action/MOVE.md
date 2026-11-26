@@ -78,6 +78,16 @@ code review, security review) have passed:
      in ci.yaml, the v0.1.2 tag, the remote self-test dispatch) is
      `action/MOVE.md`." with "… was executed per
      `action/MOVE.md`, removed once it landed." — same reason.
+   - `docs/PLAN.md` §8, Components list: the four staged paths
+     become the post-move ones — `action/create/action.yml` and
+     `action/delete/action.yml` become `.github/actions/create/action.yml`
+     and `.github/actions/delete/action.yml`,
+     `action/self-test.yaml` becomes
+     `.github/workflows/action-self-test.yaml`, and
+     `action/local-gate.sh` becomes `tools/local-gate.sh`. The
+     intro bullet above rewrites only §8's closing sentence;
+     without this the Components list still points at the
+     emptied `action/` tree.
 
 6. Commit and push the move — the pushed default branch is what
    makes the workflow dispatchable in the next step:

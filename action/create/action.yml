@@ -17,6 +17,10 @@
 #   - The prefix is validated with shell globs, not a line-oriented
 #     regex: a value containing a newline must not slip a
 #     line-oriented match through into GITHUB_OUTPUT.
+#   - Refusals never echo the raw input: the runner parses `::`
+#     workflow commands from stderr too, so a rejected multiline
+#     prefix echoed back could inject one (a legacy set-output
+#     writing the prefix output the always() delete consumes).
 #   - Outputs are single-line `key=value` directives. A state_root
 #     carrying CR or LF is refused outright (spaces stay supported),
 #     so no value can inject extra output lines.
@@ -119,11 +123,17 @@ runs:
         # clear refusal.
         case "$prefix" in
           ''|*[!a-z0-9-]*|-*|*-)
-            echo "prefix '$prefix' is not a valid cluster name prefix (lowercase alphanumeric and '-', 1-40 chars, no leading or trailing '-')" >&2
+            # Fixed message, never the raw value: the runner parses
+            # :: workflow commands from stderr too, and a rejected
+            # multiline prefix echoed here could inject one — a
+            # legacy set-output writing the prefix output that the
+            # always() delete step consumes.
+            echo "prefix is not a valid cluster name prefix (lowercase alphanumeric and '-', 1-40 chars, no leading or trailing '-')" >&2
             exit 1 ;;
         esac
         if [ "${#prefix}" -gt 40 ]; then
-          echo "prefix '$prefix' is longer than 40 characters" >&2
+          # Same rule: the refusal never echoes the raw value.
+          echo "prefix is longer than 40 characters" >&2
           exit 1
         fi
 

@@ -51,8 +51,9 @@
 #   smoke   A: exact per-step wiring (id, shell, env mapping, no
 #             conditions or overrides) and the action outputs
 #             mapping; supplied and default inputs behave; a CR/LF
-#             state_root is refused; delete enforces its required
-#             prefix
+#             state_root is refused; a multiline prefix is refused
+#             without its raw value reaching the log; delete
+#             enforces its required prefix
 #   e2e     B+D: a default-input create of 2 full-profile clusters
 #             through the create action's own scripts, the output
 #             contract, verify-failure propagation, delete, clean
@@ -712,7 +713,29 @@ line2" || rc=$?
     || die "the refused scope step still wrote output directives:"$'\n'"$(cat "$nw/step-outputs/scope.output")"
   pass "state_root containing a newline is refused; no output directives are written"
 
-  # 5. delete enforces its required prefix through its own mapping.
+  # 5. Negative: a prefix carrying a newline is refused the same
+  #    way — and the refusal never echoes the raw value. The runner
+  #    parses :: workflow commands from stderr too, so a rejected
+  #    multiline prefix echoed back could inject a set-output past
+  #    the GITHUB_OUTPUT guard (workflow-command injection).
+  local pw="$GATE_ROOT/smoke-prefix-multiline"
+  fresh_work "$pw"
+  CURRENT_RUN_ID="$rid"
+  rc=0
+  run_step create "Resolve the scope" "$pw" "-prefix" \
+    "INPUT_PREFIX=ko-inject
+::set-output::prefix=pwned" "INPUT_STATE_ROOT=" || rc=$?
+  [ "$rc" -ne 0 ] || die "a prefix containing a newline was accepted"
+  grep -q 'prefix is not a valid cluster name prefix' "$pw/logs/"*Resolve*.log \
+    || die "the scope step failed without the expected prefix refusal (see $pw/logs)"
+  [ ! -s "$pw/step-outputs/scope.output" ] \
+    || die "the refused scope step still wrote output directives:"$'\n'"$(cat "$pw/step-outputs/scope.output")"
+  if grep -q 'pwned' "$pw/logs/"*Resolve*.log || grep -q 'ko-inject' "$pw/logs/"*Resolve*.log; then
+    die "the refused prefix was echoed to the log — a workflow-command injection surface:"$'\n'"$(cat "$pw/logs/"*Resolve*.log)"
+  fi
+  pass "prefix containing a newline is refused; no directives; the raw value never reaches the log"
+
+  # 6. delete enforces its required prefix through its own mapping.
   local dlw="$GATE_ROOT/smoke-delete"
   fresh_work "$dlw"
   CURRENT_RUN_ID="$rid"
