@@ -87,6 +87,16 @@ kind network.
   release manifests, on every full-profile create), and
   `raw.githubusercontent.com` (the 18 OpenShift API CRDs, at the pinned
   `openshift/api` commit).
+- **umask 002** (the Debian `usergroups` default): other tooling on
+  such systems leaves `~/.local` 0775, and kind-ocp refuses a
+  group-writable ancestor of its state root — the default is
+  `${XDG_STATE_HOME:-~/.local/state}/kind-ocp`, and the tree holds
+  cluster-admin kubeconfigs. A fresh machine is fine (kind-ocp creates
+  a missing `~/.local` 0700). When create fails with "is
+  group-writable", either tighten the directory the error names
+  (`chmod g-w ~/.local`) or point the state root at a private location
+  (`--state-root`, or `XDG_STATE_HOME`) — the error carries both
+  remedies.
 - Platforms: linux/amd64 and macOS (Docker Desktop). On macOS the
   Linux-only host tunings degrade to notes, never failures.
 - **macOS pitfalls** (environment constraints, not kind-ocp defects):
@@ -287,6 +297,13 @@ into the cluster) plus a **~4 MB** container layer; the pinned node
 image (~1.3 GB) is pulled once and shared by every cluster on the
 daemon, as is the ~15 MB scc-admission image.
 
+Totals for the default 2-cluster run: roughly **5 GB of images** (the
+node, OLM, builder, and webhook images above — pulled once and shared
+by every cluster on the daemon) plus **~1.5 GB per cluster** in
+volumes. A small disk caps the practical cluster count well below the
+64 limit: budget the shared image set plus ~1.5 GB per cluster, and
+check `docker system df` before raising `--count`.
+
 `--count` is **hard-capped at 64**: create refuses a larger count up
 front. Within the cap, clusters 2..N are created concurrently with no
 concurrency limiter, so the practical bound is the daemon's capacity.
@@ -315,8 +332,10 @@ concurrency limiter, so the practical bound is the daemon's capacity.
 - The scc-admission webhook's `failurePolicy` is `Ignore` (a wedged
   webhook degrades to OpenShift-absent behavior rather than blocking pod
   creation); its scope is the namespaces it is configured to watch.
-- The module path `github.com/guzalv/kind-ocp` is provisional until the
-  publishing location is confirmed; renaming is mechanical.
+- `kubectl get scc` does not work: the pinned upstream SCC CRD declares
+  no `shortNames`, and adding one would diverge from the
+  digest-verified bytes kind-ocp applies. Use the full resource name:
+  `kubectl get securitycontextconstraints`.
 
 ## Repository layout and history
 

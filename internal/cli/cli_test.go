@@ -236,6 +236,70 @@ clusters:
 	})
 }
 
+// A typo'd layer name in an unselected profile is a create-only
+// failure (§3.3, §5.3): create must fail fast on it, and the scope
+// commands — delete, list, verify, kubeconfig — must run their normal
+// course with the same config file, never the profile validation.
+func TestUnselectedProfileTypoIsCreateOnly(t *testing.T) {
+	stateRoot := filepath.Join(t.TempDir(), "state")
+	cfgFile := filepath.Join(t.TempDir(), "cfg.yaml")
+	content := `
+prefix: t
+count: 1
+profile: minimal
+stateRoot: ` + stateRoot + `
+profiles:
+  typoed:
+    layers: [nope]
+`
+	if err := os.WriteFile(cfgFile, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prov := &cliFakeProvisioner{clusters: map[string]bool{}, api: newFakeAPIServer(t, true)}
+
+	// Create fails on the unselected profile's typo, before anything
+	// is provisioned, naming the profile and the unknown layer.
+	_, errOut, err := runCommand(t, prov, "create", "--config", cfgFile)
+	if err == nil {
+		t.Fatal("create must fail on the unselected profile's unknown layer")
+	}
+	if !strings.Contains(errOut, "typoed") || !strings.Contains(errOut, "nope") {
+		t.Errorf("stderr = %q, want the profile and unknown layer named", errOut)
+	}
+	if len(prov.clusters) != 0 {
+		t.Errorf("provisioned = %v, want nothing (validation precedes provisioning)", prov.clusters)
+	}
+
+	// A clean create (no config file) builds the cluster the scope
+	// commands below operate on, under the same prefix and state root.
+	if _, _, err := runCommand(t, prov, "create", "--prefix", "t", "--count", "1",
+		"--profile", "minimal", "--state-root", stateRoot); err != nil {
+		t.Fatalf("clean create failed: %v", err)
+	}
+
+	// The same config file must not block any scope command.
+	out, _, err := runCommand(t, prov, "list", "--config", cfgFile)
+	if err != nil {
+		t.Fatalf("list with the typo'd config failed: %v", err)
+	}
+	if !strings.Contains(out, "t-1") {
+		t.Errorf("stdout = %q, want cluster t-1 listed", out)
+	}
+	if _, _, err := runCommand(t, prov, "kubeconfig", "t-1", "--config", cfgFile); err != nil {
+		t.Fatalf("kubeconfig with the typo'd config failed: %v", err)
+	}
+	out, _, err = runCommand(t, prov, "verify", "--config", cfgFile)
+	if err != nil {
+		t.Fatalf("verify with the typo'd config failed: %v", err)
+	}
+	if !strings.Contains(out, "PASS") {
+		t.Errorf("stdout = %q, want verify's normal check output", out)
+	}
+	if _, _, err := runCommand(t, prov, "delete", "--config", cfgFile); err != nil {
+		t.Fatalf("delete with the typo'd config failed: %v", err)
+	}
+}
+
 // The cleanup hint must appear after every failed create, including
 // failures that happen before any record is written (the old code gated the
 // hint on having records, which hid live clusters).

@@ -116,6 +116,17 @@ func CheckManagedDir(path string) error {
 	return checkManagedACL(path)
 }
 
+// ErrUnsafeAncestor is wrapped by the ancestor policy's refusals of a
+// writable, non-sticky directory: a directory above the managed region
+// whose permissions would let another local user substitute or race the
+// entries kind-ocp's safety depends on. The refusal's own message names
+// the chmod remedy; a caller that knows what the chain leads to (the
+// state root) can use the sentinel to offer the further alternative of
+// pointing its root at a location the policy already accepts — a user
+// who cannot or will not tighten a shared home directory still has a
+// way forward.
+var ErrUnsafeAncestor = errors.New("unsafe ancestor directory")
+
 // CheckAncestorDir verifies that path is usable as an ancestor of the
 // state tree: a real directory, owned by the current user or by root, and
 // writable by no one but its owner unless the sticky bit is set (the
@@ -140,10 +151,12 @@ func CheckAncestorDir(path string) error {
 		// Without the sticky bit, write access for anyone but the
 		// owner means another local user can substitute entries.
 		if perm&0o020 != 0 {
-			return fmt.Errorf("%s is group-writable (mode %04o)", path, perm)
+			return fmt.Errorf("%w: %s is group-writable (mode %04o); fix with chmod g-w %s",
+				ErrUnsafeAncestor, path, perm, path)
 		}
 		if perm&0o002 != 0 {
-			return fmt.Errorf("%s is world-writable (mode %04o)", path, perm)
+			return fmt.Errorf("%w: %s is world-writable (mode %04o); fix with chmod o-w %s",
+				ErrUnsafeAncestor, path, perm, path)
 		}
 	}
 	return checkAncestorACL(path)

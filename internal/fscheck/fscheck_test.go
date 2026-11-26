@@ -160,13 +160,43 @@ func TestCheckAncestorDir(t *testing.T) {
 	t.Run("group-writable dir is rejected", func(t *testing.T) {
 		d := makeDir(t, filepath.Join(dir, "a770"), 0o770)
 		wantErr(t, CheckAncestorDir(d), "group-writable")
+		// The refusal must carry its remedy (§5.3: a cold machine
+		// hits this with no way forward otherwise) and be classifiable
+		// as an ancestor-policy refusal, so the state layer can offer
+		// the state-root alternative on top of it.
+		err := CheckAncestorDir(d)
+		if !errors.Is(err, ErrUnsafeAncestor) {
+			t.Errorf("CheckAncestorDir(0770) = %v, want an ErrUnsafeAncestor chain", err)
+		}
+		if !strings.Contains(err.Error(), "chmod g-w "+d) {
+			t.Errorf("CheckAncestorDir(0770) = %v, want the chmod g-w remedy naming %s", err, d)
+		}
 	})
 
 	t.Run("world-writable dir is rejected", func(t *testing.T) {
 		// 0777 is group-writable too; either rejection names the
-		// problem. The sticky-bit subtest covers the passing case.
+		// problem and carries its chmod remedy. The sticky-bit subtest
+		// covers the passing case.
 		d := makeDir(t, filepath.Join(dir, "a777"), 0o777)
-		wantErr(t, CheckAncestorDir(d), "writable")
+		err := CheckAncestorDir(d)
+		wantErr(t, err, "writable")
+		if !strings.Contains(err.Error(), "chmod g-w "+d) && !strings.Contains(err.Error(), "chmod o-w "+d) {
+			t.Errorf("CheckAncestorDir(0777) = %v, want a chmod remedy naming %s", err, d)
+		}
+	})
+
+	t.Run("world-writable-only dir is rejected with chmod o-w", func(t *testing.T) {
+		// 0002 carries no group-write bit, so this pins the
+		// world-writable branch and its remedy exactly.
+		d := makeDir(t, filepath.Join(dir, "a002"), 0o002)
+		err := CheckAncestorDir(d)
+		wantErr(t, err, "world-writable")
+		if !errors.Is(err, ErrUnsafeAncestor) {
+			t.Errorf("CheckAncestorDir(0002) = %v, want an ErrUnsafeAncestor chain", err)
+		}
+		if !strings.Contains(err.Error(), "chmod o-w "+d) {
+			t.Errorf("CheckAncestorDir(0002) = %v, want the chmod o-w remedy naming %s", err, d)
+		}
 	})
 	t.Run("sticky world-writable dir passes", func(t *testing.T) {
 		// The /tmp shape: world-writable, but the sticky bit keeps

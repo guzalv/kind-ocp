@@ -646,6 +646,55 @@ func TestCreateEagerValidation(t *testing.T) {
 			t.Errorf("provisioned = %v, want nothing", prov.created)
 		}
 	})
+
+	// A profile's layer list naming an unknown layer fails create up
+	// front, selected (the long-standing behavior) or not (§5.3's
+	// cold-machine finding: a typo in an unselected profile previously
+	// created fine and surfaced only on the run that selected it).
+	t.Run("unknown layer in a selected profile", func(t *testing.T) {
+		cfg := testConfig(t, 1, "typoed")
+		cfg.Profiles["typoed"] = config.Profile{Layers: []string{"one", "nope"}}
+		prov := newFakeProvisioner()
+		reg := layers.NewRegistry()
+		if err := reg.Register(&recordingLayer{name: "one"}); err != nil {
+			t.Fatal(err)
+		}
+		client := newTestClient(t, cfg, reg, prov)
+
+		_, err := client.Create(context.Background())
+		if err == nil {
+			t.Fatal("expected an error")
+		}
+		if !strings.Contains(err.Error(), "typoed") || !strings.Contains(err.Error(), "nope") {
+			t.Errorf("error %q must name the profile and the unknown layer", err)
+		}
+		if len(prov.created) != 0 {
+			t.Errorf("provisioned = %v, want nothing (validation precedes provisioning)", prov.created)
+		}
+	})
+
+	t.Run("unknown layer in an unselected profile", func(t *testing.T) {
+		cfg := testConfig(t, 1, "minimal")
+		cfg.Profiles["unselected"] = config.Profile{Layers: []string{"one", "nope"}}
+		cfg.Profiles["also-fine"] = config.Profile{Layers: []string{"one"}}
+		prov := newFakeProvisioner()
+		reg := layers.NewRegistry()
+		if err := reg.Register(&recordingLayer{name: "one"}); err != nil {
+			t.Fatal(err)
+		}
+		client := newTestClient(t, cfg, reg, prov)
+
+		_, err := client.Create(context.Background())
+		if err == nil {
+			t.Fatal("expected the unselected profile's typo to fail create")
+		}
+		if !strings.Contains(err.Error(), "unselected") || !strings.Contains(err.Error(), "nope") {
+			t.Errorf("error %q must name the profile and the unknown layer", err)
+		}
+		if len(prov.created) != 0 {
+			t.Errorf("provisioned = %v, want nothing (validation precedes provisioning)", prov.created)
+		}
+	})
 }
 
 func TestCreateReusesMatchingRecord(t *testing.T) {

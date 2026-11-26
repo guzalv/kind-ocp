@@ -165,8 +165,10 @@ func fromStateRecord(r state.Record) Record {
 // before any other cluster starts, which is the sequential contract
 // every earlier increment ran under.
 //
-// Every cluster's profile is resolved before the first cluster is
-// provisioned, so an unknown profile or an override of an ungenerated
+// Every cluster's profile is resolved — and every profile the config
+// defines is validated against the registry, selected or not — before
+// the first cluster is provisioned, so an unknown profile, a typo'd
+// layer name in any defined profile, or an override of an ungenerated
 // cluster name fails before any cluster exists. An existing cluster is
 // reused only when its state record matches the requested node image and
 // profile and the live cluster is the instance the record is bound to;
@@ -287,6 +289,25 @@ type clusterPlan struct {
 func (c *Client) planClusters() ([]clusterPlan, error) {
 	if err := c.cfg.ValidateCreate(); err != nil {
 		return nil, err
+	}
+	// Every profile the config defines must resolve against the
+	// registry, selected or not: a typo in an unselected profile's
+	// layer list otherwise surfaces only on the run that finally
+	// selects it — or never — while the config file silently drifts
+	// from what this build can apply. The check lives here, in the
+	// create path, so the scope commands stay unaffected by it (§3.3);
+	// it tightens create (a config that previously created fine with a
+	// typo'd unselected profile now fails fast), which is the intent.
+	// Sorted for a deterministic error when several profiles are wrong.
+	defined := make([]string, 0, len(c.cfg.Profiles))
+	for name := range c.cfg.Profiles {
+		defined = append(defined, name)
+	}
+	sort.Strings(defined)
+	for _, name := range defined {
+		if _, err := layers.LayerNamesForProfile(c.reg, name, c.cfg.Profiles); err != nil {
+			return nil, err
+		}
 	}
 	names := c.cfg.ClusterNames()
 	plans := make([]clusterPlan, 0, len(names))

@@ -213,7 +213,34 @@ func (s *Store) walk(extra []string, create bool) (string, error) {
 	names := append(append([]string(nil), s.rootNames...), extra...)
 	// The configured root may be reached through ancestor aliases, so
 	// they are trusted and resolved hop by hop.
-	return fscheck.WalkDirNames(names, len(s.rootNames)-1, s.walkOptions(create, true))
+	resolved, err := fscheck.WalkDirNames(names, len(s.rootNames)-1, s.walkOptions(create, true))
+	if err != nil {
+		return "", stateRootRemedy(err)
+	}
+	return resolved, nil
+}
+
+// stateRootRemedy adds the state-root alternative to a refusal of the
+// ancestor policy, so one error carries both remedies: the refusal
+// itself already names the chmod fix for the offending directory
+// (fscheck), and a user who cannot or will not tighten a shared home
+// directory — the umask-002 default on several Linux distributions
+// leaves other tooling's ~/.local 0775, and the default state root
+// lives under it — can instead point the state root somewhere the
+// policy already accepts. Anything else passes through untouched: a
+// missing component is "no state", and a refusal about the tree itself
+// (marker, managed permissions) already carries its own remedy.
+//
+// Only the walk from the configured state root is decorated. The walks
+// below an already-verified resolved root (walkResolved, prepareRoot)
+// are pinned to a tree the operation chose; a refusal there means the
+// chain changed underneath the operation, and pointing the state root
+// elsewhere mid-operation is exactly what those refusals forbid.
+func stateRootRemedy(err error) error {
+	if !errors.Is(err, fscheck.ErrUnsafeAncestor) {
+		return err
+	}
+	return fmt.Errorf("%w — or point --state-root (or XDG_STATE_HOME) at a private location", err)
 }
 
 // walkResolved verifies — and when create is set, creates below — the

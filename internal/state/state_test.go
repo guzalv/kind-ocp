@@ -705,16 +705,35 @@ func TestAncestorWriteBitsAreRejectedWithoutSticky(t *testing.T) {
 	dir := t.TempDir()
 
 	t.Run("group-writable ancestor", func(t *testing.T) {
+		// 0775 is the real-world shape: other tooling under umask 002
+		// (the Debian usergroups default) leaves ~/.local 0775, and
+		// the default state root lives under it. The refusal must
+		// carry both remedies in one error chain: the chmod fix for
+		// the offending directory, and the state-root alternative
+		// (§5.3's cold-machine finding).
 		shared := filepath.Join(dir, "groupwritable")
-		if err := os.Mkdir(shared, 0o770); err != nil {
+		if err := os.Mkdir(shared, 0o775); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Chmod(shared, 0o770); err != nil {
+		if err := os.Chmod(shared, 0o775); err != nil {
 			t.Fatal(err)
 		}
 		_, err := Open(filepath.Join(shared, "p")).ensureClusterDir("p-1")
 		if err == nil || !strings.Contains(err.Error(), "writable") {
 			t.Fatalf("ensureClusterDir() = %v, want a group-writable ancestor rejection", err)
+		}
+		// The walk resolves ancestor symlinks before checking them
+		// (macOS $TMPDIR lives under /var), so the refusal names the
+		// resolved spelling of the offending directory.
+		resolved, rerr := filepath.EvalSymlinks(shared)
+		if rerr != nil {
+			t.Fatal(rerr)
+		}
+		if !strings.Contains(err.Error(), "chmod g-w "+resolved) {
+			t.Errorf("error %q does not carry the chmod g-w remedy for %s", err, resolved)
+		}
+		if !strings.Contains(err.Error(), "--state-root") || !strings.Contains(err.Error(), "XDG_STATE_HOME") {
+			t.Errorf("error %q does not offer pointing --state-root / XDG_STATE_HOME at a private location", err)
 		}
 	})
 	t.Run("world-writable ancestor", func(t *testing.T) {

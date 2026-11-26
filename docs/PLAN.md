@@ -544,11 +544,11 @@ exit-code fidelity in Make recipes.
 
 Each increment is one gated pass: implement → verify (tester) → review →
 security → triage. Acceptance for every increment: `make build test lint`
-green, unit tests need no Docker, integration evidence attached. All ten
-increments are delivered; the table records what each delivered and where
-its behavior is pinned. Design rationale lives in §3 — each row names the
-section that carries it — except for the two entries kept as blocks below
-the table.
+green, unit tests need no Docker, integration evidence attached. All
+eleven increments are delivered; the table records what each delivered
+and where its behavior is pinned. Design rationale lives in §3 — each
+row names the section that carries it — except for the two entries kept
+as blocks below the table.
 
 | # | Increment | Delivered | Pinned by |
 |---|---|---|---|
@@ -562,7 +562,7 @@ the table.
 | 8 | CO fitness proof + CI | `internal/verify/compliance` (semantics and gate behavior: §6); scc-admission image build moved behind `provider.ImageBuilder` — no layer invokes a container-runtime CLI directly; CI: lint + unit on every PR, integration behind the `integration` label, `workflow_dispatch`, nightly; actions SHA-pinned, workflow-level `contents: read`, no secrets. | `internal/verify/compliance` tests; `.github/workflows/ci.yaml` |
 | 9 | StackRox example | `examples/stackrox` — recipe design and boundary rules: §5.1. | example unit tests (no Docker, no helm, no network) |
 | 10 | Usability and honesty pass | Expected-vs-inventory count assertion (§3.6) with its regressions; example values-override flags and their refusal rules (§5.1); README honesty, prerequisites, recovery decision tree, performance budget (the README is the artifact; numbers in §6). | `kindocp` count-assertion regressions; `examples/stackrox` override regressions |
-| 11 | Cold-machine findings | Refusal remedies + umask-002 docs; hermetic test scratch chains (§5.3); unselected-profile layer validation; scc-shortname, lint-toolchain, disk-footprint docs (§5.3). | §5.3 |
+| 11 | Cold-machine findings | Refusal remedies: the ancestor policy's write-bit refusals name their chmod fix and are classifiable as `fscheck.ErrUnsafeAncestor`, and the state-root walk decorates that class with the `--state-root` / `XDG_STATE_HOME` alternative — one error carries both remedies (§5.3); hermetic test scratch: `internal/testscratch`, whose TestMain helper masks ambient umask write bits and re-points the scratch base under the system `/tmp` when the ambient chain is refused, wired into the seven affected packages; unselected-profile layer validation in `planClusters` — create-only by construction, a deliberate tightening (release-notes: a config with a typo'd unselected profile that previously created fine now fails fast); README: umask-002 prerequisite warning, scc-shortname limitation, disk-footprint totals and small-disk warning; maintenance doc: lint-toolchain requirement. | `internal/fscheck`, `internal/state`, `kindocp`, `internal/cli` regressions; `internal/testscratch` tests; the §5.3 umask-002 proof run |
 
 ### 5.1 StackRox example (increment 9)
 
@@ -690,6 +690,25 @@ meet the most common Linux default with no remedy offered.
   2-cluster run costs ~5 GB of images plus ~1.5 GB per cluster in
   volumes, and a small disk caps the practical cluster count well
   below the 64 limit.
+
+Delivered as increment 11. The refusal remedies and the validations
+landed as specified above. One mechanism detail the findings did not
+spell out: re-pointing the scratch base alone is not enough, because
+the testing package creates `t.TempDir`'s per-test subdirectories with
+mode 0777 — they are umask-subject, so under umask 002 they come out
+0775 (user-owned, group-writable, non-sticky) wherever the base lives.
+The delivered helper (`internal/testscratch`, wired into the seven
+packages' TestMain through `testscratch.Main`) therefore does two
+things: it adds the group- and other-write bits to the test binary's
+umask (preserving stricter ambient masks, never loosening them), and
+it re-points `GOTMPDIR`/`TMPDIR` to a fresh 0700 directory directly
+under the system `/tmp` when the ambient chain fails the ancestor
+policy. Neither touches what the boundary refuses: tests that chmod a
+directory into an unsafe shape keep failing as designed, because chmod
+applies exactly the requested mode. Proof (the §6 manual-evidence
+convention): the seven packages fail before the fix and the full
+suite passes after it, run under `umask 002` with `TMPDIR` pointed at
+a user-owned group-writable non-sticky directory.
 
 ## 6. Testing strategy
 
