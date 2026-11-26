@@ -767,31 +767,47 @@ Components:
   `uses:` paths are the final operative ones (`./.github/actions/…`),
   so the move needs no content edits.
 - `action/local-gate.sh` — the local gate: runs the actions' own
-  `run:` scripts with the environment their own `env:` mappings
-  declare. It never fabricates input variables — composite run
-  steps get no automatic INPUT_* on a real runner (GitHub documents
-  this), so the gate resolves every INPUT_* from the action.yml's
-  step `env:` mappings (a scenario supplies what a consumer's
-  `with:` would set; an unsupplied input falls back to the
-  action.yml default), which means a removed mapping fails the gate
-  instead of hiding behind injected variables. Scenarios: `yaml`
-  (parse + pin and injection invariants), `smoke` (the input wiring
-  is complete and canonical; supplied and default inputs behave; a
-  CR/LF state_root is refused before any output directive is
-  written; delete enforces its required prefix), `e2e` (default-input
+  `run:` scripts, called by name, with the environment their own
+  step `env:` mappings declare. It never fabricates input
+  variables — composite run steps get no automatic INPUT_* on a
+  real runner (GitHub documents this) — and it validates wiring
+  per step: every INPUT_* a step's script references must be
+  mapped by that step's own env as `INPUT_<NAME>:
+  ${{ inputs.<name> }}` (a mapping another step carries does not
+  help), so a removed mapping fails the gate with empty defaults
+  and nothing supplied. Step-output references resolve exactly:
+  `${{ steps.<id>.outputs.<key> }}` reads only the referenced
+  step's own output file (every step gets its own, like the
+  runner — no merged output scopes), a wrong or not-yet-run id and
+  a key the step never emitted are both refused, and the
+  action-level outputs are materialized from the `outputs:`
+  section under the same rule. The gate calls the steps through
+  explicit name sequences checked against the action.yml files,
+  so a step added without a gate call fails instead of never
+  running. Its `yaml` scenario also resolves every remote `uses:`
+  pin against api.github.com — a correctly-shaped SHA can still
+  name no commit, and a review round caught exactly such a typo in
+  the delete action's setup-go pin — and requires one SHA per repo
+  across the staged tree, so the two setup-go pins cannot drift
+  apart. Scenarios: `yaml` (parse; pins resolve; injection,
+  wiring, and step-sequence invariants), `smoke` (per-step input
+  wiring; supplied and default inputs behave; a CR/LF state_root
+  is refused before any output directive is written; delete
+  enforces its required prefix), `e2e` (default-input
   create of 2 full-profile clusters, the full output contract,
-  verify-failure propagation via a sabotaged check, a credential-leak
-  grep over step logs and outputs, the planted ambient GOBIN staying
-  unused), `failure` (a create killed mid-run — its own process
-  group only — still exposed prefix/state_root and emitted no
-  clusters; a delete run from a fresh step context cleans the
-  half-created prefix), and `spaced` (a state root containing a
-  space keeps the JSON valid and the kubeconfigs usable). It plants
-  ambient `KIND_OCP_*` values around every step to prove the
-  scripts neutralize them, gives every run a fresh mktemp scratch
-  root and a unique run id (derived prefixes never collide across
-  runs), and keeps the scratch root for inspection on failure. Not
-  used by CI; the move handoff moves it to `tools/`.
+  verify-failure propagation via a sabotaged check, a
+  credential-leak grep over step logs and outputs, the planted
+  ambient GOBIN staying unused), `failure` (a create killed
+  mid-run — its own process group only — still exposed
+  prefix/state_root and emitted no clusters; a delete run from a
+  fresh step context cleans the half-created prefix), and `spaced`
+  (a state root containing a space keeps the JSON valid and the
+  kubeconfigs usable). It plants ambient `KIND_OCP_*` values
+  around every step to prove the scripts neutralize them, gives
+  every run a fresh mktemp scratch root and a unique run id
+  (derived prefixes never collide across runs), and keeps the
+  scratch root for inspection on failure. Not used by CI; the move
+  handoff moves it to `tools/`.
 
 Contract decisions:
 
@@ -864,9 +880,12 @@ Contract decisions:
 - Third-party actions are SHA-pinned with version comments —
   `actions/setup-go` v7.1.0 inside both composite actions and
   `actions/checkout` v7.0.1 in the self-test, the same commits
-  ci.yaml pins. `setup-go` runs with `cache: false`: the caller
-  need not be a Go project, and keying a cache on the caller's
-  go.sum is pointless on an ephemeral runner.
+  ci.yaml pins; the local gate resolves every pin against
+  api.github.com and requires one SHA per repo, so a typo'd or
+  drifted pin fails gating locally. `setup-go` runs with
+  `cache: false`: the caller need not be a Go project, and keying
+  a cache on the caller's go.sum is pointless on an ephemeral
+  runner.
 - The self-test grants `contents: read`, checks out with
   `persist-credentials: false`, runs dispatch + nightly only (no
   `pull_request`, never `pull_request_target`), and sets an explicit

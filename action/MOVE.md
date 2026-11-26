@@ -68,31 +68,59 @@ code review, security review) have passed:
      workflow remotely and require green".
    - `.github/workflows/action-self-test.yaml`, header comment:
      `action/local-gate.sh` becomes `tools/local-gate.sh`.
+   - `docs/PLAN.md` §7 roadmap entry: "The staged move into
+     `.github/` is tracked by `action/MOVE.md`." becomes "The
+     staged move into `.github/` was executed per
+     `action/MOVE.md`, removed once it landed." — this file is
+     gone after step 4, so the present-tense pointer would dangle.
+   - `docs/PLAN.md` §8 intro: replace the closing "… the
+     authorized-session move (paths, the stale STAGED FILE block
+     in ci.yaml, the v0.1.2 tag, the remote self-test dispatch) is
+     `action/MOVE.md`." with "… was executed per
+     `action/MOVE.md`, removed once it landed." — same reason.
 
-6. Commit, then tag and push the release the README's consumer
-   section references:
+6. Commit and push the move — the pushed default branch is what
+   makes the workflow dispatchable in the next step:
 
    ```sh
    git add -A
    git commit -m "ci: move the consumer actions into .github/"
-   git tag v0.1.2
-   git push origin main --tags
+   git push origin main
    ```
 
-   Optional, behavior-neutral: bump the `kind_ocp_version` input
-   default from `v0.1.1` to `v0.1.2` in both
-   `.github/actions/{create,delete}/action.yml`. The binaries are
-   identical (this increment adds no Go code), so `v0.1.1` stays
-   correct either way.
+   Optional, behavior-neutral, and best done in this commit so the
+   dispatched self-test tests what ships: bump the
+   `kind_ocp_version` input default from `v0.1.1` to `v0.1.2` in
+   both `.github/actions/{create,delete}/action.yml`. The binaries
+   are identical (this increment adds no Go code), so `v0.1.1`
+   stays correct either way.
 
-7. Dispatch the self-test on the remote and confirm it is green —
-   this is the Linux-runner proof, which no local gate on macOS
-   Docker Desktop can substitute for:
+7. Dispatch the self-test on the remote and require the exact
+   dispatched run green — this is the Linux-runner proof, which no
+   local gate on macOS Docker Desktop can substitute for. Do not
+   publish the tag until it is green:
 
    ```sh
-   gh workflow run action-self-test
-   gh run watch "$(gh run list --workflow=action-self-test --limit=1 --json databaseId --jq '.[0].databaseId')"
+   gh workflow run action-self-test.yaml
+   sleep 10   # let GitHub register the dispatch
+   run_id="$(gh run list --workflow=action-self-test.yaml --event=workflow_dispatch --limit=1 --json databaseId --jq '.[0].databaseId')"
+   gh run watch "$run_id" --exit-status
    ```
 
-8. Confirm the nightly schedule picks the workflow up (the Actions
+   `--event=workflow_dispatch` selects the dispatched run — the
+   plainly newest run could be a scheduled one that started
+   meanwhile. `--exit-status` makes `gh run watch` exit non-zero
+   when the run is not green, so the sequence above fails the
+   shell instead of printing a red run and returning 0. If it is
+   not green: stop, fix, and repeat from the step that changed.
+
+8. Only now publish the release the README's consumer section
+   references:
+
+   ```sh
+   git tag v0.1.2
+   git push origin v0.1.2
+   ```
+
+9. Confirm the nightly schedule picks the workflow up (the Actions
    tab shows the next `schedule` run within a day).

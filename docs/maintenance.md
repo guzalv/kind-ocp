@@ -35,10 +35,11 @@ The pin table itself lives in the root README ("Defaults and pins").
   automatic INPUT_* variables — and outputs are single-line
   `key=value` directives with CR/LF inputs refused; keep both
   invariants when editing. A bump is: edit the files, run
-  `action/local-gate.sh all` (needs Docker; its `smoke` scenario
-  fails if an input mapping is lost), and — after the staged move
-  into `.github/` — dispatch the self-test workflow remotely and
-  require green.
+  `action/local-gate.sh all` (needs Docker, and network: its `yaml`
+  scenario resolves every `uses:` pin against api.github.com; its
+  `smoke` scenario fails if any consuming step loses its own input
+  mapping), and — after the staged move into `.github/` — dispatch
+  the self-test workflow remotely and require green.
 
 ## Lint toolchain
 
