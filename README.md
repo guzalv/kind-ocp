@@ -3,21 +3,14 @@
 `kind-ocp` is a Go CLI and importable library that creates N (default 2)
 kind clusters and applies a configurable set of OpenShift layers to each.
 The layers provide the OpenShift API surface and admission behavior that
-StackRox Central/Sensor and the Compliance Operator depend on — see
-[what is proven](#what-is-proven) for exactly how far that goes.
-
-The repo creates clusters; it deploys nothing. The [Compliance Operator
-fitness proof](#the-compliance-operator-proof) (an integration test) and
-the [StackRox example](examples/stackrox) live outside the create path by
-design: they prove the clusters are fit, they are not product
-functionality.
-
-It exists because multi-cluster OpenShift e2e work has nowhere cheap to
-run: CI gives every job one OpenShift cluster, and standing up real ones
-is slow and expensive. kind-ocp turns one Docker daemon into N
-OCP-like clusters in minutes — the multi-cluster shape (a Central on one
-cluster, Sensors on the others, one Compliance Operator per cluster)
-without the install.
+StackRox Central/Sensor and the Compliance Operator depend on. The repo
+creates clusters; it deploys nothing: the [Compliance Operator fitness
+proof](#the-compliance-operator-proof) (an integration test) and the
+[StackRox example](examples/stackrox) live outside the create path by
+design — they prove the clusters are fit, they are not product
+functionality. It exists because multi-cluster OpenShift e2e work has
+nowhere cheap to run: kind-ocp turns one Docker daemon into N OCP-like
+clusters in minutes.
 
 ## What is proven
 
@@ -52,8 +45,8 @@ reject pods; the shim cannot.
 ```sh
 # Prerequisites: Docker client + daemon, the buildx CLI plugin (see
 # Prerequisites below), Go 1.27.4+, kubectl for inspection.
-# Until the module is published (owner's call), build from a checkout
-# and invoke the binary where you built it — no PATH setup needed:
+# Build from a checkout and invoke the binary where you built it —
+# no PATH setup needed:
 go build -o kind-ocp ./cmd/kind-ocp
 
 ./kind-ocp create                  # 2 clusters: kind-ocp-1, kind-ocp-2, profile full
@@ -78,48 +71,23 @@ kind network.
 
 ## Prerequisites
 
-- **The Docker client and a running Docker daemon.** kind runs the
-  clusters as containers on the daemon; `create` needs no other runtime
-  tool — no kind CLI, no kubectl to create, no jq, no openssl, no
-  python. The runtime is reached through the `provider` boundary's
-  optional capabilities (`ImageBuilder`, `ImageLoader`, `TCPProber`, …):
-  the shipped implementation talks to Docker, and a podman
-  implementation can be added behind the same boundary without touching
-  a layer (a follow-up, not shipped).
+- **The Docker client and a running Docker daemon.** `create` needs no
+  other runtime tool — no kind CLI, no kubectl to create, no jq, no
+  openssl, no python.
 - **The buildx CLI plugin** for full-profile create: the scc-admission
-  layer builds its webhook image with `docker build`, which needs the
-  `docker-buildx` plugin discoverable by the Docker CLI (profile
-  `minimal` does not build images and needs no buildx).
+  layer builds its webhook image with `docker build` (profile `minimal`
+  does not build images and needs no buildx).
 - **Go 1.27.4 or newer** to build from a checkout (there is no released
   binary yet): the `go.mod` directive pins 1.27.4 as the minimum
-  toolchain, and an older one is refused.
+  toolchain; an older one is refused.
 - **`kubectl`** for the inspection commands the quickstart itself shows
   (kind-ocp does not need or use it).
-- **Network access** for the endpoints `create` fetches from. What
-  each endpoint actually serves, and what caches what:
-  - `docker.io` — the pinned kind node image and the scc-admission
-    builder image. Both are pulled through the Docker daemon, which
-    caches them after the first pull.
-  - `quay.io` — the OLM operator image the release's three deployments
-    run (one digest-pinned `quay.io/operator-framework/olm`
-    reference). It is pulled by the kubelet into each cluster node's
-    own containerd, not into the host Docker cache. The release's
-    floating community-catalog image is dropped by the olm layer, and
-    the pinned configmap-registry reference is never pulled at all —
-    nothing kind-ocp runs creates a ConfigMap-based CatalogSource.
-  - `github.com` — the OLM release manifests, on **every** full-profile
-    create (the download redirects to
-    `release-assets.githubusercontent.com`). They are fetched and
-    digest-verified per apply; they are not cached under the state
-    root.
-  - `raw.githubusercontent.com` at the pinned `openshift/api` commit —
-    the 18 OpenShift API CRDs, the one manifest set that is cached
-    under the state root: fetched once per state root, not once per
-    run.
-  - The Compliance Operator proof (an integration test) additionally
-    pulls its pinned images into the nodes' containerd the same way:
-    the operator, content, and scanner images from `quay.io`, and the
-    catalog server from `ghcr.io`.
+- **Network access** for the endpoints `create` fetches from:
+  `docker.io` (the pinned kind node image and the scc-admission builder
+  image), `quay.io` (the OLM operator image), `github.com` (the OLM
+  release manifests, on every full-profile create), and
+  `raw.githubusercontent.com` (the 18 OpenShift API CRDs, at the pinned
+  `openshift/api` commit).
 - Platforms: linux/amd64 and macOS (Docker Desktop). On macOS the
   Linux-only host tunings degrade to notes, never failures.
 - **macOS pitfalls** (environment constraints, not kind-ocp defects):
@@ -134,31 +102,24 @@ kind network.
     same `cli-plugins/docker-buildx` entry — one without the other fails
     the webhook image build with either "docker buildx not found" or a
     daemon-mismatch error.
-  - Source builds on macOS must keep cgo enabled (the default): the
-    state tree's extended-ACL checks read the ACL through libc, and a
-    `CGO_ENABLED=0` darwin build fails closed — refusing the state tree
-    — rather than silently skipping the check.
+  - Source builds on macOS must keep cgo enabled (the default): a
+    `CGO_ENABLED=0` darwin build fails closed on the state tree's
+    extended-ACL checks.
 
 ## Architecture
 
-```
-cmd/kind-ocp/            main() → internal/cli
-internal/cli/            cobra commands: create, delete, list, kubeconfig, verify
-kindocp/                 public façade: the provisioning loop (Create, Delete, List, Verify)
-config/                  public config types, built-in defaults (pins), load + resolution
-layers/                  public layer framework: Layer interface, Env, Registry, profiles
-provider/                public Provisioner interface (future runtimes plug in here)
-internal/provider/kind/  kind-as-library implementation (kind is pinned in go.mod)
-internal/state/          per-prefix state root, permissions, cluster records
-internal/kube/           k8s helpers: REST config, server-side apply, waits, instance IDs
-internal/layers/<name>/  the six builtin layer implementations
-internal/builtin/        registers builtin layers — the ONLY file touched when adding a layer
-internal/verify/         CO fitness proof (imported only by tests, never by create)
-assets/                  embedded manifests + webhook source
-test/integration/        build-tagged integration tests (Docker-gated)
-tools/                   regeneration and pinning tools
-examples/stackrox        Central + Sensor recipe (example only)
-```
+### Where things live
+
+The public surface is at the repo root: `kindocp/` (the provisioning
+façade), `config/`, `layers/` (the layer framework), and `provider/`
+(the runtime boundary future runtimes plug into). Implementations are
+under `internal/`: kind-as-library (`internal/provider/kind/`, pinned in
+go.mod), state, kube helpers, and `internal/layers/<name>/` for the six
+builtin layers. Supporting trees: `assets/` (embedded manifests +
+webhook source), `tools/` (regeneration and pinning tools),
+`test/integration/`, `examples/stackrox` (example only), and
+`internal/verify/` (the CO proof, imported only by tests, never by
+create).
 
 ### The six layers (profile `full`, in apply order)
 
@@ -166,10 +127,10 @@ examples/stackrox        Central + Sensor recipe (example only)
 |---|---|---|---|
 | 1 | `config-openshift` | 13 placeholder `config.openshift.io` CRDs + the 3 singletons (APIServer, Infrastructure, ClusterVersion), Infrastructure status via the status subresource | `Infrastructure/cluster` readable with `status.platformStatus` |
 | 2 | `node-labels` | labels control-plane nodes `node-role.kubernetes.io/master=""` (the exact value OLM's CSV nodeSelectors match) | every control-plane node carries the label |
-| 3 | `olm` | upstream OLM v0.46.0 (digest-verified release manifests, SSA for the CRDs, rollout waits); drops the floating community catalog and pins the catalog-operator's `:latest` image reference | both deployments Available, `operators.coreos.com/v1alpha1` served |
-| 4 | `openshift-api-crds` | the 18 real OpenShift CRDs, fetched at create time over HTTPS from the exact `openshift/api` commit go.mod pins, digest-verified, cached per state root | all 18 Established **and** carrying the real schema (a placeholder swap FAILs) |
+| 3 | `olm` | upstream OLM (digest-verified release manifests, SSA for the CRDs, rollout waits); drops the floating community catalog and pins the catalog-operator's `:latest` image reference | both deployments Available, `operators.coreos.com/v1alpha1` served |
+| 4 | `openshift-api-crds` | the 18 real OpenShift CRDs, fetched at create time over HTTPS from the `openshift/api` commit go.mod pins, cached per state root | all 18 Established **and** carrying the real schema (a placeholder swap FAILs) |
 | 5 | `platform-objects` | ~20 singleton objects (namespaces, ConfigMaps, ClusterOperators…) + the `restricted-v2`/`privileged` SCCs, ported from OpenShift and regenerable from pinned upstream commits | both SCCs, the four control-plane ConfigMaps, singletons with populated status |
-| 6 | `scc-admission` | a Go mutating webhook that emulates OpenShift SCC UID injection: on pod creates in watched namespaces it defaults `runAsUser`/`runAsGroup`/`fsGroup` where unset (an explicit `runAsUser` wins; it never denies and does not evaluate `runAsNonRoot`); image built at create time from a digest-pinned multi-stage Dockerfile and loaded into each cluster | a probe pod in a watched namespace runs with the injected UID |
+| 6 | `scc-admission` | a Go mutating webhook that emulates SCC UID injection — see [What is proven](#what-is-proven); its image is built at create time and loaded into each cluster | a probe pod in a watched namespace runs with the injected UID |
 
 `minimal` applies none (a plain kind cluster). Custom profiles select any
 subset; per-cluster overrides can run one cluster differently (for example
@@ -191,21 +152,17 @@ one registration line — the provisioning loop never changes.
 - `verify` runs global checks (nodes Ready, cross-cluster NodePort
   reachability through the shared network) plus every enabled layer's
   check, one PASS/FAIL/SKIP line per check. With no cluster names it
-  also asserts the cluster count create persisted: every cluster the
-  last create set out to build must be in the inventory, so a cluster
-  whose container and state record both vanished FAILs by name instead
-  of dropping out of the checks.
+  also asserts the persisted cluster count: a cluster whose container
+  and record both vanished FAILs by name.
 
 ### The Compliance Operator proof
 
-`internal/verify/compliance` (run by the tagged integration suite, never
-reachable from `create`) installs a real Compliance Operator through OLM
-from a catalog committed in this repo — every image digest-pinned — and
-waits for real scan results: ProfileBundles `VALID`, one `ocp4-cis` scan
-with PASS and FAIL ComplianceCheckResults. That proof is the strictest
-OpenShift-emulation test kind-ocp has: it exercises the node label, the
-SCC-UID webhook, the config objects the ocp4 OVAL checks read, and OLM
-itself.
+`internal/verify/compliance` — run by the tagged integration suite,
+never reachable from `create` — installs a real Compliance Operator
+through OLM from a catalog committed in this repo (every image
+digest-pinned) and waits for real scan results: ProfileBundles `VALID`,
+one `ocp4-cis` scan with PASS and FAIL ComplianceCheckResults. It is the
+strictest OpenShift-emulation test kind-ocp has.
 
 ## When something goes wrong
 
@@ -235,19 +192,16 @@ Four branches, each resting on a documented behavior:
    The refusal names the exact problem and path; resolve what it names
    (fix ownership or modes, remove the unrelated directory, point
    `--state-root` at the right place), then re-run `delete`. Nothing is
-   removed until the tree verifies — a pre-existing unrelated directory
-   under a custom state root is never deleted.
+   removed until the tree verifies.
 
 A cluster that vanished *entirely* — no container, no state record — is
 caught by `verify`'s cluster-count assertion (it FAILs naming the
 cluster). Re-run the **original** `create` command — same prefix,
-configuration, and `--count`, which the FAIL line names: clusters still
-present are reused when they match and the missing one is built fresh.
-A create with a *smaller* `--count` is a supported downscope — it
-rewrites the persisted expectation to that count — and would clear the
-failure without rebuilding anything, but only when the smaller count
-excludes every missing cluster: no count create can write excludes
-`<prefix>-1`, so a missing first cluster fails under every downscope.
+configuration, and `--count`: clusters still present are reused when
+they match and the missing one is built fresh. A create with a *smaller*
+`--count` is a supported downscope that rewrites the persisted
+expectation, but it clears the failure only when the smaller count
+excludes every missing cluster (`<prefix>-1` is excluded by none).
 Match the count the FAIL line reports.
 
 ## Configuration
@@ -305,40 +259,8 @@ struct for its own.
 | CO catalog (proof only) | committed manifests in `internal/verify/compliance/catalog`, every image digest-pinned, served by `ghcr.io/complianceascode/compliance-operator-catalog@sha256:b5ad7b09…` | `make pin-compliance-catalog` |
 | StackRox charts (example only) | `stackrox-{central,secured-cluster-services} 500.0.0`, tarballs SHA-256-verified | constants in `examples/stackrox/charts.go` |
 
-## Bump and maintenance policy
-
-- **Node image / OLM release**: change the pin (config or default), run
-  `make test` and the integration suite. A node-image bump means new
-  clusters — kind-ocp does not upgrade nodes in place; `delete` and
-  re-create.
-- **openshift/api**: bump the go.mod requirement, then `make generate`
-  (regenerates the build-time pin file: commit digests and the expected
-  manifest digests). The pin file and go.mod are kept in sync by test.
-- **platform-objects**: `make regenerate` refetches the pinned upstream
-  commits, splices between the managed markers, and records fixtures;
-  review the diff like any vendored content.
-- **CO catalog**: `make pin-compliance-catalog` re-derives the committed
-  manifests from the pinned bundle/image digests (through a pinned crane,
-  digest-verifying every read); a bump is a new bundle digest plus a
-  regenerated catalog, run through the integration suite. Reassess the
-  recorded GO-2026-6865 advisory at the crane pin on every crane or bundle
-  bump.
-- **StackRox charts (example)**: record the new version and digest from
-  `https://charts.stackrox.io/index.yaml` in `examples/stackrox/charts.go`
-  and run the example once.
-
-Nightly CI is the determinism signal for all of these: the integration
-suite (label-gated on PRs, manual, and nightly) re-creates clusters from
-the pins on a cold runner.
-
-## CI
-
-Lint + unit on every PR; the Docker-gated integration suite (multi-cluster
-create/verify plus the Compliance Operator proof) on PRs carrying the
-`integration` label, on manual dispatch, and nightly — the nightly run is
-the determinism signal for the pinned external inputs on a cold runner.
-Actions are SHA-pinned, permissions are `contents: read`, no secrets. The
-workflow lives at `.github/workflows/ci.yaml`.
+Bump procedures for every pin, and the CI policy, live in
+[docs/maintenance.md](docs/maintenance.md).
 
 ## Performance and resource budget
 
@@ -354,9 +276,9 @@ numbers will differ; the shape is what transfers.
 | re-run `create` over the same prefix (full reuse — the recovery path) | 8 s |
 | `delete` (2 clusters + all state) | ~1 s |
 | `verify` (2 clusters, all checks) | 17 s |
-| 2 clusters, profile `minimal` (image-cached, from the increment-7 runs) | 58 s |
-| 3 clusters, profile `full` (image-cached, from the increment-7 runs) | 89 s |
-| full integration suite, cold CO image pulls (increment-8 run, same machine) | ~17 min |
+| 2 clusters, profile `minimal` (image-cached) | 58 s |
+| 3 clusters, profile `full` (image-cached) | 89 s |
+| full integration suite, cold CO image pulls | ~17 min |
 
 Steady-state cost per cluster, measured with `docker stats` on idle
 clusters: about **1 GiB RAM** and **15–20 % of one CPU** per node
@@ -366,13 +288,9 @@ into the cluster) plus a **~4 MB** container layer; the pinned node
 image (~1.3 GB) is pulled once and shared by every cluster on the
 daemon, as is the ~15 MB scc-admission image.
 
-`--count` is **hard-capped at 64**: create refuses a larger count
-up front. Within the cap, clusters 2..N are created concurrently with
-**no concurrency limiter** after the first cluster, so the practical
-bound is the daemon's capacity (CPU, RAM, and the per-cluster budget
-above), not kind-ocp. The two are different statements: the cap is a
-refusal kind-ocp enforces, the missing limiter is a deliberate scope
-cut (adding one is out of scope).
+`--count` is **hard-capped at 64**: create refuses a larger count up
+front. Within the cap, clusters 2..N are created concurrently with no
+concurrency limiter, so the practical bound is the daemon's capacity.
 
 ## Known limitations
 
@@ -384,6 +302,11 @@ cut (adding one is out of scope).
   applied at all. `rhcos4-*` node scans cannot work on kind nodes. The
   layers cover the API surface and admission behavior the targeted
   workloads need — no more.
+- No StackRox Central/Sensor or Compliance Operator deployment as
+  product functionality (example and verification only). Consumers own
+  their e2e test suites.
+- No cluster upgrades or Kubernetes version management beyond what
+  kind provides.
 - Docker only today. The runtime boundary (`provider.ImageBuilder` and
   friends) does not assume Docker; a podman implementation is a follow-up.
 - kind-as-library is pinned (`sigs.k8s.io/kind v0.33.0`); its API is less
@@ -398,9 +321,12 @@ cut (adding one is out of scope).
 
 ## Repository layout and history
 
-Design docs: [docs/BRIEF.md](docs/BRIEF.md) (product brief, acceptance
-criteria), [docs/PLAN.md](docs/PLAN.md) (architecture and increment
-records). The development workflow that produced this repo is documented
-in [docs/workflow.md](docs/workflow.md).
+Docs: [docs/PLAN.md](docs/PLAN.md) (architecture and increment records)
+and [docs/maintenance.md](docs/maintenance.md) (bump procedures and CI).
+
+kind-ocp is a productized port of the multi-cluster kind proof in
+stackrox PR #23841. The porting map and preserved gotchas are in
+docs/PLAN.md §4. The repo was built by an automated multi-agent
+development workflow; docs/PLAN.md records the increment history.
 
 License: Apache-2.0.

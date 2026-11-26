@@ -8,16 +8,11 @@ when the example finishes, Central reports every Sensor cluster registered
 and healthy — which means a workload pod on one cluster reached a NodePort
 service on another and stayed connected.
 
-It is an example, not product functionality: kind-ocp creates the clusters
-and applies the OpenShift layers; everything here deploys third-party
-software on top of them. The code drives kind-ocp through its public
-surface (`config`, `kindocp`) plus the standard Kubernetes Go clients,
-the way an outside consumer would, and lives as a `package main` so
-nothing can import it. Its credential workspace is the one part that
-reaches inside the module: it is verified with kind-ocp's internal
-filesystem boundary (`internal/fscheck`), the same policy the state tree
-walks, reused rather than forked. An outside consumer would keep its
-credentials under a caller-owned directory it verifies itself.
+It is an example, not product functionality. The code drives kind-ocp
+through its public surface as an outside consumer would (`package
+main`, so nothing can import it); only its credential workspace reaches
+inside the module, reusing kind-ocp's `internal/fscheck` — the state
+tree's filesystem policy.
 
 ## What it does
 
@@ -33,11 +28,8 @@ credentials under a caller-owned directory it verifies itself.
 4. Generates a cluster registration secret (CRS — the modern replacement
    for init bundles, which Central 5.0 deprecates) through Central's REST
    API, over a localhost port-forward to the Central pod. On a re-run the
-   name is already taken (Central refuses a name held by a non-revoked
-   init bundle or CRS), so the previous run's CRS is revoked and a fresh
-   one generated: revocation removes only the bootstrap credential, and
-   Sensors that already registered keep their issued identities and
-   connections.
+   name is already taken, so the previous run's CRS is revoked and a fresh
+   one generated.
 5. Deploys Sensor on every remaining cluster from the pinned
    `stackrox-secured-cluster-services` chart — collector disabled
    (`collectionMethod: NO_COLLECTION`: no collector container; the
@@ -88,15 +80,10 @@ reachability (every Sensor is a workload pod on one cluster that reached
 a NodePort service on another and stayed connected), and every Sensor
 cluster registered and reporting `HEALTHY` in Central.
 
-Not proven: anything that needs real OpenShift. The example pins
-`env.openshift: false` for both charts, so StackRox's OpenShift
-deployment mode — the SCC and Route paths — is never exercised (see
+Not proven: anything needing real OpenShift, or a Central-driven
+scan-to-results round trip — see the root README's
+[what is proven](../../README.md#what-is-proven) (and
 [why the Sensors do not run in OpenShift mode](#why-the-sensors-do-not-run-in-openshift-mode)).
-And nothing anywhere in this repo drives a scan from Central to results:
-the Compliance Operator proof covers operator-initiated scans, this
-example covers deployment and connectivity. A Central-driven
-scan-to-results round trip still needs a real OpenShift cluster or a
-future proof.
 
 ## Pointing the example at your own images
 
@@ -126,35 +113,11 @@ the keys you set change; everything the recipe pins (the registration
 secret, the shrunk resource requests, the disabled collector) stays.
 `--central-values` works the same way for the Central release. Both
 flags accept one file each, validated before the clusters are touched:
-the file must be a private, caller-owned regular file (a values file
-can carry secrets, so the example refuses a symlinked or
-world-readable one), the directory holding it must pass the same
-ancestor policy the example's workspace does — a values file reached
-through a directory other local users can write is refused, because
-the entry could be swapped between the check and the moment helm
-opens it — and the file must live **outside the trees the run
-rewrites**: the example's work directory (default
-`~/.local/state/kind-ocp-stackrox-example/`; the generated values
-files are rewritten on every run and each chart's extraction on every
-fetch, so an override inside it would be overwritten or removed by
-the very run that accepted it) and this prefix's kind-ocp state
-directory (`<state root>/<prefix>/`; the expected cluster count, the
-cluster records, and the exported kubeconfigs are rewritten there,
-and `kind-ocp delete` removes the whole tree). A values file with
-more than one name — a hard link — is refused too: one of its names
-may be one of the files the run rewrites in place (a cluster record,
-a kubeconfig), and the run cannot see a file's other names to tell
-the safe links from the clobbering ones; make an independent copy
-(`cp`, not `ln`) and pass the copy. The path is
-resolved to its absolute form before helm sees it (a relative path —
-or a file named `-`, which helm reads as stdin — would make helm open
-whatever its own resolution picks), and the resolved path must not
-contain a comma, a double quote, a newline, or a carriage return: helm
-parses each `-f` operand as a CSV record, so such a path would make it
-load a different, unchecked file (the example refuses those paths up
-front). Nothing in the file is ever logged.
-Your images must be pullable from every cluster (kind nodes have no
-registry access beyond what the daemon and the network allow).
+the file must be a private, caller-owned regular file outside the work
+and state trees (the example's work directory and this prefix's kind-ocp
+state directory, both rewritten by the run); see the root repo docs for
+the full refusal policy. Nothing in the file is ever logged. Your images
+must be pullable from every cluster.
 
 ## Pins and determinism
 
@@ -183,50 +146,17 @@ StackRox version and should stay on the same appVersion.
   `~/.local/state/kind-ocp-stackrox-example/<prefix>/`), not under the
   system temporary directory: it holds persistent credentials, and a
   predictable temp path has parents another local user could substitute.
-  Its name is derived from the *resolved* state root — the state root's
-  own name plus `-stackrox-example` — and the derived location is
-  opened with alias following disabled, because `kind-ocp delete`
-  removes the state tree: a symlink at the workspace's base or leaf is
-  refused wherever it points, so no alias can point the credentials
-  into the state tree. The refusal, not a path comparison, is what
-  keeps the trees apart — on a case-insensitive filesystem (macOS's
-  default) `State` and `state` are one directory while remaining two
-  strings, so no lexical overlap check could tell an alias naming the
-  state root in the other case from any other alias.
-- The directory is opened through kind-ocp's own filesystem boundary:
-  every ancestor is verified before it is trusted (substitutable
-  ancestors and permissive directories are refused), and the workspace
-  tree — its base and the per-prefix directory alike — is created
-  `0700` or verified caller-owned and private. The run writes through
-  the resolved path the walk returned.
 - The Central admin password is generated once (crypto/rand), stored
   `0600` in the work directory, reused across runs, and never printed or
-  logged. Every credential file — the password and the Sensor values
-  files — is checked private (owner, mode, no symlink) before each read
-  and write; a symlinked or shared file is refused, not followed.
+  logged.
 - The cluster registration secret rides in the Sensor values files,
   written `0600` and passed to helm with `-f` — never through argv,
   which other local users could read.
 - helm's own output is discarded, not forwarded to the run's log: its
-  diagnostics quote values-file content verbatim (a malformed YAML line
-  is echoed back in the error), and those files carry the admin
-  password and the registration secret. A failed helm run reports the
-  exit status and the full command line, shell-quoted — every argument
-  and the helm binary itself — so copying it into a shell reproduces
-  the run even across paths containing spaces or shell
-  metacharacters. Re-running it by hand prints helm's diagnostics,
-  which can quote values content, to your terminal only — never to the
-  run's log.
-- The example's own API calls to Central authenticate it before any
-  credential is sent: the TLS peer must present the certificate the
-  chart's CA issued — the CA is read from the `central-tls` secret
-  through the cluster's own authenticated Kubernetes API, and the
-  certificate is verified as `central.stackrox.svc`, the name the chart
-  generates. Redirect answers are refused rather than followed (Go's
-  default client would carry the Authorization header to the redirect
-  target), and a base URL that is not https is refused outright. The
-  Sensors' connection is separate — mTLS with their registration
-  identity over the shared network, verified by the readiness wait.
+  diagnostics quote values-file content verbatim, and those files carry
+  the admin password and the registration secret. A failed helm run
+  reports the exit status and the full command line, shell-quoted, so
+  copying it into a shell reproduces the run.
 
 ## Cleaning up
 
