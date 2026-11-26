@@ -64,8 +64,10 @@ inputs:
     default: ''
   config:
     description: >-
-      Path to a kind-ocp config file, resolved against the calling
-      job's working directory. Empty passes --config '' (no
+      Path to a kind-ocp config file, resolved against the GitHub
+      workspace — the directory this action's steps run in; a
+      job-level defaults.run.working-directory does not reach
+      composite-action steps. Empty passes --config '' (no
       config-file lookup at all).
     default: ''
   kind_ocp_version:

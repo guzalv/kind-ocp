@@ -1,51 +1,57 @@
 #!/usr/bin/env bash
 # local-gate.sh — gates the consumer actions by running their own
-# `run:` scripts, called by name, with the environment their own
-# step `env:` mappings declare, against the local Docker daemon.
-# NOT part of CI: the remote self-test (self-test.yaml, moved to
+# `run:` scripts, called by name, with test values supplied
+# explicitly, against the local Docker daemon. NOT part of CI: the
+# remote self-test (self-test.yaml, moved to
 # .github/workflows/action-self-test.yaml by MOVE.md) is the
 # operative Linux-runner proof; this gate covers what a macOS +
 # Docker Desktop machine can prove (docs/PLAN.md §8).
 #
-# How it stays honest about inputs: composite run steps get no
-# automatic INPUT_* variables on a real runner (GitHub documents
-# this), and this gate does not fabricate them either. Before any
-# step runs, that step's wiring is validated, per step: every
-# INPUT_* the step's script references must be mapped by THAT
-# step's own env as INPUT_<NAME>: ${{ inputs.<name> }} (a mapping
-# some other step carries does not help this one), and every
-# ${{ steps.<id>.… }} env value must name an id the action
-# declares. Both checks are purely structural — they fail with
-# empty default inputs and nothing supplied.
+# Design: the gate is NOT a runner emulator. It never resolves a
+# ${{ }} expression and never builds a runner context. It records,
+# for every run step of both actions, the EXACT wiring it expects
+# that step to declare — id, shell, and the whole env mapping,
+# verbatim — and asserts each action.yml carries exactly that
+# wiring before anything runs (a purely static check: it fails with
+# empty default inputs and nothing supplied). It then runs each
+# named step's own script with test values supplied explicitly for
+# exactly those env keys. Step-to-step data flow — the scope step's
+# outputs feeding the later steps — is read from the scope step's
+# own GITHUB_OUTPUT file and passed on explicitly, which is what
+# the asserted `${{ steps.scope.outputs.* }}` env wiring delivers
+# on a real runner. Inputs a scenario does not pin fall back to the
+# action.yml's declared default, read straight from the YAML.
 #
-# How it resolves values: an unsupplied input falls back to the
-# action.yml default, and a ${{ steps.<id>.outputs.<key> }}
-# reference resolves only from the referenced step's OWN output
-# file — the gate gives every step its own, like the runner, so
-# there are no merged output scopes and a wrong id, or a key that
-# step never emitted, is refused. The action-level outputs are
-# materialized from the outputs: section under the same rule.
+# Run steps carrying `if:`, `continue-on-error:`, or
+# `working-directory:` are refused outright: the gate executes
+# every step unconditionally in its own scratch directory and takes
+# every failure, so a condition, override, or working directory it
+# would silently ignore must fail statically instead.
 #
-# What it simulates from the runner: per-step GITHUB_OUTPUT files
-# and one cumulative GITHUB_PATH per action run (that is how the
-# runner applies it), GITHUB_RUN_ID / RUNNER_TEMP. The `uses:`
-# steps are skipped (Go is provided by the harness instead of
-# actions/setup-go). Ambient KIND_OCP_* and GOBIN values are
-# planted around every step: the scripts must neutralize the first
-# and override the second.
+# From the runner interface it takes only: per-step GITHUB_OUTPUT
+# files, one cumulative GITHUB_PATH per action run, GITHUB_RUN_ID /
+# RUNNER_TEMP. The `uses:` steps are skipped (Go is provided by the
+# harness instead of actions/setup-go). Ambient KIND_OCP_* and GOBIN
+# values are planted around every step: the scripts must neutralize
+# the first and override the second.
 #
 # The gate calls the actions' run steps through explicit name
-# sequences (CREATE_RUN_STEPS / DELETE_RUN_STEPS); the yaml
-# scenario checks those sequences against the action.yml files, so
-# a step added to an action without a gate call fails the gate
-# instead of never running.
+# sequences (CREATE_RUN_STEPS / DELETE_RUN_STEPS); the yaml scenario
+# checks those sequences against the action.yml files, so a step
+# added to an action without a gate call fails the gate instead of
+# never running.
 #
 # Scenarios (argument; `all` runs them in order):
 #   yaml    A: staged YAML parses; remote pins resolve on GitHub;
-#             injection, wiring, and step-sequence invariants hold
-#   smoke   A: per-step input wiring; supplied and default inputs
-#             behave; a CR/LF state_root is refused; delete
-#             enforces its required prefix
+#             injection, pin-shape, and step-sequence invariants
+#             hold — over the two actions and the self-test
+#             explicitly, so nothing is lost when MOVE.md relocates
+#             them
+#   smoke   A: exact per-step wiring (id, shell, env mapping, no
+#             conditions or overrides) and the action outputs
+#             mapping; supplied and default inputs behave; a CR/LF
+#             state_root is refused; delete enforces its required
+#             prefix
 #   e2e     B+D: a default-input create of 2 full-profile clusters
 #             through the create action's own scripts, the output
 #             contract, verify-failure propagation, delete, clean
@@ -74,6 +80,8 @@ if [ ! -d "$ACTIONS_DIR/create" ]; then
   ACTIONS_DIR="$REPO/.github/actions"
   SELF_TEST_YML="$REPO/.github/workflows/action-self-test.yaml"
 fi
+CREATE_YML="$ACTIONS_DIR/create/action.yml"
+DELETE_YML="$ACTIONS_DIR/delete/action.yml"
 
 die() {
   echo "FAIL: $*" >&2
@@ -106,20 +114,19 @@ if [ -z "$DOCKER_HOST" ] && [ -S "$HOME/.docker/run/docker.sock" ]; then
   export DOCKER_HOST="unix://$HOME/.docker/run/docker.sock"
 fi
 
-# The only expression forms the gate resolves, in step env blocks
-# and in the outputs: section.
+# The only expression forms the gate's recorded expectations carry
+# (checked against the declared inputs and step ids — never
+# resolved).
 P_INPUTS='${{ inputs.'
 P_STEPS='${{ steps.'
 P_END=' }}'
 
-# What a consumer's `with:` sets for the current run; empty means
-# the action.yml defaults govern.
-SUPPLIED_INPUTS=()
+# The GITHUB_RUN_ID of the current action run.
 CURRENT_RUN_ID="$RUN_ID"
 
-# The gate's explicit step sequences: every run step of each
-# action, by name, in order. The yaml scenario asserts the
-# sequences equal the action.yml run steps.
+# The gate's explicit step sequences: every run step of each action,
+# by name, in order. The yaml scenario asserts the sequences equal
+# the action.yml run steps.
 CREATE_RUN_STEPS=(
   "Resolve the scope"
   "Install kind-ocp"
@@ -132,7 +139,172 @@ DELETE_RUN_STEPS=(
   "Delete the clusters"
 )
 
-# ---------------------------------------------------------------- runner
+# ------------------------------------------------- recorded expectations
+
+# expected_step_id ACTION STEP — the id the named run step must
+# declare ('': none). The later steps' env and the create action's
+# outputs reference steps.scope / steps.clusters, so the ids are
+# part of the wiring the gate asserts.
+expected_step_id() {
+  case "$1/$2" in
+    create/"Resolve the scope") echo "scope" ;;
+    create/"Emit the clusters output") echo "clusters" ;;
+    *) echo "" ;;
+  esac
+}
+
+# expected_step_env ACTION STEP — the exact env mapping the named
+# run step must declare: one KEY=VALUE line per entry, the VALUE
+# verbatim from the action.yml. The gate asserts the actions carry
+# exactly this wiring and supplies test values for exactly these
+# keys; no expression is ever resolved.
+expected_step_env() {
+  case "$1/$2" in
+    create/"Resolve the scope")
+      printf '%s\n' \
+        'INPUT_PREFIX=${{ inputs.prefix }}' \
+        'INPUT_STATE_ROOT=${{ inputs.state_root }}'
+      ;;
+    create/"Install kind-ocp" | delete/"Install kind-ocp")
+      printf '%s\n' \
+        'INPUT_KIND_OCP_VERSION=${{ inputs.kind_ocp_version }}'
+      ;;
+    create/"Create the clusters")
+      printf '%s\n' \
+        'INPUT_COUNT=${{ inputs.count }}' \
+        'INPUT_PROFILE=${{ inputs.profile }}' \
+        'INPUT_CONFIG=${{ inputs.config }}' \
+        'KIND_OCP_ACTION_PREFIX=${{ steps.scope.outputs.prefix }}' \
+        'KIND_OCP_ACTION_STATE_ROOT=${{ steps.scope.outputs.state_root }}'
+      ;;
+    create/"Emit the clusters output" | create/"Verify the clusters")
+      printf '%s\n' \
+        'INPUT_CONFIG=${{ inputs.config }}' \
+        'KIND_OCP_ACTION_PREFIX=${{ steps.scope.outputs.prefix }}' \
+        'KIND_OCP_ACTION_STATE_ROOT=${{ steps.scope.outputs.state_root }}'
+      ;;
+    delete/"Delete the clusters")
+      printf '%s\n' \
+        'INPUT_PREFIX=${{ inputs.prefix }}' \
+        'INPUT_STATE_ROOT=${{ inputs.state_root }}'
+      ;;
+    *)
+      die "no recorded expectation for $1 step '$2' — the gate's recorded wiring is stale"
+      ;;
+  esac
+}
+
+# expected_action_outputs ACTION — the exact outputs section the
+# action must declare (KEY=VALUE lines, the VALUE verbatim); the
+# delete action declares none.
+expected_action_outputs() {
+  case "$1" in
+    create)
+      printf '%s\n' \
+        'prefix=${{ steps.scope.outputs.prefix }}' \
+        'state_root=${{ steps.scope.outputs.state_root }}' \
+        'clusters=${{ steps.clusters.outputs.clusters }}'
+      ;;
+    delete) : ;;
+  esac
+}
+
+# --------------------------------------------------------- static checks
+
+# check_step ACTION STEP_JSON YML — asserts ONE run step carries
+# exactly the gate's recorded wiring, before anything runs (it
+# fails with empty default inputs and nothing supplied):
+#   - shell: bash exactly;
+#   - no `if:` condition, no `continue-on-error:` override, no
+#     `working-directory:` — the gate runs every step
+#     unconditionally in its own scratch directory and takes every
+#     failure, so anything it would silently ignore fails here;
+#   - the step's id and its whole env mapping equal the recorded
+#     expectation, verbatim (YAML mappings are unordered, so both
+#     sides are sorted before the compare);
+#   - every INPUT_* the script references is a key of the recorded
+#     env — an unmapped reference would be an unset variable on a
+#     real runner (composite run steps get no automatic INPUT_*
+#     variables; GitHub documents this);
+#   - every `${{ inputs.<name> }}` / `${{ steps.<id>.… }}` value in
+#     the recorded env names a declared input / step id of that
+#     action — a renamed input or id would leave the reference
+#     empty on a real runner while still passing a literal compare.
+check_step() {
+  local action="$1" step_json="$2" yml="$3"
+  local name shell id expected got env_keys ref val iname sid
+  local declared_inputs declared_ids
+  name="$(jq -r '.name // "(unnamed)"' <<<"$step_json")"
+  shell="$(jq -r '.shell // ""' <<<"$step_json")"
+  [ "$shell" = "bash" ] \
+    || die "$yml: step '$name' must declare shell: bash (got '${shell:-none}') — the gate runs scripts through bash"
+  if jq -e 'has("if")' <<<"$step_json" >/dev/null; then
+    die "$yml: step '$name' carries an if: condition — the gate runs every step unconditionally and would ignore it"
+  fi
+  if jq -e 'has("continue-on-error")' <<<"$step_json" >/dev/null; then
+    die "$yml: step '$name' carries continue-on-error: — the gate takes every failure and would ignore the override"
+  fi
+  if jq -e 'has("working-directory")' <<<"$step_json" >/dev/null; then
+    die "$yml: step '$name' carries working-directory: — the gate runs every step in its own scratch directory and would ignore it"
+  fi
+  id="$(jq -r '.id // ""' <<<"$step_json")"
+  expected="$(expected_step_id "$action" "$name")"
+  [ "$id" = "$expected" ] \
+    || die "$yml: step '$name' declares id '${id:-none}', expected '${expected:-none}'"
+  expected="$(expected_step_env "$action" "$name" | LC_ALL=C sort)"
+  got="$(jq -r '(.env // {}) | to_entries[] | "\(.key)=\(.value)"' <<<"$step_json" | LC_ALL=C sort)"
+  [ "$expected" = "$got" ] \
+    || die "$yml: step '$name' env mapping differs from the gate's recorded expectation:
+--- recorded ---
+$expected
+--- declared ---
+$got"
+  env_keys="$(expected_step_env "$action" "$name" | sed 's/=.*//')"
+  while read -r ref; do
+    [ -n "$ref" ] || continue
+    grep -Fxq "$ref" <<<"$env_keys" \
+      || die "$yml: step '$name' references \$$ref, but its recorded env maps nothing onto it — composite run steps get no automatic INPUT_* variables, so the script would never see it on a real runner"
+  done < <(jq -r '.run' <<<"$step_json" | grep -oE 'INPUT_[A-Z0-9_]+' | sort -u || true)
+  declared_inputs="$(yq -r '.inputs // {} | keys | join("\n")' "$yml")"
+  declared_ids="$(yq -r '[.runs.steps[] | select(.id != null) | .id] | join("\n")' "$yml")"
+  while read -r val; do
+    [ -n "$val" ] || continue
+    case "$val" in
+      "$P_INPUTS"*"$P_END")
+        iname="${val#"$P_INPUTS"}"; iname="${iname%"$P_END"}"
+        grep -Fxq "$iname" <<<"$declared_inputs" \
+          || die "$yml: the recorded env maps a value from inputs.$iname, which is not a declared input"
+        ;;
+      "$P_STEPS"*.outputs.*"$P_END")
+        sid="${val#"$P_STEPS"}"; sid="${sid%%.outputs.*}"
+        grep -Fxq "$sid" <<<"$declared_ids" \
+          || die "$yml: the recorded env references $val, but no step declares the id '$sid'"
+        ;;
+      *)
+        die "internal: recorded env value is neither an inputs nor a steps reference: $val"
+        ;;
+    esac
+  done < <(expected_step_env "$action" "$name" | sed 's/^[^=]*=//')
+}
+
+# check_action_outputs ACTION YML — the action's outputs section
+# equals the gate's recorded expectation, verbatim: this is the
+# mapping a consumer's steps.<id>.outputs.<name> reads, so a wrong
+# step id or key here breaks consumers while every step still runs
+# green.
+check_action_outputs() {
+  local expected got
+  expected="$(expected_action_outputs "$1" | LC_ALL=C sort)"
+  got="$(yq -r '(.outputs // {}) | to_entries[] | .key + "=" + .value.value' "$2" | LC_ALL=C sort)"
+  [ "$expected" = "$got" ] \
+    || die "$2: the outputs section differs from the gate's recorded expectation:
+--- recorded ---
+$expected
+--- declared ---
+$got"
+}
+
+# ------------------------------------------------------------ execution
 
 # github_output_get FILE KEY — prints KEY's value from a
 # GITHUB_OUTPUT file. The actions emit single-line key=value
@@ -144,142 +316,6 @@ github_output_get() {
       print substr($0, index($0, "=") + 1); exit
     }
   ' "$1"
-}
-
-# github_output_has FILE KEY — exit 0 iff FILE carries a KEY=
-# directive (string compare, no regex: keys come from the YAML).
-github_output_has() {
-  local line
-  while IFS= read -r line; do
-    [ "${line%%=*}" = "$2" ] && return 0
-  done <"$1"
-  return 1
-}
-
-# check_step_wiring ACTION_YML STEP_JSON — validates ONE step's own
-# wiring, statically, before anything runs:
-#   - every INPUT_* the step's `run:` script references must be
-#     mapped by THIS step's env as INPUT_<NAME>:
-#     ${{ inputs.<name> }}, with <name> a declared input (composite
-#     run steps get no automatic INPUT_* variables — GitHub
-#     documents this; a mapping another step carries does not help
-#     this one);
-#   - every ${{ steps.<id>.… }} value in this step's env must name
-#     an id the action declares.
-check_step_wiring() {
-  local action_yml="$1" step_json="$2"
-  local script envjson referenced r name line val idval sid
-  # The ids this action's steps declare, one per line (empty when
-  # none does); membership is a fixed-string whole-line match, so
-  # no reference text is ever interpolated into a query.
-  local step_ids
-  step_ids="$(yq -r '[.runs.steps[] | select(.id != null) | .id] | join("\n")' "$action_yml")"
-  script="$(jq -r '.run // empty' <<<"$step_json")"
-  [ -n "$script" ] || return 0    # uses: step — the runner provides it
-  envjson="$(jq -c '.env // {}' <<<"$step_json")"
-  referenced="$(grep -oE 'INPUT_[A-Z0-9_]+' <<<"$script" | sort -u || true)"
-  while read -r r; do
-    [ -n "$r" ] || continue
-    name=''
-    while read -r line; do
-      [ -n "$line" ] || continue
-      if [ "$r" = "INPUT_$(printf '%s' "$line" | tr 'a-z-' 'A-Z_')" ]; then
-        name="$line"; break
-      fi
-    done < <(yq -r '.inputs | keys | .[]' "$action_yml")
-    [ -n "$name" ] \
-      || die "$action_yml: a run script references \$$r, which belongs to no declared input"
-    val="$(jq -r --arg k "$r" '.[$k] // empty' <<<"$envjson")"
-    [ -n "$val" ] \
-      || die "$action_yml: \$$r is referenced by this step's script but the step's own env maps nothing onto it — composite run steps get no automatic INPUT_* variables, so the script would never see it on a real runner"
-    while read -r line; do
-      [ -n "$line" ] || continue
-      [ "$line" = "\${{ inputs.$name }}" ] \
-        || die "$action_yml: $r is mapped as '$line', not the canonical \${{ inputs.$name }} — the value would come from the wrong input"
-    done <<<"$val"
-  done <<<"$referenced"
-  while read -r idval; do
-    [ -n "$idval" ] || continue
-    case "$idval" in
-      "$P_STEPS"*)
-        sid="${idval#"$P_STEPS"}"; sid="${sid%"$P_END"}"; sid="${sid%%.outputs.*}"
-        [ -n "$sid" ] || die "$action_yml: malformed step env reference: $idval"
-        grep -Fxq "$sid" <<<"$step_ids" \
-          || die "$action_yml: step env references '$idval', but no step declares the id '$sid'"
-        ;;
-    esac
-  done < <(jq -r '(.env // {}) | to_entries[] | .value' <<<"$step_json")
-}
-
-# step_output_value WORK '${{ steps.<id>.outputs.<key> }}' — the
-# referenced value. Only exact references resolve: <id> must be a
-# step that ran in WORK (its own output file exists under
-# WORK/step-outputs) and <key> a directive that step emitted. A
-# malformed reference, a wrong id, or a missing key is refused —
-# the gate never falls back to another step's outputs.
-step_output_value() {
-  local work="$1" val="$2" ref sid okey
-  case "$val" in
-    "$P_STEPS"*"$P_END") ;;
-    *) die "not a step output reference: $val" ;;
-  esac
-  ref="${val#"$P_STEPS"}"; ref="${ref%"$P_END"}"     # <id>.outputs.<key>
-  sid="${ref%%.outputs.*}"
-  okey="${ref##*.}"
-  if [ -z "$sid" ] || [ -z "$okey" ] || [ "$ref" != "$sid.outputs.$okey" ]; then
-    die "malformed step output reference: $val (expected steps.<id>.outputs.<key>)"
-  fi
-  [ -f "$work/step-outputs/$sid.output" ] \
-    || die "cannot resolve '$val': step '$sid' has no output file here — wrong id, or the step never ran"
-  github_output_has "$work/step-outputs/$sid.output" "$okey" \
-    || die "cannot resolve '$val': step '$sid' emitted no '$okey'"
-  github_output_get "$work/step-outputs/$sid.output" "$okey"
-}
-
-# resolve_step_env ACTION_YML ENVJSON WORK — exports one step's env
-# block into the calling shell (the step subshell). Values may be
-# literals, exact ${{ inputs.<name> }} references (declared inputs
-# only; a supplied value wins, the action.yml default is the
-# fallback), or exact ${{ steps.<id>.outputs.<key> }} references
-# (via step_output_value). Anything else carrying ${{ }} is refused
-# loudly: values must cross to scripts as environment variables,
-# never as script text.
-#
-# NOTE: the step subshell runs on the left of a `||`, where the
-# shell ignores `set -e` even inside it (verified on bash), so
-# every fallible command here carries its own `|| exit 1`.
-resolve_step_env() {
-  local action_yml="$1" envjson="$2" work="$3"
-  local n i key val name got
-  n="$(jq 'length' <<<"$envjson")"
-  for ((i = 0; i < n; i++)); do
-    key="$(jq -r "to_entries[$i].key" <<<"$envjson")"
-    val="$(jq -r "to_entries[$i].value" <<<"$envjson")"
-    case "$val" in
-      "$P_INPUTS"*"$P_END")
-        name="${val#"$P_INPUTS"}"; name="${name%"$P_END"}"
-        if ! grep -Fxq "$name" <<<"$(yq -r '.inputs | keys | join("\n")' "$action_yml")"; then
-          die "$action_yml: env maps $key from inputs.$name, which is not a declared input"
-        fi
-        got=''
-        for kv in ${SUPPLIED_INPUTS[@]+"${SUPPLIED_INPUTS[@]}"}; do
-          if [ "${kv%%=*}" = "$name" ]; then got="${kv#*=}"; break; fi
-        done
-        if [ -z "$got" ]; then
-          # $name is a declared key (checked above); the keys are
-          # [a-z0-9_-] by the actions' own convention.
-          got="$(yq -r ".inputs.\"$name\".default // \"\"" "$action_yml")" || exit 1
-        fi
-        export "$key=$got" ;;
-      "$P_STEPS"*)
-        got="$(step_output_value "$work" "$val")" || exit 1
-        export "$key=$got" ;;
-      *'$'{'{'*)
-        die "unsupported expression in step env: $val" ;;
-      *)
-        export "$key=$val" ;;
-    esac
-  done
 }
 
 # gate_path WORK — the PATH a step runs with: GATE_PATH_BASE plus
@@ -308,40 +344,73 @@ fresh_work() {
   : >"$1/github-path"
 }
 
-# run_step ACTION_YML NAME WORK TAG — runs ONE step of a composite
-# action, by name, under the gate's runner environment: wiring
-# validated first (check_step_wiring), env resolved from the step's
-# own env block, the script writing outputs to THIS step's own
-# GITHUB_OUTPUT file (WORK/step-outputs/<id>.output — its YAML
-# index when the step declares no id). TAG keeps re-runs of the
-# same step from overwriting the first log. Returns the step's exit
+# declared_default YML NAME — the action.yml's declared default for
+# NAME ('' when it declares none), read the way a runner feeds an
+# input a consumer's `with:` leaves unset.
+declared_default() {
+  yq -r ".inputs.\"$2\".default // \"\"" "$1"
+}
+
+# with_input YML NAME [WITH...] — the value a consumer's `with:`
+# sets for NAME: the override when one is given, else the declared
+# default.
+with_input() {
+  local yml="$1" name="$2" ov
+  shift 2
+  for ov in "$@"; do
+    if [ "${ov%%=*}" = "$name" ]; then printf '%s' "${ov#*=}"; return 0; fi
+  done
+  declared_default "$yml" "$name"
+}
+
+# run_step ACTION NAME WORK TAG ENV... — runs ONE named run step's
+# own script under the gate's step environment. check_step's static
+# assertions run first; the script then runs with exactly the
+# caller-supplied env values, which must cover exactly the recorded
+# key set (no extras, none missing) — the gate supplies test values,
+# it never resolves an expression. TAG keeps re-runs of the same
+# step from overwriting the first log. Returns the step's exit
 # status.
 run_step() {
-  local action_yml="$1" want="$2" work="$3" tag="$4"
-  local steps_json step script envjson id out log rc=0 idx n i
-  steps_json="$work/.steps.json"
-  yq -o=json '.runs.steps' "$action_yml" >"$steps_json"
+  local action="$1" want="$2" work="$3" tag="$4"
+  shift 4
+  local yml steps_json n i idx=-1 step script id out log rc=0 kv
+  local expected_keys supplied_keys
+  yml="$ACTIONS_DIR/$action/action.yml"
+  steps_json="$work/.steps-$action.json"
+  yq -o=json '.runs.steps' "$yml" >"$steps_json" \
+    || die "cannot read the steps of $yml"
   n="$(jq 'length' <"$steps_json")"
-  idx=-1
   for ((i = 0; i < n; i++)); do
     if [ "$(jq -r ".[$i].name // empty" <"$steps_json")" = "$want" ]; then
       idx=$i; break
     fi
   done
-  [ "$idx" -ge 0 ] || die "no step named '$want' in $action_yml"
+  [ "$idx" -ge 0 ] || die "no step named '$want' in $yml"
   step="$(jq -c ".[$idx]" <"$steps_json")"
-  script="$(jq -r '.run // empty' <<<"$step")"
-  [ -n "$script" ] \
-    || die "step '$want' of $action_yml has no run block (uses: steps are the runner's, not the gate's)"
-  check_step_wiring "$action_yml" "$step"
-  envjson="$(jq -c '.env // {}' <<<"$step")"
-  id="$(jq -r '.id // empty' <<<"$step")"
+  check_step "$action" "$step" "$yml"
+  script="$(jq -r '.run' <<<"$step")"
+  id="$(jq -r '.id // ""' <<<"$step")"
   out="$work/step-outputs/${id:-$idx}.output"
+  # The supplied values must cover exactly the recorded key set.
+  # Keys are taken per argument (values may span lines — the CR/LF
+  # probe supplies one), so a missing or extra mapping is a gate-side
+  # bug, not a silent empty.
+  expected_keys="$(expected_step_env "$action" "$want" | sed 's/=.*//' | LC_ALL=C sort)"
+  supplied_keys="$(for kv in "$@"; do printf '%s\n' "${kv%%=*}"; done | LC_ALL=C sort)"
+  [ "$expected_keys" = "$supplied_keys" ] \
+    || die "run_step '$want': the supplied values must cover exactly the recorded env keys
+--- recorded ---
+$expected_keys
+--- supplied ---
+$supplied_keys"
   : >"$out"
   log="$work/logs/$(printf '%02d%s-%s' "$((idx + 1))" "$tag" "$want" | tr ' /' '__').log"
   echo "--- step: $want"
   (
-    resolve_step_env "$action_yml" "$envjson" "$work"
+    for kv in "$@"; do
+      export "${kv%%=*}=${kv#*=}"
+    done
     export GITHUB_OUTPUT="$out" GITHUB_PATH="$work/github-path"
     export GITHUB_RUN_ID="${CURRENT_RUN_ID:?CURRENT_RUN_ID is not set}" RUNNER_TEMP="$work/runner-temp"
     # One shared GOPATH so the pinned-release download happens once.
@@ -366,61 +435,63 @@ run_step() {
   return "$rc"
 }
 
-# run_create_action WORK RUN_ID — the create action's run steps,
-# called by name in order (Set up Go is uses:; the harness provides
-# Go, standing in for actions/setup-go). Every call validates that
-# step's own wiring first, so a missing or wrong mapping fails even
-# with empty default inputs. Returns the first failing step's exit
-# status, or 0.
+# run_create_action WORK RUN_ID [WITH...] — the create action's run
+# steps, called by name in order (Set up Go is uses:; the harness
+# provides Go, standing in for actions/setup-go). WITH entries
+# (KEY=VALUE) stand for a consumer's `with:`; inputs without an
+# override fall back to the action.yml's declared defaults. The
+# scope step's own outputs feed the later steps, exactly what the
+# asserted `${{ steps.scope.outputs.* }}` env wiring delivers on a
+# real runner. Returns the first failing step's exit status, or 0.
 run_create_action() {
-  local work="$1" s
+  local work="$1" yml="$CREATE_YML"
   CURRENT_RUN_ID="$2"
+  shift 2
   fresh_work "$work"
-  for s in "${CREATE_RUN_STEPS[@]}"; do
-    run_step "$ACTIONS_DIR/create/action.yml" "$s" "$work" "" || return $?
-  done
+  local prefix state_root count profile config version
+  prefix="$(with_input "$yml" prefix "$@")" || return 1
+  state_root="$(with_input "$yml" state_root "$@")" || return 1
+  count="$(with_input "$yml" count "$@")" || return 1
+  profile="$(with_input "$yml" profile "$@")" || return 1
+  config="$(with_input "$yml" config "$@")" || return 1
+  version="$(with_input "$yml" kind_ocp_version "$@")" || return 1
+  run_step create "Resolve the scope" "$work" "" \
+    "INPUT_PREFIX=$prefix" "INPUT_STATE_ROOT=$state_root" || return $?
+  local scope_prefix scope_root
+  scope_prefix="$(github_output_get "$work/step-outputs/scope.output" prefix)" || return 1
+  scope_root="$(github_output_get "$work/step-outputs/scope.output" state_root)" || return 1
+  [ -n "$scope_prefix" ] || die "the scope step emitted no prefix"
+  [ -n "$scope_root" ] || die "the scope step emitted no state_root"
+  run_step create "Install kind-ocp" "$work" "" \
+    "INPUT_KIND_OCP_VERSION=$version" || return $?
+  local scope_env=(
+    "KIND_OCP_ACTION_PREFIX=$scope_prefix"
+    "KIND_OCP_ACTION_STATE_ROOT=$scope_root"
+  )
+  run_step create "Create the clusters" "$work" "" \
+    "INPUT_COUNT=$count" "INPUT_PROFILE=$profile" "INPUT_CONFIG=$config" \
+    "${scope_env[@]}" || return $?
+  run_step create "Emit the clusters output" "$work" "" \
+    "INPUT_CONFIG=$config" "${scope_env[@]}" || return $?
+  run_step create "Verify the clusters" "$work" "" \
+    "INPUT_CONFIG=$config" "${scope_env[@]}" || return $?
 }
 
-# run_delete_action WORK PREFIX STATE_ROOT — the delete action's
-# run steps from a fresh step context (empty GITHUB_PATH, so
-# kind-ocp resolves only through the delete action's own install
-# step), fed like the consumer's if: always() pattern: create's
-# outputs as inputs.
+# run_delete_action WORK PREFIX STATE_ROOT — the delete action's run
+# steps from a fresh step context (empty GITHUB_PATH, so kind-ocp
+# resolves only through the delete action's own install step), fed
+# like the consumer's if: always() pattern: create's outputs as
+# inputs.
 run_delete_action() {
-  local work="$1" s
-  SUPPLIED_INPUTS=("prefix=$2" "state_root=$3")
+  local work="$1" prefix="$2" state_root="$3" yml="$DELETE_YML" version
   CURRENT_RUN_ID="${RUN_ID}9"
   fresh_work "$work"
-  for s in "${DELETE_RUN_STEPS[@]}"; do
-    run_step "$ACTIONS_DIR/delete/action.yml" "$s" "$work" "" \
-      || die "action/delete failed at '$s' (see the step log above)"
-  done
-}
-
-# materialize_action_outputs ACTION_YML WORK — writes the action's
-# outputs to WORK/action-output, resolving the outputs: section the
-# way the runner does: every value must be an exact
-# ${{ steps.<id>.outputs.<key> }} reference (step_output_value), so
-# a wrong id or a key no step emitted fails the gate instead of
-# silently producing an empty output.
-materialize_action_outputs() {
-  local action_yml="$1" work="$2" out="$work/action-output"
-  local name val got names
-  names="$(yq -r '.outputs | keys | join("\n")' "$action_yml")"
-  : >"$out"
-  while read -r name; do
-    [ -n "$name" ] || continue
-    # $name is a declared outputs key; the keys are
-    # [a-z0-9_-] by the actions' own convention.
-    val="$(yq -r ".outputs.\"$name\".value" "$action_yml")"
-    case "$val" in
-      "$P_STEPS"*"$P_END")
-        got="$(step_output_value "$work" "$val")" || exit 1
-        printf '%s=%s\n' "$name" "$got" >>"$out" ;;
-      *)
-        die "$action_yml: output '$name' is not a steps.<id>.outputs.<key> reference: $val" ;;
-    esac
-  done <<<"$names"
+  version="$(declared_default "$yml" kind_ocp_version)" || return 1
+  run_step delete "Install kind-ocp" "$work" "" "INPUT_KIND_OCP_VERSION=$version" \
+    || die "the delete action failed at 'Install kind-ocp' (see the step log above)"
+  run_step delete "Delete the clusters" "$work" "" \
+    "INPUT_PREFIX=$prefix" "INPUT_STATE_ROOT=$state_root" \
+    || die "the delete action failed at 'Delete the clusters' (see the step log above)"
 }
 
 # assert_clean WORK PREFIX STATE_ROOT — no <prefix>-* containers, no
@@ -468,14 +539,14 @@ preflight_docker() {
 gate_yaml() {
   echo "=== yaml: staged files parse and hold their invariants"
   local f
-  for f in "$ACTIONS_DIR/create/action.yml" "$ACTIONS_DIR/delete/action.yml" "$SELF_TEST_YML"; do
+  for f in "$CREATE_YML" "$DELETE_YML" "$SELF_TEST_YML"; do
     yq eval '.' "$f" >/dev/null
   done
   pass "all staged YAML parses"
   # By design the actions keep ${{ }} out of run: scripts (values
   # cross as environment variables); the self-test keeps it out of
   # run: too — its env: blocks do use it, which is safe.
-  for f in "$ACTIONS_DIR/create/action.yml" "$ACTIONS_DIR/delete/action.yml"; do
+  for f in "$CREATE_YML" "$DELETE_YML"; do
     if yq -r '.runs.steps[] | select(.run != null) | .run' "$f" | grep -Fq '${{'; then
       die "$f carries a \${{ }} expression inside a run: script"
     fi
@@ -484,28 +555,41 @@ gate_yaml() {
     die "the self-test carries a \${{ }} expression inside a run: script"
   fi
   pass "no \${{ }} expressions inside run: scripts"
-  if grep -rh --include='*.yml' --include='*.yaml' -v '^[[:space:]]*#' "$ACTIONS_DIR" | grep -q 'pull_request_target'; then
-    die "pull_request_target under $ACTIONS_DIR"
-  fi
-  pass "no pull_request_target under $ACTIONS_DIR"
+  # The trigger and pin checks below run over the two actions and
+  # the self-test EXPLICITLY: a directory scan of ACTIONS_DIR would
+  # lose the self-test once the MOVE.md handoff moves it to
+  # .github/workflows/.
+  for f in "$CREATE_YML" "$DELETE_YML" "$SELF_TEST_YML"; do
+    if grep -v '^[[:space:]]*#' "$f" | grep -q 'pull_request_target'; then
+      die "pull_request_target in $f"
+    fi
+  done
+  pass "no pull_request_target in the actions or the self-test"
   # Every non-local uses: is SHA-pinned with a version comment.
-  local bad
-  bad="$(grep -rhE '^[[:space:]]*-?[[:space:]]*uses:' "$ACTIONS_DIR" --include='*.yml' --include='*.yaml' \
-    | grep -v 'uses: \./' \
-    | grep -vE 'uses: [^@[:space:]]+@[0-9a-f]{40} # .+$' || true)"
+  local uses bad=""
+  for f in "$CREATE_YML" "$DELETE_YML" "$SELF_TEST_YML"; do
+    while read -r uses; do
+      [ -n "$uses" ] || continue
+      bad+="$f: $uses"$'\n'
+    done < <(grep -E '^[[:space:]]*-?[[:space:]]*uses:' "$f" \
+      | grep -v 'uses: \./' \
+      | grep -vE 'uses: [^@[:space:]]+@[0-9a-f]{40} # .+$' || true)
+  done
   if [ -n "$bad" ]; then
     die "uses: lines not SHA-pinned with a version comment:
 $bad"
   fi
-  pass "every remote uses: is SHA-pinned with a version comment"
+  pass "every remote uses: is SHA-pinned with a version comment (actions and self-test)"
   # Every remote pin also RESOLVES on GitHub — a correctly-shaped
   # SHA can still name no commit (a typo), and such a pin loads
   # nowhere on a runner — and each repo is pinned at ONE SHA across
-  # the staged tree, so the two setup-go pins cannot drift apart.
+  # the actions and the self-test, so the two setup-go pins cannot
+  # drift apart.
   local refs ref repo sha code repos
-  refs="$(grep -rhoE 'uses: [^@[:space:]]+@[0-9a-f]{40}' "$ACTIONS_DIR" --include='*.yml' --include='*.yaml' \
+  refs="$( { grep -hoE 'uses: [^@[:space:]]+@[0-9a-f]{40}' \
+      "$CREATE_YML" "$DELETE_YML" "$SELF_TEST_YML" || true; } \
     | awk '{print $2}' | sort -u)"
-  [ -n "$refs" ] || die "no SHA-pinned uses: found under $ACTIONS_DIR (setup-go and checkout pins expected)"
+  [ -n "$refs" ] || die "no SHA-pinned uses: found (setup-go and checkout pins expected)"
   while read -r ref; do
     [ -n "$ref" ] || continue
     repo="${ref%@*}"; sha="${ref#*@}"
@@ -515,76 +599,80 @@ $bad"
       || die "uses: pin $ref does not resolve on GitHub (HTTP $code) — a runner could not load it"
   done <<<"$refs"
   repos="$(awk -F@ '{print $1}' <<<"$refs" | uniq -d)"
-  [ -z "$repos" ] || die "one repo pinned at multiple SHAs under $ACTIONS_DIR:
+  [ -z "$repos" ] || die "one repo pinned at multiple SHAs across the actions and the self-test:
 $repos"
-  pass "every remote pin resolves on GitHub; one SHA per repo across the staged tree"
+  pass "every remote pin resolves on GitHub; one SHA per repo across the actions and the self-test"
   # The gate's explicit step sequences must list every run step the
   # actions declare, in order: a step added to an action.yml without
   # a gate call fails here instead of silently never running.
   local declared
-  declared="$(yq -r '.runs.steps[] | select(.run != null) | .name' "$ACTIONS_DIR/create/action.yml")"
+  declared="$(yq -r '.runs.steps[] | select(.run != null) | .name' "$CREATE_YML")"
   [ "$declared" = "$(printf '%s\n' "${CREATE_RUN_STEPS[@]}")" ] \
-    || die "action/create's run steps and the gate's CREATE_RUN_STEPS differ:
+    || die "$CREATE_YML: the declared run steps and the gate's CREATE_RUN_STEPS differ:
 $declared"
-  declared="$(yq -r '.runs.steps[] | select(.run != null) | .name' "$ACTIONS_DIR/delete/action.yml")"
+  declared="$(yq -r '.runs.steps[] | select(.run != null) | .name' "$DELETE_YML")"
   [ "$declared" = "$(printf '%s\n' "${DELETE_RUN_STEPS[@]}")" ] \
-    || die "action/delete's run steps and the gate's DELETE_RUN_STEPS differ:
+    || die "$DELETE_YML: the declared run steps and the gate's DELETE_RUN_STEPS differ:
 $declared"
   pass "the gate's explicit step sequences cover every declared run step, in order"
 }
 
 gate_smoke() {
-  echo "=== smoke: per-step input wiring; supplied and default inputs; CR/LF refused"
-  local create_yml="$ACTIONS_DIR/create/action.yml"
-  local delete_yml="$ACTIONS_DIR/delete/action.yml"
+  echo "=== smoke: exact step wiring; supplied and default inputs; CR/LF refused"
+  local create_yml="$CREATE_YML" delete_yml="$DELETE_YML"
 
-  # 1. Static wiring, PER STEP: every INPUT_* a step's run script
-  #    references must be mapped by THAT step's own env — not by
-  #    some other step's — and every steps.<id>.… env value must
-  #    name a declared step id. Purely structural: it fails with
-  #    empty default inputs and nothing supplied.
-  local yml n i
-  for yml in "$create_yml" "$delete_yml"; do
-    n="$(yq '.runs.steps | length' "$yml")"
+  # 1. Static wiring, per step and per action — purely structural,
+  #    it fails with empty default inputs and nothing supplied:
+  #    every run step must carry exactly the gate's recorded wiring
+  #    (shell, no if:/continue-on-error:/working-directory:, id, the
+  #    whole env mapping, every INPUT_* the script references
+  #    covered), and the action-level outputs must map exactly as
+  #    recorded.
+  local action yml n i
+  for action in create delete; do
+    yml="$ACTIONS_DIR/$action/action.yml"
+    n="$(yq '[.runs.steps[] | select(.run != null)] | length' "$yml")"
     for ((i = 0; i < n; i++)); do
-      check_step_wiring "$yml" "$(yq -o=json ".runs.steps[$i]" "$yml")"
+      check_step "$action" "$(yq -o=json "[.runs.steps[] | select(.run != null)] | .[$i]" "$yml")" "$yml"
     done
+    check_action_outputs "$action" "$yml"
   done
-  pass "every run step maps the INPUT_* its own script references, canonically"
+  pass "every run step carries exactly the recorded wiring; the outputs sections map exactly"
 
   # 2. Supplied inputs reach the script through the mappings.
   local sw="$GATE_ROOT/smoke-supplied"
   fresh_work "$sw"
   CURRENT_RUN_ID="${RUN_ID}5"
-  SUPPLIED_INPUTS=("prefix=smokeprefix" "state_root=$sw/custom state root")
-  run_step "$create_yml" "Resolve the scope" "$sw" "-supplied"
+  run_step create "Resolve the scope" "$sw" "-supplied" \
+    "INPUT_PREFIX=smokeprefix" "INPUT_STATE_ROOT=$sw/custom state root" \
+    || die "the scope step failed under supplied inputs"
   [ "$(github_output_get "$sw/step-outputs/scope.output" prefix)" = "smokeprefix" ] \
     || die "the supplied prefix did not reach the scope step through its env mapping"
   [ "$(github_output_get "$sw/step-outputs/scope.output" state_root)" = "$sw/custom state root" ] \
     || die "the supplied state_root did not reach the scope step (a space must be kept)"
   pass "supplied inputs reach the scripts through the env mappings (space kept)"
 
-  # 3. Default inputs: nothing supplied, the action.yml defaults
-  #    govern through the same mappings.
+  # 3. Empty inputs: the scripts derive the documented defaults.
   local dw="$GATE_ROOT/smoke-default" rid="${RUN_ID}6"
   fresh_work "$dw"
   CURRENT_RUN_ID="$rid"
-  SUPPLIED_INPUTS=()
-  run_step "$create_yml" "Resolve the scope" "$dw" "-default"
+  run_step create "Resolve the scope" "$dw" "-default" \
+    "INPUT_PREFIX=" "INPUT_STATE_ROOT=" \
+    || die "the scope step failed under empty inputs"
   [ "$(github_output_get "$dw/step-outputs/scope.output" prefix)" = "ko-$rid" ] \
     || die "default prefix not derived from the run id"
   [ "$(github_output_get "$dw/step-outputs/scope.output" state_root)" = "$dw/runner-temp/kind-ocp" ] \
     || die "default state_root not derived from RUNNER_TEMP"
-  pass "default inputs derive the prefix from the run id and the state root from RUNNER_TEMP"
+  pass "empty inputs derive the prefix from the run id and the state root from RUNNER_TEMP"
 
   # 4. Negative: a state_root carrying a newline is refused before
   #    any output directive is written (output injection).
   local nw="$GATE_ROOT/smoke-newline" rc=0
   fresh_work "$nw"
   CURRENT_RUN_ID="$rid"
-  SUPPLIED_INPUTS=("state_root=$nw/line1
-line2")
-  run_step "$create_yml" "Resolve the scope" "$nw" "-newline" || rc=$?
+  run_step create "Resolve the scope" "$nw" "-newline" \
+    "INPUT_PREFIX=" "INPUT_STATE_ROOT=$nw/line1
+line2" || rc=$?
   [ "$rc" -ne 0 ] || die "a state_root containing a newline was accepted"
   grep -q 'state_root must be a single line' "$nw/logs/"*Resolve*.log \
     || die "the scope step failed without the expected single-line refusal (see $nw/logs)"
@@ -596,9 +684,9 @@ line2")
   local dlw="$GATE_ROOT/smoke-delete"
   fresh_work "$dlw"
   CURRENT_RUN_ID="$rid"
-  SUPPLIED_INPUTS=()
   rc=0
-  run_step "$delete_yml" "Delete the clusters" "$dlw" "-noprefix" || rc=$?
+  run_step delete "Delete the clusters" "$dlw" "-noprefix" \
+    "INPUT_PREFIX=" "INPUT_STATE_ROOT=" || rc=$?
   [ "$rc" -ne 0 ] || die "delete ran without its required prefix"
   grep -q 'prefix input is required' "$dlw/logs/"*Delete*.log \
     || die "delete failed without the expected required-prefix error (see $dlw/logs)"
@@ -607,31 +695,27 @@ line2")
 
 gate_e2e() {
   local work="$GATE_ROOT/e2e" rid="${RUN_ID}1"
-  local create_yml="$ACTIONS_DIR/create/action.yml"
   echo "=== e2e: create 2 full-profile clusters through the create action's own scripts (default inputs)"
-  SUPPLIED_INPUTS=()
   run_create_action "$work" "$rid" \
     || die "the create action failed (see the step log above)"
   pass "the create action ran clean (scope, install, create, emit, verify) with default inputs"
 
-  materialize_action_outputs "$create_yml" "$work"
   export PATH="$(gate_path "$work")"
 
+  # The action's outputs, read from the step output files the
+  # asserted outputs: section maps: prefix/state_root from the scope
+  # step's own file, clusters from the clusters step's.
   local prefix state_root clusters
-  prefix="$(github_output_get "$work/action-output" prefix)"
-  state_root="$(github_output_get "$work/action-output" state_root)"
-  clusters="$(github_output_get "$work/action-output" clusters)"
+  prefix="$(github_output_get "$work/step-outputs/scope.output" prefix)"
+  state_root="$(github_output_get "$work/step-outputs/scope.output" state_root)"
+  clusters="$(github_output_get "$work/step-outputs/clusters.output" clusters)"
 
   # Acceptance C, first half: the scope step emitted prefix and
   # state_root into ITS OWN output file — exactly what a consumer's
   # steps.scope.outputs.* reads — and clusters exists only in the
-  # clusters step's file, which did not exist at scope time.
+  # clusters step's file.
   [ "$prefix" = "ko-$rid" ] || die "default prefix not derived from the run id: '$prefix'"
   [ "$state_root" = "$work/runner-temp/kind-ocp" ] || die "unexpected default state root: '$state_root'"
-  [ -n "$(github_output_get "$work/step-outputs/scope.output" prefix)" ] \
-    || die "prefix missing from the scope step's own output"
-  [ -n "$(github_output_get "$work/step-outputs/scope.output" state_root)" ] \
-    || die "state_root missing from the scope step's own output"
   [ -z "$(github_output_get "$work/step-outputs/scope.output" clusters)" ] \
     || die "the scope step emitted a clusters directive"
   pass "prefix/state_root are the scope step's own outputs; clusters is the clusters step's"
@@ -667,7 +751,7 @@ gate_e2e() {
 
   # Acceptance D: no kubeconfig credential material in outputs or
   # logs; the planted ambient GOBIN stayed unused.
-  if grep -RE 'client-certificate-data|client-key-data' "$work/logs" "$work/step-outputs" "$work/action-output"; then
+  if grep -RE 'client-certificate-data|client-key-data' "$work/logs" "$work/step-outputs"; then
     die "kubeconfig credential material leaked into step logs or outputs"
   fi
   pass "no kubeconfig credential material in step logs or outputs"
@@ -677,14 +761,16 @@ gate_e2e() {
   # node-labels check (drop the master label from one node), re-run
   # just the verify step, and require the step to fail.
   echo "=== e2e: sabotage a verify check, then prove the failure propagates"
+  local node rc=0 config
   name="$(jq -r 'keys[0]' <<<"$clusters")"
   kc="$(jq -r --arg n "$name" '.[$n].kubeconfig' <<<"$clusters")"
-  local node rc=0
   node="$(kubectl --kubeconfig "$kc" --context "kind-$name" get nodes -o name | head -1 | cut -d/ -f2)"
   kubectl --kubeconfig "$kc" --context "kind-$name" label node "$node" node-role.kubernetes.io/master- >/dev/null
-  SUPPLIED_INPUTS=()
+  config="$(declared_default "$CREATE_YML" config)"
   CURRENT_RUN_ID="$rid"
-  run_step "$create_yml" "Verify the clusters" "$work" "-rerun" || rc=$?
+  run_step create "Verify the clusters" "$work" "-rerun" \
+    "INPUT_CONFIG=$config" \
+    "KIND_OCP_ACTION_PREFIX=$prefix" "KIND_OCP_ACTION_STATE_ROOT=$state_root" || rc=$?
   [ "$rc" -ne 0 ] || die "the verify step did not fail after the sabotage"
   grep -q 'FAIL' "$work/logs/"*rerun*Verify*.log || die "the re-run verify log shows no FAIL line"
   pass "verify's non-zero exit propagates (step exit $rc with a FAIL line)"
@@ -702,8 +788,7 @@ gate_failure() {
   # on the daemon that happens to match a kind-ocp command line.
   set -m
   (
-    SUPPLIED_INPUTS=("profile=minimal")
-    run_create_action "$work" "$rid"
+    run_create_action "$work" "$rid" "profile=minimal"
   ) &
   local pid=$!
   # Let the run get underway: wait for cluster 2's node container
@@ -750,19 +835,15 @@ gate_failure() {
 
 gate_spaced() {
   local work="$GATE_ROOT/spaced" rid="${RUN_ID}3"
-  local create_yml="$ACTIONS_DIR/create/action.yml"
   echo "=== spaced: a state root containing a space keeps the JSON valid and usable"
   local spaced_root="$work/spa ced/kind-ocp"
-  SUPPLIED_INPUTS=("profile=minimal" "state_root=$spaced_root")
-  run_create_action "$work" "$rid" \
+  run_create_action "$work" "$rid" "profile=minimal" "state_root=$spaced_root" \
     || die "the create action failed under the spaced state root (see the step log above)"
 
-  materialize_action_outputs "$create_yml" "$work"
   export PATH="$(gate_path "$work")"
-
   local prefix clusters name kc
-  prefix="$(github_output_get "$work/action-output" prefix)"
-  clusters="$(github_output_get "$work/action-output" clusters)"
+  prefix="$(github_output_get "$work/step-outputs/scope.output" prefix)"
+  clusters="$(github_output_get "$work/step-outputs/clusters.output" clusters)"
   [ "$prefix" = "ko-$rid" ] || die "default prefix not derived from the run id: '$prefix'"
   jq -e . >/dev/null <<<"$clusters" || die "spaced state root broke the clusters JSON"
   [ "$(jq 'length' <<<"$clusters")" = 2 ] || die "expected 2 clusters under the spaced state root"
@@ -780,7 +861,7 @@ gate_spaced() {
 }
 
 usage() {
-  sed -n '2,62p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,68p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-}" in

@@ -88,37 +88,55 @@ code review, security review) have passed:
    git push origin main
    ```
 
-   Optional, behavior-neutral, and best done in this commit so the
-   dispatched self-test tests what ships: bump the
-   `kind_ocp_version` input default from `v0.1.1` to `v0.1.2` in
-   both `.github/actions/{create,delete}/action.yml`. The binaries
-   are identical (this increment adds no Go code), so `v0.1.1`
-   stays correct either way.
+   Leave the `kind_ocp_version` input defaults at `v0.1.1` in both
+   actions. The `v0.1.2` tag does not exist until step 8, and the
+   self-test's install step runs `go install …@<the default>`,
+   which fails on an unpublished tag (the module proxy answers 404
+   for it — a review round verified exactly that). The binaries
+   are identical — this increment adds no Go code — so `v0.1.1`
+   stays correct; a future release that changes code can bump the
+   defaults with it.
 
-7. Dispatch the self-test on the remote and require the exact
-   dispatched run green — this is the Linux-runner proof, which no
-   local gate on macOS Docker Desktop can substitute for. Do not
-   publish the tag until it is green:
+7. Dispatch the self-test on the remote and require THAT exact run
+   green — this is the Linux-runner proof, which no local gate on
+   macOS Docker Desktop can substitute for. Do not publish the tag
+   until it is green:
 
    ```sh
-   gh workflow run action-self-test.yaml
-   sleep 10   # let GitHub register the dispatch
-   run_id="$(gh run list --workflow=action-self-test.yaml --event=workflow_dispatch --limit=1 --json databaseId --jq '.[0].databaseId')"
+   release_sha="$(git rev-parse HEAD)"    # the commit step 6 pushed
+   run_id="$(gh api --method POST \
+     repos/guzalv/kind-ocp/actions/workflows/action-self-test.yaml/dispatches \
+     -f ref=main --jq '.workflow_run_id')"
+   head_sha="$(gh run view "$run_id" --json headSha --jq .headSha)"
+   if [ "$head_sha" != "$release_sha" ]; then
+     echo "run $run_id tested $head_sha, not the release commit $release_sha" >&2
+     exit 1
+   fi
    gh run watch "$run_id" --exit-status
    ```
 
-   `--event=workflow_dispatch` selects the dispatched run — the
-   plainly newest run could be a scheduled one that started
-   meanwhile. `--exit-status` makes `gh run watch` exit non-zero
-   when the run is not green, so the sequence above fails the
-   shell instead of printing a red run and returning 0. If it is
-   not green: stop, fix, and repeat from the step that changed.
+   The run id comes from the dispatch response itself — the GitHub
+   REST API's dispatch endpoint returns `workflow_run_id` — so the
+   sequence cannot end up watching some other run. Selecting "the
+   newest `workflow_dispatch` run" from a list, as an earlier
+   revision of this step did, can pick a scheduled run or a stale
+   manual one and report the wrong green; and if the dispatch
+   response carries no `workflow_run_id`, the `gh run view` that
+   follows fails on the empty id and the headSha check stops the
+   sequence. The `headSha` check runs before the watch, so a run
+   testing the wrong commit fails fast instead of after twenty
+   minutes. `--exit-status` makes `gh run watch` exit non-zero
+   when the run is not green, so the sequence fails the shell
+   instead of printing a red run and returning 0. If the headSha
+   differs or the run is not green: stop, fix, and repeat from the
+   step that changed.
 
 8. Only now publish the release the README's consumer section
-   references:
+   references — tagging the exact commit step 7 watched (still
+   `$release_sha` in that shell):
 
    ```sh
-   git tag v0.1.2
+   git tag v0.1.2 "$release_sha"
    git push origin v0.1.2
    ```
 

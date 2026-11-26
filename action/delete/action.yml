@@ -5,7 +5,7 @@
 # during its own setup. Idempotent: absent clusters and absent state
 # are not errors, so a re-run continues where a stopped one left off.
 #
-# Security posture: same as action/create (no `${{ }}` in `run:`,
+# Security posture: same as the create action (no `${{ }}` in `run:`,
 # `euo pipefail`, quoted expansions, ambient KIND_OCP_* neutralized).
 #
 # STAGED FILE — this is the complete action, byte-for-byte, but it
@@ -54,7 +54,7 @@ runs:
       uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
       with:
         go-version: ${{ inputs.go_version }}
-        # See action/create: caching against the caller's go.sum is
+        # See the create action: caching against the caller's go.sum is
         # pointless here, and the caller need not be a Go project.
         cache: false
 
@@ -64,7 +64,7 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        # See action/create: GOBIN pinned to a runner-local
+        # See the create action: GOBIN pinned to a runner-local
         # directory, and that same directory published below, so an
         # ambient GOBIN cannot decide where the binary lands.
         install_dir="${RUNNER_TEMP:?RUNNER_TEMP is not set}/kind-ocp-bin"

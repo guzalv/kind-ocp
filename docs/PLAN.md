@@ -767,33 +767,38 @@ Components:
   `uses:` paths are the final operative ones (`./.github/actions/…`),
   so the move needs no content edits.
 - `action/local-gate.sh` — the local gate: runs the actions' own
-  `run:` scripts, called by name, with the environment their own
-  step `env:` mappings declare. It never fabricates input
-  variables — composite run steps get no automatic INPUT_* on a
-  real runner (GitHub documents this) — and it validates wiring
-  per step: every INPUT_* a step's script references must be
-  mapped by that step's own env as `INPUT_<NAME>:
-  ${{ inputs.<name> }}` (a mapping another step carries does not
-  help), so a removed mapping fails the gate with empty defaults
-  and nothing supplied. Step-output references resolve exactly:
-  `${{ steps.<id>.outputs.<key> }}` reads only the referenced
-  step's own output file (every step gets its own, like the
-  runner — no merged output scopes), a wrong or not-yet-run id and
-  a key the step never emitted are both refused, and the
-  action-level outputs are materialized from the `outputs:`
-  section under the same rule. The gate calls the steps through
+  `run:` scripts, called by name, with test values supplied
+  explicitly. It is not a runner emulator — it never resolves a
+  ${{ }} expression — after a review round found the earlier
+  partial-emulation design accepting a step that carried `if:
+  false` and `continue-on-error: true`. Instead it records, for
+  every run step of both actions, the exact wiring it expects
+  (id, `shell: bash`, and the whole env mapping, verbatim) and
+  asserts each action.yml carries exactly that before anything
+  runs, so a removed mapping or a changed scope reference fails
+  with empty defaults and nothing supplied; run steps carrying
+  `if:`, `continue-on-error:`, or `working-directory:` are refused
+  outright (the gate would silently ignore them). It then runs
+  each named step's script with test values for exactly those env
+  keys; step-to-step data flow is the scope step's own
+  GITHUB_OUTPUT file read explicitly (what the asserted
+  `${{ steps.scope.outputs.* }}` wiring delivers on a real
+  runner), and inputs a scenario does not pin fall back to the
+  action.yml's declared defaults. The gate calls the steps through
   explicit name sequences checked against the action.yml files,
   so a step added without a gate call fails instead of never
   running. Its `yaml` scenario also resolves every remote `uses:`
   pin against api.github.com — a correctly-shaped SHA can still
   name no commit, and a review round caught exactly such a typo in
-  the delete action's setup-go pin — and requires one SHA per repo
-  across the staged tree, so the two setup-go pins cannot drift
-  apart. Scenarios: `yaml` (parse; pins resolve; injection,
-  wiring, and step-sequence invariants), `smoke` (per-step input
-  wiring; supplied and default inputs behave; a CR/LF state_root
-  is refused before any output directive is written; delete
-  enforces its required prefix), `e2e` (default-input
+  the delete action's setup-go pin — over the two actions and the
+  self-test explicitly (a directory scan would lose the self-test
+  after the move), and requires one SHA per repo across them, so
+  the two setup-go pins cannot drift apart. Scenarios: `yaml`
+  (parse; pins resolve; injection, wiring, and step-sequence
+  invariants), `smoke` (exact per-step wiring and the action
+  outputs mapping; supplied and default inputs behave; a CR/LF
+  state_root is refused before any output directive is written;
+  delete enforces its required prefix), `e2e` (default-input
   create of 2 full-profile clusters, the full output contract,
   verify-failure propagation via a sabotaged check, a
   credential-leak grep over step logs and outputs, the planted

@@ -24,7 +24,7 @@ The pin table itself lives in the root README ("Defaults and pins").
 - **StackRox charts (example)**: record the new version and digest from
   `https://charts.stackrox.io/index.yaml` in `examples/stackrox/charts.go`
   and run the example once.
-- **Consumer actions (action/)**: the `kind_ocp_version` input default
+- **Consumer actions**: the `kind_ocp_version` input default
   (kept identical in `action/create/action.yml` and
   `action/delete/action.yml`), the `go_version` default (must satisfy
   the pinned release's go.mod minimum), and the SHA-pinned
@@ -37,9 +37,11 @@ The pin table itself lives in the root README ("Defaults and pins").
   invariants when editing. A bump is: edit the files, run
   `action/local-gate.sh all` (needs Docker, and network: its `yaml`
   scenario resolves every `uses:` pin against api.github.com; its
-  `smoke` scenario fails if any consuming step loses its own input
-  mapping), and — after the staged move into `.github/` — dispatch
-  the self-test workflow remotely and require green.
+  `smoke` scenario fails if any step's env wiring drifts from the
+  gate's recorded expectation — a removed mapping or a changed
+  scope reference fails with empty defaults), and — after the
+  staged move into `.github/` — dispatch the self-test workflow
+  remotely and require green.
 
 ## Lint toolchain
 

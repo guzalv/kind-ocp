@@ -312,7 +312,7 @@ jobs:
 | `profile` | `''` | Empty passes no `--profile` (default `full`). |
 | `prefix` | `''` | Empty derives `ko-<run id>`. Lowercase alphanumeric and `-`, 1-40 chars. |
 | `state_root` | `''` | Empty derives `<RUNNER_TEMP>/kind-ocp`. Always wins over the config file. Must be a single line (CR/LF refused). |
-| `config` | `''` | Path to a kind-ocp config file, resolved against the job's working directory. Empty disables file lookup. |
+| `config` | `''` | Path to a kind-ocp config file, resolved against the GitHub workspace — the directory composite-action steps run in; a job-level `defaults.run.working-directory` does not reach them. Empty disables file lookup. |
 | `kind_ocp_version` | `v0.1.1` | The released version `go install` builds. |
 | `go_version` | `1.27.4` | Must satisfy the release's go.mod minimum. |
 
