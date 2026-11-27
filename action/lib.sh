@@ -14,16 +14,24 @@
 # — which no input rule reaches. The runner parses workflow
 # commands out of the step log in two formats (actions/runner
 # v2.338.2, src/Runner.Common/ActionCommand.cs and
-# src/Runner.Worker/Handlers/OutputManager.cs): the modern
+# src/Runner.Worker/ActionCommandManager.cs): the modern
 # '::name::' introducer at the start of a line, after leading
-# whitespace (the parser TrimStarts), and the legacy '##[name]'
-# introducer ANYWHERE on a line. A bare CR ends a log line (the
-# runner reads process output with .NET line semantics). A
-# single-line input is therefore not a safe input, and %q quoting
-# is not a defense: an escaped-newline value arrives as one
-# physical line, which is exactly the shape the legacy parser
-# accepts mid-line. Every log-bound tool byte below is made inert
-# instead; the input refusals stay as defense in depth.
+# whitespace, and the legacy '##[name]' introducer ANYWHERE on a
+# line. A bare CR ends a log line (the runner reads process
+# output with .NET line semantics). Neither parser compares
+# bytes: the modern parser TrimStart()s with the full .NET
+# char.IsWhiteSpace set (U+0085, U+00A0, U+1680, U+2000-U+200A,
+# U+2028, U+2029, U+202F, U+205F, U+3000 beyond ASCII), and BOTH
+# parsers search with the culture-sensitive string overloads
+# (IndexOf / StartsWith without a StringComparison argument),
+# which skip ignorable characters such as the soft hyphen
+# U+00AD. A single-line input is therefore not a safe input, and
+# %q quoting is not a defense: an escaped-newline value arrives
+# as one physical line, which is exactly the shape the legacy
+# parser accepts mid-line. Every log-bound tool byte below is
+# made inert instead, by defenses that do not depend on
+# character classification; the input refusals stay as defense
+# in depth.
 #
 # Exit statuses are preserved: ko_run_tool returns the tool's own
 # status (PIPESTATUS), ko_capture_tool replays captured stderr
@@ -33,17 +41,39 @@
 # inside, so the caller sees the status and decides.
 
 # ko_neutralize_log — stdin to stdout, both workflow-command
-# introducers made inert:
+# introducers made inert. Each defense is independent of
+# character classification, because neither runner parser
+# compares bytes (see the threat model above):
 #   - CR becomes LF first, so whatever follows a bare CR is
-#     neutralized as its own line (sed sees the split);
-#   - '##[' becomes '##\[' globally — the legacy introducer is
-#     parsed anywhere on a line, so the sequence must not survive
-#     (the backslash insertion is the same transformation the
-#     runner's own OutputManager applies to its internal markers);
-#   - a line-leading '::' (after leading whitespace, which the
-#     modern parser TrimStarts) becomes ': :'.
+#     handled as its own line (sed sees the split).
+#   - Every '#' becomes '\#'. The legacy parser scans the WHOLE
+#     line for '##[' with the culture-sensitive IndexOf, and a
+#     culture-sensitive search skips ignorable characters (the
+#     soft hyphen U+00AD is .NET's documented example), so a
+#     byte-sequence rule like '##[' -> '##\[' is not enough:
+#     '#<U+00AD>#[' can match '##['. After this escape every '#'
+#     is immediately preceded by '\', a significant character no
+#     collation equates with '#' or treats as ignorable, so no
+#     two '#'s are ever adjacent in comparison space — whatever
+#     the culture ignores between them, the pattern cannot
+#     align. (Backslash insertion is the transformation the
+#     runner's own OutputManager applies to its internal
+#     markers: '##[start-action' -> '##[\start-action'.)
+#   - Every line is prefixed 'kind-ocp| '. The modern parser
+#     TrimStart()s the line — the full .NET whitespace set,
+#     which sed's locale-dependent [[:space:]] classes do not
+#     reliably cover (BSD sed misses U+0085 in every locale) —
+#     and then requires '::' at the start (a culture-sensitive
+#     StartsWith, which can also skip ignorables). The prefix
+#     makes the line begin with a letter, so the TrimStart is a
+#     no-op and the trimmed line can never start with '::' —
+#     no matter which characters count as whitespace.
+# Residual assumption, stated: no collation equates another
+# character with '#' or '\', or treats the prefix's characters
+# as ignorable; CLDR locales give all of these weight-bearing
+# primary collation elements.
 ko_neutralize_log() {
-  tr '\r' '\n' | sed -e 's/##\[/##\\[/g' -e 's/^\([[:space:]]*\)::/\1: :/'
+  tr '\r' '\n' | sed -e 's/#/\\#/g' -e 's/^/kind-ocp| /'
 }
 
 # ko_run_tool CMD... — run a tool whose stdout and stderr are

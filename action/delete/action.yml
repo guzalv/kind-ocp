@@ -18,10 +18,12 @@
 #     operand unquoted). Fixed messages, never the raw value.
 #   - Tool diagnostics are inert in the runner's log whatever they
 #     quote: the runner parses workflow commands in two formats
-#     (modern `::name::` at a line start, legacy `##[name]`
-#     anywhere on a line), so every kind-ocp and go byte bound for
-#     the log passes lib.sh's ko_neutralize_log, with tool exit
-#     statuses preserved.
+#     (modern `::name::` at a trimmed line start, legacy `##[name]`
+#     anywhere on a line — neither comparison is byte-wise), so
+#     every kind-ocp and go byte bound for the log passes lib.sh's
+#     ko_neutralize_log (every `#` backslash-escaped, every line
+#     given a fixed visible prefix), with tool exit statuses
+#     preserved.
 #
 # STAGED FILE — this is the complete action, byte-for-byte, but it
 # does not live at its operative path yet: the automated sessions

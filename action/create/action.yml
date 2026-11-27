@@ -34,13 +34,16 @@
 #     quote — including config-file CONTENT that kind-ocp's parse
 #     errors can embed. The runner parses workflow commands in two
 #     formats (actions/runner v2.338.2): the modern `::name::` at
-#     the start of a line (after leading whitespace) and the legacy
-#     `##[name]` ANYWHERE on a line, so a single-line input is not
-#     a safe input and %q quoting is not a defense. Every tool byte
-#     bound for the log passes ko_neutralize_log (CR becomes a line
-#     break, `##[` becomes `##\[` — the same backslash insertion
-#     the runner's own OutputManager uses — and a line-leading `::`
-#     becomes `: :`), with tool exit statuses preserved.
+#     the start of a trimmed line and the legacy `##[name]`
+#     ANYWHERE on a line — and neither parser compares bytes (the
+#     modern TrimStart strips the full .NET Unicode whitespace
+#     set; both searches are culture-sensitive and skip ignorable
+#     characters). Every tool byte bound for the log passes
+#     ko_neutralize_log: each `#` becomes `\#` (so no collation
+#     can align `##[`, whatever it ignores between them) and every
+#     line is prefixed `kind-ocp| ` (so no trimmed line can start
+#     with `::`, whatever counts as whitespace), with tool exit
+#     statuses preserved.
 #   - The prefix is validated with shell globs, not a line-oriented
 #     regex: a value containing a newline must not slip a
 #     line-oriented match through into GITHUB_OUTPUT.
@@ -49,10 +52,12 @@
 #     state_root carrying CR or LF is refused outright (spaces stay
 #     supported), so no value can inject extra output lines.
 #   - The default prefix is not merely random, it is RESERVED: one
-#     8-byte /dev/urandom draw (16 hex chars) is mkdir-reserved in
-#     a job-local directory before it is published, a collision
-#     retries with a fresh draw, and exhaustion fails without
-#     publishing anything — see the scope step.
+#     `mktemp -d` call inside a job-local reservation root both
+#     draws the name and reserves it atomically (the O_EXCL
+#     semantics are mktemp's own, so the action owns no draw loop
+#     or retry limit), and the eight template characters are
+#     hex-encoded to keep the published shape
+#     `ko-<run id>-<16 lowercase hex>` — see the scope step.
 #
 # STAGED FILE — this is the complete action, byte-for-byte, but it
 # does not live at its operative path yet: the automated sessions
@@ -181,49 +186,38 @@ runs:
         # run: two default creates in one job share GITHUB_RUN_ID,
         # and a shared prefix would let the second reuse the first's
         # clusters and either delete target both sets. Uniqueness is
-        # RESERVED, not just drawn: one 8-byte draw from
-        # /dev/urandom (16 hex chars, 64 bits, fixed width — two
-        # draws cannot concatenate into the same suffix) is
-        # mkdir-reserved in a job-local directory (mkdir succeeds
-        # for exactly one contender) before it is published; a
-        # collision retries with a fresh draw, and exhaustion fails
-        # the step without publishing anything. An explicit prefix
-        # is preserved verbatim and is not reserved — the caller
-        # manages that scope. The delete action requires create's
-        # prefix output instead of deriving one, so reservation
-        # stays local to create.
+        # RESERVED, not just drawn: one mktemp -d call inside the
+        # job-local reservation root both draws the random name and
+        # reserves it atomically (mktemp's own O_EXCL mkdir retries
+        # are its contract, not this action's), so the action owns
+        # no draw loop, retry count, or draw validation. The eight
+        # template characters are hex-encoded (16 lowercase hex
+        # chars, fixed width — two suffixes cannot concatenate into
+        # the same value) to keep the published shape
+        # ko-<run id>-<16 hex> without collapsing mktemp's mixed
+        # case. An explicit prefix is preserved verbatim and is not
+        # reserved — the caller manages that scope. The delete
+        # action requires create's prefix output instead of
+        # deriving one, so reservation stays local to create.
         prefix="${INPUT_PREFIX:-}"
         state_root="${INPUT_STATE_ROOT:-${RUNNER_TEMP:?RUNNER_TEMP is not set}/kind-ocp}"
         if [ -z "$prefix" ]; then
           reservations="${RUNNER_TEMP}/kind-ocp-scope-reservations"
           mkdir -p "$reservations"
-          attempt=0
-          while [ "$attempt" -lt 5 ]; do
-            # od resolves through PATH; the draw must be exactly 16
-            # lowercase hex chars or nothing is published.
-            draw="$(od -An -N8 -tx1 /dev/urandom | tr -d '[:space:]')"
-            if [ "${#draw}" -ne 16 ]; then
-              echo "internal error: the default-prefix draw was not 16 hex characters" >&2
-              exit 1
-            fi
-            case "$draw" in
-              *[!0-9a-f]*)
-                echo "internal error: the default-prefix draw was not 16 hex characters" >&2
-                exit 1 ;;
-            esac
-            if mkdir "$reservations/ko-${GITHUB_RUN_ID:?GITHUB_RUN_ID is not set}-$draw" 2>/dev/null; then
-              prefix="ko-${GITHUB_RUN_ID}-$draw"
-              break
-            fi
-            attempt=$((attempt + 1))
-          done
-          if [ -z "$prefix" ]; then
-            # Fixed message, never the value: a failed allocation
+          if ! reservation="$(mktemp -d "$reservations/scope.XXXXXXXX")"; then
+            # Fixed message, never a value: a failed allocation
             # publishes nothing, so an if: always() delete has no
             # half-published scope to act on (nothing was created).
-            echo "internal error: could not reserve a unique default prefix (5 collisions)" >&2
+            echo "internal error: could not reserve a unique default prefix" >&2
             exit 1
           fi
+          token="$(basename "$reservation")"
+          token="${token#scope.}"
+          token_hex=""
+          for ((i = 0; i < ${#token}; i++)); do
+            token_hex+="$(printf '%02x' "'${token:i:1}")"
+          done
+          prefix="ko-${GITHUB_RUN_ID:?GITHUB_RUN_ID is not set}-$token_hex"
         fi
 
         # Mirror config.ValidatePrefix (^[a-z0-9]([-a-z0-9]*[a-z0-9])?$,

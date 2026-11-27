@@ -39,8 +39,8 @@
 # values are planted around every step: the scripts must neutralize
 # the first and override the second. GATE_PATH_PREPEND (a
 # gate-internal variable, never exported into a step's env) places
-# scenario shims — a deterministic od, a marker-emitting kind-ocp —
-# ahead of a step's PATH, which is how the collision and
+# scenario shims — a failing mktemp, a marker-emitting kind-ocp —
+# ahead of a step's PATH, which is how the allocator-failure and
 # sanitizer probes stay deterministic.
 #
 # The step arrays (CREATE_RUN_STEPS / DELETE_RUN_STEPS) are the
@@ -60,20 +60,26 @@
 #             conditions or overrides) and the action outputs
 #             mapping; supplied and default inputs behave; the
 #             default prefix is unique per invocation under one
-#             run id, each allocation reserved atomically in
-#             RUNNER_TEMP; a colliding draw retries with a fresh
-#             one (od PATH-shimmed, so the collision is scripted,
-#             not awaited) and an exhausted allocation fails
-#             without publishing anything; a CR/LF state_root, a
-#             multiline prefix, a multiline config path, a multiline
-#             or marker-carrying kind-ocp/go version, and a
-#             multiline delete-side prefix or state_root are
+#             run id, each allocation drawn AND reserved by one
+#             mktemp -d call whose hex-encoded template suffix is
+#             the published 16-hex component; a failing allocator
+#             (mktemp PATH-shimmed, so the failure is scripted,
+#             not awaited) fails with a fixed message and
+#             publishes nothing; a CR/LF state_root, a
+#             multiline prefix, a multiline config path, a
+#             multiline or marker-carrying kind-ocp/go version,
+#             and a multiline delete-side prefix or state_root are
 #             refused without the raw value reaching the log; tool
-#             diagnostics stay inert in both workflow-command
-#             formats at both log boundaries (harmless-marker
+#             diagnostics stay inert under an INDEPENDENT
+#             runner-parse model (a perl re-implementation of the
+#             runner's .NET line semantics, whitespace set, and
+#             introducer anchors — not the sanitizer's own sed
+#             classes) on both log boundaries, for harmless-marker
 #             probes against the real lib and through the real
-#             create step), with tool exit statuses preserved;
-#             delete enforces its required prefix
+#             create step that include the Unicode whitespace the
+#             runner's TrimStart strips and sed's POSIX classes
+#             miss, with tool exit statuses preserved; delete
+#             enforces its required prefix
 #   e2e     B+D: a default-input create of 2 full-profile clusters
 #             through the create action's own scripts, the output
 #             contract, verify-failure propagation, delete, clean
@@ -646,6 +652,78 @@ preflight_docker() {
   fi
 }
 
+# --------------------------------------------------- runner-parse model
+
+# The smoke scenario's marker probes need a harmless-marker check
+# that is INDEPENDENT of the sanitizer: the sanitizer itself uses
+# sed, so a smoke check built on sed's POSIX character classes
+# cannot catch a sanitizer gap inside those classes — exactly how
+# review round 7's finding survived six gate runs (the runner's
+# TrimStart strips U+0085 and friends, which no sed [[:space:]]
+# reliably matches). This model re-implements the runner's own
+# parse (actions/runner v2.338.2, src/Runner.Common/ActionCommand.cs
+# and src/Runner.Worker/ActionCommandManager.cs) in perl, sharing
+# no matching machinery with the lib:
+#   - lines split on CRLF, CR, and LF — .NET line semantics, so a
+#     bare CR ends a log line;
+#   - the modern introducer: a TrimStart over the full .NET
+#     char.IsWhiteSpace set, then '::' at the start of the
+#     remainder;
+#   - the legacy introducer: '##[' must be gone AND every '#'
+#     must carry the sanitizer's backslash escape, the invariant
+#     that also breaks the culture-sensitive IndexOf the legacy
+#     parser uses (ignorable characters between the '#'s cannot
+#     repair a significant '\' between them);
+#   - every line carries the fixed visible prefix — the modern
+#     defense's structure.
+# The input is decoded as UTF-8 with replacement, the way .NET
+# decodes process output; undecodable bytes become U+FFFD, which
+# is neither whitespace nor ':' or '#'.
+cat >"$GATE_ROOT/runner-model.pl" <<'RUNNER_MODEL'
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Encode qw(decode);
+
+binmode(STDIN, ':raw');
+local $/;
+my $raw = <STDIN>;
+$raw = '' unless defined $raw;
+my $log = decode('UTF-8', $raw, Encode::FB_DEFAULT | Encode::LEAVE_SRC);
+
+my $bad = 0;
+my $n = 0;
+for my $line (split /\r\n|\r|\n/, $log) {
+    $n++;
+    (my $t = $line) =~ s/^[\x09\x0A\x0B\x0C\x0D\x20\x85\x{00A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}]+//;
+    if (index($t, '::') == 0) {
+        print "MODEL-VIOLATION line $n: a modern introducer survives the .NET TrimStart\n";
+        $bad = 1;
+    }
+    if (index($line, '##[') >= 0) {
+        print "MODEL-VIOLATION line $n: a live legacy introducer '##[' is present\n";
+        $bad = 1;
+    }
+    if ($line =~ /(^|[^\\])#/) {
+        print "MODEL-VIOLATION line $n: a '#' is not preceded by a backslash\n";
+        $bad = 1;
+    }
+    if (index($line, 'kind-ocp| ') != 0) {
+        print "MODEL-VIOLATION line $n: the line lacks the fixed visible prefix\n";
+        $bad = 1;
+    }
+}
+exit($bad ? 1 : 0);
+RUNNER_MODEL
+
+# assert_log_inert FILE — the log carries no live workflow-command
+# introducer under the model above.
+assert_log_inert() {
+  local out
+  out="$(perl "$GATE_ROOT/runner-model.pl" <"$1" 2>&1)" \
+    || die "$1 carries a live workflow-command introducer under the runner-parse model:"$'\n'"$out"
+}
+
 gate_yaml() {
   echo "=== yaml: staged files parse and hold their invariants"
   local f
@@ -778,13 +856,16 @@ gate_smoke() {
   #    two resolutions under the same run id (two default creates
   #    in one job) must not share a scope — the second would reuse
   #    the first's clusters, and either delete would target both
-  #    sets. Uniqueness is enforced by RESERVATION, not by entropy:
-  #    each derived prefix owns a directory in the job-local
-  #    reservation root (mkdir is atomic), so a repeat draw cannot
-  #    publish. The state-root default stays deterministic (the
-  #    delete action derives the same one, and the state store
-  #    isolates scopes in per-prefix directories under it).
-  local dw="$GATE_ROOT/smoke-default" rid="${RUN_ID}6" pa pb p
+  #    sets. Uniqueness is enforced by RESERVATION, not by
+  #    entropy: each published prefix is the hex encoding of one
+  #    mktemp -d reservation in the job-local reservation root
+  #    (draw and O_EXCL reserve are one primitive), so the
+  #    reservations root proves the published value cannot exist
+  #    without its own directory. The state-root default stays
+  #    deterministic (the delete action derives the same one, and
+  #    the state store isolates scopes in per-prefix directories
+  #    under it).
+  local dw="$GATE_ROOT/smoke-default" rid="${RUN_ID}6" pa pb p e tok hex i
   fresh_work "$dw"
   CURRENT_RUN_ID="$rid"
   run_step create "Resolve the scope" "$dw" "-default-a" \
@@ -796,96 +877,65 @@ gate_smoke() {
     || die "the scope step failed under empty inputs (second resolution)"
   pb="$(github_output_get "$dw/step-outputs/scope.output" prefix)"
   for p in "$pa" "$pb"; do
-    [[ "$p" =~ ^ko-$rid-[0-9a-f]+$ ]] \
-      || die "default prefix not derived from the run id plus a 16-hex-char draw: '$p'"
+    [[ "$p" =~ ^ko-$rid-[0-9a-f]{16}$ ]] \
+      || die "default prefix not derived from the run id plus 16 hex chars: '$p'"
   done
   [ "$pa" != "$pb" ] \
     || die "two scope resolutions under run id $rid derived the same prefix ($pa) — the default is not invocation-unique"
-  for p in "$pa" "$pb"; do
-    [ -d "$dw/runner-temp/kind-ocp-scope-reservations/$p" ] \
-      || die "the published default prefix '$p' has no reservation directory — it was not reserved atomically"
-  done
+  # Exactly two reservations, and hex-encoding each one's template
+  # suffix reproduces a published prefix: the published scopes and
+  # the reservations are the same set.
+  local entries
+  entries="$(ls -A "$dw/runner-temp/kind-ocp-scope-reservations")"
+  [ "$(wc -l <<<"$entries" | tr -d '[:space:]')" = 2 ] \
+    || die "expected exactly 2 reservations after two default resolutions, saw:"$'\n'"$entries"
+  while read -r e; do
+    [ -n "$e" ] || continue
+    tok="${e#scope.}"
+    hex=""
+    for ((i = 0; i < ${#tok}; i++)); do
+      hex+="$(printf '%02x' "'${tok:i:1}")"
+    done
+    if [ "ko-$rid-$hex" != "$pa" ] && [ "ko-$rid-$hex" != "$pb" ]; then
+      die "reservation '$e' does not correspond to a published prefix (it encodes to ko-$rid-$hex)"
+    fi
+  done <<<"$entries"
   [ "$(github_output_get "$dw/step-outputs/scope.output" state_root)" = "$dw/runner-temp/kind-ocp" ] \
     || die "default state_root not derived from RUNNER_TEMP"
-  pass "empty inputs derive ko-<run id>-<16 hex> per invocation, each reserved atomically; the state root from RUNNER_TEMP"
+  pass "empty inputs derive ko-<run id>-<16 hex> per invocation, each from its own mktemp reservation; the state root from RUNNER_TEMP"
 
-  # 4. Deterministic collision: the first draw hits an existing
-  #    reservation, the step retries with a fresh draw and
-  #    publishes the second one. od — the step's only random
-  #    source — is PATH-shimmed, so the collision is scripted, not
-  #    awaited; the call count proves exactly one retry happened.
-  local cw="$GATE_ROOT/smoke-collision" fakes count_file
-  fresh_work "$cw"
+  # 4. Deterministic allocator failure: mktemp is PATH-shimmed to
+  #    fail, so the failure path is scripted, not awaited. The
+  #    step must fail with the fixed message and publish NOTHING
+  #    (no half-published scope for an if: always() delete to act
+  #    on), and the reservation root must gain no entry.
+  local fw="$GATE_ROOT/smoke-allocfail" fakes rc=0 left
+  fresh_work "$fw"
   CURRENT_RUN_ID="$rid"
-  fakes="$cw/fakebin" count_file="$cw/od-calls"
+  fakes="$fw/fakebin"
   mkdir -p "$fakes"
-  cat >"$fakes/od" <<'FAKE_OD'
+  cat >"$fakes/mktemp" <<'FAKE_MKTEMP'
 #!/usr/bin/env bash
-# Deterministic od stand-in: emits a scripted 8-byte hex row per
-# call (the scope step's tr strips the whitespace), counting calls
-# in a file so the gate can assert how many draws happened.
-set -u
-count_file="${KO_FAKE_OD_COUNT:?}"
-mode="${KO_FAKE_OD_MODE:?}"
-n=0
-[ -s "$count_file" ] && n="$(cat "$count_file")"
-n=$((n + 1))
-printf '%s\n' "$n" >"$count_file"
-case "$mode:$n" in
-  sequence:1) printf ' aa bb cc dd ee ff 00 11\n' ;;
-  sequence:*) printf ' 11 22 33 44 55 66 77 88\n' ;;
-  constant:*) printf ' aa bb cc dd ee ff 00 11\n' ;;
-esac
-FAKE_OD
-  chmod +x "$fakes/od"
-  mkdir -p "$cw/runner-temp/kind-ocp-scope-reservations/ko-$rid-aabbccddeeff0011"
-  KO_FAKE_OD_COUNT="$count_file"
-  KO_FAKE_OD_MODE=sequence
-  export KO_FAKE_OD_COUNT KO_FAKE_OD_MODE
+# Deterministic mktemp stand-in: fails the way an exhausted
+# allocator would, without creating anything.
+exit 1
+FAKE_MKTEMP
+  chmod +x "$fakes/mktemp"
   GATE_PATH_PREPEND="$fakes"
-  run_step create "Resolve the scope" "$cw" "-collide" \
-    "INPUT_PREFIX=" "INPUT_STATE_ROOT=" \
-    || die "the scope step failed on a scripted collision (see the step log above)"
-  unset GATE_PATH_PREPEND
-  [ "$(cat "$count_file")" = 2 ] \
-    || die "expected exactly 2 draws on a single scripted collision, saw $(cat "$count_file")"
-  [ "$(github_output_get "$cw/step-outputs/scope.output" prefix)" = "ko-$rid-1122334455667788" ] \
-    || die "the retried (second) draw was not the published prefix: $(github_output_get "$cw/step-outputs/scope.output" prefix)"
-  [ -d "$cw/runner-temp/kind-ocp-scope-reservations/ko-$rid-aabbccddeeff0011" ] \
-    || die "the pre-existing reservation is gone (the step must not delete reservations)"
-  [ -d "$cw/runner-temp/kind-ocp-scope-reservations/ko-$rid-1122334455667788" ] \
-    || die "the published prefix has no reservation of its own"
-  pass "a colliding default-prefix draw is retried with a fresh draw; only the reserved prefix is published"
-
-  # 5. Deterministic exhaustion: every draw collides with the same
-  #    reservation; the step fails with the fixed message and
-  #    publishes NOTHING (no half-published scope for an if:
-  #    always() delete to act on).
-  local ew="$GATE_ROOT/smoke-exhaust" ecount rc=0
-  fresh_work "$ew"
-  CURRENT_RUN_ID="$rid"
-  ecount="$ew/od-calls"
-  mkdir -p "$ew/runner-temp/kind-ocp-scope-reservations/ko-$rid-aabbccddeeff0011"
-  KO_FAKE_OD_COUNT="$ecount"
-  KO_FAKE_OD_MODE=constant
-  GATE_PATH_PREPEND="$fakes"
-  run_step create "Resolve the scope" "$ew" "-exhaust" \
+  run_step create "Resolve the scope" "$fw" "-allocfail" \
     "INPUT_PREFIX=" "INPUT_STATE_ROOT=" || rc=$?
   unset GATE_PATH_PREPEND
-  [ "$rc" -ne 0 ] || die "the scope step survived exhausting its reservation attempts"
-  [ "$(cat "$ecount")" = 5 ] \
-    || die "expected exactly 5 draws before giving up, saw $(cat "$ecount")"
-  grep -q 'could not reserve a unique default prefix' "$ew/logs/"*exhaust*Resolve*.log \
-    || die "exhaustion failed without the fixed message (see $ew/logs)"
-  [ ! -s "$ew/step-outputs/scope.output" ] \
-    || die "the exhausted scope step still published output directives:"$'\n'"$(cat "$ew/step-outputs/scope.output")"
-  if grep -q 'aabbccddeeff0011' "$ew/logs/"*exhaust*Resolve*.log; then
-    die "the exhausted step echoed the colliding value — a workflow-command injection surface:"$'\n'"$(cat "$ew/logs/"*exhaust*Resolve*.log)"
-  fi
-  unset KO_FAKE_OD_COUNT KO_FAKE_OD_MODE
-  pass "an exhausted default-prefix allocation fails after 5 draws with a fixed message and publishes nothing"
+  [ "$rc" -ne 0 ] || die "the scope step survived a failing allocator"
+  grep -q 'could not reserve a unique default prefix' "$fw/logs/"*allocfail*Resolve*.log \
+    || die "the allocator failure failed without the fixed message (see $fw/logs)"
+  [ ! -s "$fw/step-outputs/scope.output" ] \
+    || die "the failed allocation still published output directives:"$'\n'"$(cat "$fw/step-outputs/scope.output")"
+  left="$(ls -A "$fw/runner-temp/kind-ocp-scope-reservations")"
+  [ -z "$left" ] \
+    || die "the failed allocation left reservations behind:"$'\n'"$left"
+  pass "a failing default-prefix allocator fails the step with a fixed message and publishes nothing"
 
-  # 6. Negative: a state_root carrying a newline is refused before
+  # 5. Negative: a state_root carrying a newline is refused before
   #    any output directive is written (output injection).
   local nw="$GATE_ROOT/smoke-newline"
   fresh_work "$nw"
@@ -901,7 +951,7 @@ line2" || rc=$?
     || die "the refused scope step still wrote output directives:"$'\n'"$(cat "$nw/step-outputs/scope.output")"
   pass "state_root containing a newline is refused; no output directives are written"
 
-  # 7. Negative: a prefix carrying a newline is refused the same
+  # 6. Negative: a prefix carrying a newline is refused the same
   #    way — and the refusal never echoes the raw value. The runner
   #    parses :: workflow commands from stderr too, so a rejected
   #    multiline prefix echoed back could inject a set-output past
@@ -923,7 +973,7 @@ line2" || rc=$?
   fi
   pass "prefix containing a newline is refused; no directives; the raw value never reaches the log"
 
-  # 8. Negative: a multiline config path is refused by the create
+  # 7. Negative: a multiline config path is refused by the create
   #    action's validation step — the single validation point that
   #    replaced the guards the Create/Emit/Verify steps each used
   #    to repeat (review round 6). kind-ocp renders the config path
@@ -946,7 +996,7 @@ line2" || rc=$?
   fi
   pass "config containing a newline is refused by the validation step; the raw value never reaches the log"
 
-  # 9. Negative: the version inputs are held to the version-token
+  # 8. Negative: the version inputs are held to the version-token
   #    charset — go_version because setup-go logs the spec
   #    verbatim in its own (unsanitizable) step, kind_ocp_version
   #    because go renders the module@version operand unquoted. A
@@ -978,7 +1028,7 @@ line2" || rc=$?
   fi
   pass "kind_ocp_version and go_version are refused unless single tokens of the safe charset; the raw values never reach the log"
 
-  # 10. Negative: delete's validation step refuses a multiline
+  # 9. Negative: delete's validation step refuses a multiline
   #     prefix and a multiline state_root before kind-ocp runs.
   #     kind-ocp prints the state root unquoted (`state cleared
   #     under <root>`) and os errors carry paths verbatim.
@@ -1008,75 +1058,94 @@ line2" || rc=$?
   fi
   pass "delete's validation step refuses a multiline prefix and a multiline state_root; the raw values never reach the log"
 
-  # 11. The log wrappers, unit level against the REAL lib: both
-  #     workflow-command formats are made inert at both log
-  #     boundaries, the tool's exit status survives the pipe, and
-  #     ko_capture_tool keeps captured stdout raw while its stderr
-  #     is sanitized. The markers are harmless (set-output /
-  #     add-mask text that would have to be parsed as commands to
-  #     matter); the assertions are on shape, not on damage.
-  local lw="$GATE_ROOT/smoke-lib"
+  # 10. The log wrappers, unit level against the REAL lib, under
+  #     the independent runner-parse model. The marker payload
+  #     carries every shape the old sanitizer missed: the Unicode
+  #     whitespace the runner's TrimStart strips but sed's POSIX
+  #     [[:space:]] does not match (U+0085 NEL at a bare-CR
+  #     boundary — the exact review-round-7 finding — plus NBSP,
+  #     U+2028, U+202F, and an ideographic space), ASCII leading
+  #     whitespace, and the culture-sensitive legacy shapes (a
+  #     soft hyphen U+00AD, ignorable in .NET's culture-sensitive
+  #     IndexOf, joining the '#'s). The markers are harmless
+  #     (set-output / add-mask text that would have to be parsed
+  #     as commands to matter); the assertions are on shape, not
+  #     on damage. The CONTROL first proves the model itself flags
+  #     the raw payload — a checker that never fires proves
+  #     nothing — then both wrappers are held to it, with the
+  #     tool's exit status surviving the pipe and ko_capture_tool
+  #     keeping captured stdout raw.
+  local payload="$GATE_ROOT/marker-payload" lw="$GATE_ROOT/smoke-lib"
+  {
+    printf 'config file cfg: yaml: line 2: did not find expected key ##[set-output name=pwned]injected\n'
+    printf 'progress, carriage return follows\r'
+    printf '\xc2\x85::set-output::prefix=pwned\n'
+    printf '\xc2\xa0::add-mask::injected\n'
+    printf 'text\xe3\x80\x80::debug::injected\n'
+    printf '\xe2\x80\xa8::group::injected\n'
+    printf '\xe2\x80\xaf::warning::injected\n'
+    printf '#\xc2\xad#[set-output name=pwned]soft-hyphen\n'
+    printf '##\xc2\xad[save-state name=pwned]after-soft-hyphen\n'
+    printf '  ::add-path::injected\n'
+    printf 'clean line\n'
+  } >"$payload"
+  local soft=$'\xc2\xad' nel=$'\xc2\x85'
+  if perl "$GATE_ROOT/runner-model.pl" <"$payload" >/dev/null 2>&1; then
+    die "the runner-parse model did not flag the RAW marker payload — it cannot catch any sanitizer gap"
+  fi
   fresh_work "$lw"
   (
     source "$ACTIONS_DIR/lib.sh"
     llog="$(mktemp "$lw/wrapped.XXXXXXXX")"
     lrc=0
-    ko_run_tool bash -c 'printf "line1 ##[set-output name=pwned]mid\n"; printf "pre\r::set-output::prefix=pwned\n"; printf "  ::add-mask::pwned\n"; printf "clean line\n"; exit 3' \
+    ko_run_tool bash -c 'cat "$1"; exit 3' bash "$payload" \
       >"$llog" 2>&1 || lrc=$?
     [ "$lrc" -eq 3 ] || { echo "FAIL: ko_run_tool lost the tool's exit status (got $lrc)"; exit 1; }
-    if grep -Fq '##[set-output name=pwned]' "$llog"; then
-      echo "FAIL: a live legacy introducer reached the log"; exit 1
-    fi
-    grep -Fq '##\[set-output name=pwned]mid' "$llog" \
+    assert_log_inert "$llog"
+    grep -Fq '\#\#[set-output name=pwned]injected' "$llog" \
       || { echo "FAIL: the neutralized legacy marker is missing from the log (inert, not dropped)"; exit 1; }
-    if grep -Eq '^[[:space:]]*::' "$llog"; then
-      echo "FAIL: a live modern introducer reached a line start"; exit 1
-    fi
-    grep -Fq ': :set-output::prefix=pwned' "$llog" \
-      || { echo "FAIL: the CR-boundary modern marker is missing from the log (inert, not dropped)"; exit 1; }
-    grep -Fq '  : :add-mask::pwned' "$llog" \
-      || { echo "FAIL: the leading-whitespace modern marker is missing from the log"; exit 1; }
-    grep -Fq 'clean line' "$llog" \
+    grep -Fq "\#${soft}\#[set-output name=pwned]soft-hyphen" "$llog" \
+      || { echo "FAIL: the culture-sensitive legacy shape is missing from the log (inert, not dropped)"; exit 1; }
+    grep -Fq "kind-ocp| ${nel}::set-output::prefix=pwned" "$llog" \
+      || { echo "FAIL: the NEL-led modern marker is missing as inert text from the log"; exit 1; }
+    grep -Fq 'kind-ocp| clean line' "$llog" \
       || { echo "FAIL: ordinary tool output did not survive the sanitizer"; exit 1; }
     lcaperr="$(mktemp "$lw/capture-stderr.XXXXXXXX")"
     lrc=0
-    lcap="$(ko_capture_tool bash -c 'printf "raw ##[x] stdout\n"; printf "err ##[y] line\n" >&2; exit 4' 2>"$lcaperr")" || lrc=$?
+    lcap="$(ko_capture_tool bash -c 'printf "raw stdout line\n"; cat "$1" >&2; exit 4' bash "$payload" 2>"$lcaperr")" || lrc=$?
     [ "$lrc" -eq 4 ] || { echo "FAIL: ko_capture_tool lost the tool's exit status (got $lrc)"; exit 1; }
-    [ "$lcap" = "raw ##[x] stdout" ] \
+    [ "$lcap" = "raw stdout line" ] \
       || { echo "FAIL: ko_capture_tool mangled captured stdout (it is data, not log): $lcap"; exit 1; }
-    if grep -Fq '##[y]' "$lcaperr"; then
-      echo "FAIL: a live legacy introducer reached the log through captured stderr"; exit 1
-    fi
-    grep -Fq '##\[y] line' "$lcaperr" \
-      || { echo "FAIL: the neutralized stderr marker is missing"; exit 1; }
+    assert_log_inert "$lcaperr"
+    grep -Fq "kind-ocp| ${nel}::set-output::prefix=pwned" "$lcaperr" \
+      || { echo "FAIL: the NEL-led modern marker is missing from the replayed stderr"; exit 1; }
+    grep -Fq "\#\#${soft}[save-state name=pwned]after-soft-hyphen" "$lcaperr" \
+      || { echo "FAIL: the culture-sensitive legacy shape is missing from the replayed stderr"; exit 1; }
   ) || die "the log wrappers failed their unit-level checks (messages above)"
-  pass "log wrappers: both introducer formats inert at both boundaries, statuses preserved, captured stdout raw"
+  pass "log wrappers: the marker payload (Unicode whitespace, CR boundary, culture-ignorable legacy shapes) is inert on both log paths under the runner-parse model; statuses preserved; captured stdout raw"
 
-  # 12. The sanitizer, step level with harmless markers: a fake
-  #     kind-ocp whose diagnostics embed both command formats at
-  #     both log boundaries (modeling a config-file parse error
-  #     quoting attacker content) runs through the REAL create
-  #     step; the step succeeds, the log keeps the neutralized
-  #     markers, and nothing reaches GITHUB_OUTPUT.
+  # 11. The sanitizer, step level with harmless markers: a fake
+  #     kind-ocp whose diagnostics emit the full marker payload
+  #     (modeling a config-file parse error quoting
+  #     attacker-controlled content — the Unicode-whitespace
+  #     modern-introducer shapes, the bare-CR boundary, and the
+  #     culture-ignorable legacy shapes) runs through the REAL
+  #     create step; the step succeeds, the log passes the
+  #     runner-parse model, the neutralized forms are present, and
+  #     nothing reaches GITHUB_OUTPUT.
   local mw="$GATE_ROOT/smoke-markers" fakekc mlog mout
   fresh_work "$mw"
   CURRENT_RUN_ID="$rid"
   fakekc="$mw/fakebin"
   mkdir -p "$fakekc"
-  cat >"$fakekc/kind-ocp" <<'FAKE_KO'
+  cat >"$fakekc/kind-ocp" <<FAKE_KO
 #!/usr/bin/env bash
-# Harmless-marker kind-ocp stand-in: models the diagnostics a real
-# kind-ocp emits when a config-file parse error quotes
-# attacker-controlled content — the legacy mid-line introducer, a
-# bare-CR line boundary feeding a modern line-leading introducer,
-# and leading whitespace before a modern introducer (which the
-# modern parser TrimStarts away). Exit status is scriptable.
-printf 'config file cfg: yaml: line 2: did not find expected key ##[set-output name=pwned]injected\n'
-printf 'progress, carriage return follows\r'
-printf '::set-output::prefix=pwned\n'
-printf '  ::add-mask::injected\n'
-printf 'done\n'
-exit "${KO_FAKE_KIND_OCP_EXIT:-0}"
+# Harmless-marker kind-ocp stand-in: cats the gate's marker payload
+# (every Unicode-whitespace modern-introducer shape, the bare-CR
+# boundary, and the culture-sensitive legacy shapes). Exit status
+# is scriptable.
+cat "$payload"
+exit "\${KO_FAKE_KIND_OCP_EXIT:-0}"
 FAKE_KO
   chmod +x "$fakekc/kind-ocp"
   GATE_PATH_PREPEND="$fakekc"
@@ -1088,23 +1157,18 @@ FAKE_KO
   unset GATE_PATH_PREPEND
   mlog="$mw/logs/-markersCreate_the_clusters.log"
   mout="$mw/step-outputs/Create_the_clusters.output"
-  if grep -Fq '##[set-output name=pwned]' "$mlog"; then
-    die "a live legacy workflow-command introducer reached the create step's log"
-  fi
-  grep -Fq '##\[set-output name=pwned]injected' "$mlog" \
+  assert_log_inert "$mlog"
+  grep -Fq '\#\#[set-output name=pwned]injected' "$mlog" \
     || die "the neutralized legacy marker is missing from the create step's log (inert, not dropped)"
-  if grep -Eq '^[[:space:]]*::' "$mlog"; then
-    die "a live modern workflow-command introducer reached a line start in the create step's log"
-  fi
-  grep -Fq ': :set-output::prefix=pwned' "$mlog" \
-    || die "the CR-boundary modern marker is missing from the create step's log"
-  grep -Fq '  : :add-mask::injected' "$mlog" \
-    || die "the leading-whitespace modern marker is missing from the create step's log"
+  grep -Fq "kind-ocp| $(printf '\xc2\x85')::set-output::prefix=pwned" "$mlog" \
+    || die "the NEL-led modern marker is missing as inert text from the create step's log"
+  grep -Fq 'kind-ocp| clean line' "$mlog" \
+    || die "ordinary tool output did not survive the create step's sanitizer"
   [ ! -s "$mout" ] \
     || die "the create step wrote output directives while running the fake kind-ocp:"$'\n'"$(cat "$mout")"
-  pass "tool diagnostics stay inert through the create step: both formats neutralized at both boundaries, nothing written to GITHUB_OUTPUT"
+  pass "tool diagnostics stay inert through the create step under the runner-parse model: neutralized forms present, nothing written to GITHUB_OUTPUT"
 
-  # 13. Tool exit statuses survive the sanitizer at step level: the
+  # 12. Tool exit statuses survive the sanitizer at step level: the
   #     fake kind-ocp exits 3, and the create step fails with 3.
   rc=0
   KO_FAKE_KIND_OCP_EXIT=3
@@ -1119,7 +1183,7 @@ FAKE_KO
     || die "the create step reported exit $rc for a tool exiting 3 — the sanitizer pipe swallowed the status"
   pass "a tool's non-zero exit survives the sanitizer (step exit 3 for a tool exiting 3)"
 
-  # 14. delete enforces its required prefix through its own mapping.
+  # 13. delete enforces its required prefix through its own mapping.
   local dlw="$GATE_ROOT/smoke-delete"
   fresh_work "$dlw"
   CURRENT_RUN_ID="$rid"
@@ -1153,7 +1217,7 @@ gate_e2e() {
   # state_root into ITS OWN output file — exactly what a consumer's
   # steps.scope.outputs.* reads — and clusters exists only in the
   # clusters step's file.
-  [[ "$prefix" =~ ^ko-$rid-[0-9a-f]+$ ]] \
+  [[ "$prefix" =~ ^ko-$rid-[0-9a-f]{16}$ ]] \
     || die "default prefix not derived from the run id plus a per-invocation component: '$prefix'"
   [ "$state_root" = "$work/runner-temp/kind-ocp" ] || die "unexpected default state root: '$state_root'"
   [ -z "$(github_output_get "$work/step-outputs/scope.output" clusters)" ] \
@@ -1273,7 +1337,7 @@ gate_failure() {
   # scope step's OWN file, which is what a consumer's
   # steps.scope.outputs.* reads — and clusters was never emitted,
   # because the clusters step never ran.
-  [[ "$prefix" =~ ^ko-$rid-[0-9a-f]+$ ]] \
+  [[ "$prefix" =~ ^ko-$rid-[0-9a-f]{16}$ ]] \
     || die "prefix missing (or wrong shape) in the scope step's outputs of the killed run: '$prefix'"
   [ "$(github_output_get "$work/step-outputs/scope.output" state_root)" = "$work/runner-temp/kind-ocp" ] \
     || die "state_root missing (or wrong) in the scope step's outputs of the killed run"
@@ -1301,7 +1365,7 @@ gate_spaced() {
   local prefix clusters name kc
   prefix="$(github_output_get "$work/step-outputs/scope.output" prefix)"
   clusters="$(github_output_get "$work/step-outputs/clusters.output" clusters)"
-  [[ "$prefix" =~ ^ko-$rid-[0-9a-f]+$ ]] \
+  [[ "$prefix" =~ ^ko-$rid-[0-9a-f]{16}$ ]] \
     || die "default prefix not derived from the run id plus a per-invocation component: '$prefix'"
   jq -e . >/dev/null <<<"$clusters" || die "spaced state root broke the clusters JSON"
   [ "$(jq 'length' <<<"$clusters")" = 2 ] || die "expected 2 clusters under the spaced state root"
@@ -1319,7 +1383,7 @@ gate_spaced() {
 }
 
 usage() {
-  sed -n '2,91p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,97p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-}" in

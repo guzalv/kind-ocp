@@ -816,16 +816,24 @@ Components:
   invariants), `smoke` (exact per-step wiring and the action
   outputs mapping; supplied and default inputs behave; the default
   prefix is unique per invocation under one run id and every
-  allocation is reserved atomically; a scripted colliding draw
-  retries with a fresh one and an exhausted allocation fails
-  without publishing anything — od is PATH-shimmed, so both paths
-  are deterministic, not awaited; a CR/LF state_root, a multiline
-  prefix, a multiline config path, a multiline or marker-carrying
-  kind-ocp/go version, and a multiline delete-side prefix or
-  state_root are refused without the raw value reaching the log;
-  tool diagnostics stay inert in both workflow-command formats at
-  both log boundaries — harmless-marker probes against the real
-  lib and through the real create step — with tool exit statuses
+  allocation is drawn and reserved by one mktemp -d call whose
+  hex-encoded template suffix is the published 16-hex component; a
+  failing allocator — mktemp PATH-shimmed, so the failure is
+  deterministic — fails with a fixed message and publishes
+  nothing; a CR/LF state_root, a multiline prefix, a multiline
+  config path, a multiline or marker-carrying kind-ocp/go version,
+  and a multiline delete-side prefix or state_root are refused
+  without the raw value reaching the log; tool diagnostics stay
+  inert under an INDEPENDENT runner-parse model — a perl
+  re-implementation of the runner's .NET line semantics, whitespace
+  set, and introducer anchors, deliberately not the sanitizer's
+  own sed classes, because a review round found exactly that
+  blindness (the runner's TrimStart strips U+0085 and other
+  Unicode whitespace that sed's [[:space:]] misses, so a sed-based
+  check could not see the gap) — on both log boundaries, for
+  harmless-marker probes against the real lib and through the real
+  create step that include those Unicode shapes and the
+  culture-ignorable legacy shapes, with tool exit statuses
   preserved; delete enforces its required prefix), `e2e` (default-input
   create of 2 full-profile clusters, the full output contract,
   verify-failure propagation via a sabotaged check, a
@@ -863,24 +871,27 @@ Contract decisions:
   gate's `smoke` scenario fails if a mapping is
   removed or points at the wrong input.
 - The prefix default is `ko-<run id>-<16 hex>` and it is RESERVED,
-  not just drawn: the scope step draws 8 bytes from `/dev/urandom`
-  (16 hex chars, 64 bits, fixed width — two draws cannot
-  concatenate into the same suffix, the ambiguity review round 6
-  found in the two-RANDOM concatenation), then mkdir-creates a
-  directory named after the candidate under
-  `<RUNNER_TEMP>/kind-ocp-scope-reservations` (job-local; mkdir is
-  atomic, so exactly one contender wins a given candidate) and
-  publishes only the winner — a collision retries with a fresh
-  draw, five attempts, then a failure that publishes nothing.
-  Random draws alone are not a uniqueness guarantee (draws repeat),
-  and the run id alone is not invocation-unique: two default
-  creates in one job would share a scope — the second reusing the
-  first's clusters, either delete targeting both sets. An explicit
-  prefix is preserved verbatim and is not reserved — the caller
-  manages that scope; a name prefix is not isolation, and on an
-  ephemeral runner run identity plus a reserved per-invocation
-  draw is all the uniqueness a default needs. The scope step
-  validates it by mirroring
+  not just drawn: one `mktemp -d "$reservations/scope.XXXXXXXX"`
+  call inside `<RUNNER_TEMP>/kind-ocp-scope-reservations`
+  (job-local) both draws the random name and reserves it
+  atomically — the O_EXCL-dir creation and the internal retry are
+  mktemp's own contract, so the action owns no draw loop, retry
+  count, or draw validation (a review round rejected exactly that
+  owned machinery). The eight template characters (mixed-case
+  alnum) are hex-encoded — 16 lowercase hex chars, fixed width, no
+  case collapse — to keep the published shape and the fixed-width
+  property review round 6 added against concatenation ambiguity;
+  the encoding is injective, so distinct reservations publish
+  distinct prefixes. Random draws alone are not a uniqueness
+  guarantee, and the run id alone is not invocation-unique: two
+  default creates in one job would share a scope — the second
+  reusing the first's clusters, either delete targeting both sets.
+  A failed mktemp fails the step with a fixed message and
+  publishes nothing. An explicit prefix is preserved verbatim and
+  is not reserved — the caller manages that scope; a name prefix
+  is not isolation, and on an ephemeral runner run identity plus a
+  reserved per-invocation draw is all the uniqueness a default
+  needs. The scope step validates it by mirroring
   `config.ValidatePrefix` with shell globs — not a line-oriented
   regex, which could let a value containing a newline match one
   clean line and inject arbitrary lines into GITHUB_OUTPUT.
@@ -927,20 +938,39 @@ Contract decisions:
 - Every tool byte bound for the runner log passes lib.sh's
   `ko_neutralize_log`, making both introducers inert whatever the
   diagnostics quote — including config-file CONTENT that
-  kind-ocp's parse errors can embed, which no input rule reaches:
-  CR becomes a line break (the runner reads process output with
-  .NET line semantics, so a bare CR ends a log line and whatever
-  follows can start a modern command), `##[` becomes `##\[`
-  globally (the same backslash insertion the runner's own
-  OutputManager applies to its internal markers), and a
-  line-leading `::` becomes `: :`. Tool exit statuses are
-  preserved through the wrappers: `ko_run_tool` returns
-  `PIPESTATUS[0]` for log-bound runs; `ko_capture_tool` keeps
-  stdout raw and replays captured stderr sanitized for runs whose
-  stdout is data (kind-ocp list/kubeconfig in the clusters step).
-  Both are errexit-safe — a bare call under `set -e` fails the
-  step with the tool's own status, a checked call (`||`, `if !`)
-  sees the status and decides.
+  kind-ocp's parse errors can embed, which no input rule reaches.
+  Neither runner parser compares bytes (verified against
+  actions/runner v2.338.2 source): the modern parser TrimStart()s
+  with the parameterless .NET method, which strips the full
+  char.IsWhiteSpace set (U+0085, U+00A0, U+1680, U+2000-U+200A,
+  U+2028, U+2029, U+202F, U+205F, U+3000 beyond ASCII — sed's
+  locale-dependent [[:space:]] misses U+0085 on macOS in every
+  locale, the exact gap a review round found in the first
+  line-leading-`::` defense), and both parsers search with the
+  culture-sensitive overloads (`IndexOf`/`StartsWith` without a
+  StringComparison), which skip ignorable characters such as the
+  soft hyphen U+00AD — so `#<U+00AD>#[` can match `##[`. The two
+  defenses are therefore classification-independent: every `#`
+  becomes `\#` (after which every `#` is preceded by a
+  significant backslash that no collation equates with `#`, so
+  `##[` cannot align in comparison space whatever the culture
+  ignores between the hashes — the same backslash-insertion idea
+  as the runner's own OutputManager, applied to every `#` rather
+  than the byte sequence), and every CR/LF-delimited line is
+  prefixed `kind-ocp| ` (a bare CR becomes a line break first,
+  .NET line semantics, so the prefix lands on exactly the
+  runner's lines; the line then starts with a letter, the
+  TrimStart is a no-op, and the trimmed line can never start with
+  `::`). Stated residual: no collation equates another character
+  with `#` or `\`, or treats the prefix's characters as
+  ignorable. Tool exit statuses are preserved through the
+  wrappers: `ko_run_tool` returns `PIPESTATUS[0]` for log-bound
+  runs; `ko_capture_tool` keeps stdout raw and replays captured
+  stderr sanitized for runs whose stdout is data (kind-ocp
+  list/kubeconfig in the clusters step). Both are errexit-safe —
+  a bare call under `set -e` fails the step with the tool's own
+  status, a checked call (`||`, `if !`) sees the status and
+  decides.
 - The install steps pin `GOBIN` to `<RUNNER_TEMP>/kind-ocp-bin`
   and publish that same directory through GITHUB_PATH: an ambient
   `GOBIN` (the calling workflow's, or the runner's) must not
