@@ -1034,3 +1034,37 @@ Contract decisions:
   confusing assertion failure.
 - Local gating cannot prove Linux-runner behavior; the handoff's
   final step dispatches the self-test remotely and requires green.
+
+- [ ] **Pins-staleness CI job (check only).** A scheduled (weekly) job
+  that compares every pinned external input against its upstream
+  source and reports drift — deliberately check-only: no self-update,
+  no auto-PR; humans merge bumps (the platform-objects and catalog
+  diffs are reviewed like vendored content). New tool
+  `tools/check-pins` plus a workflow file staged next to it
+  (`tools/check-pins/workflow.yaml`, moved to
+  `.github/workflows/pins-stale.yaml` by an authorized session after
+  the gates pass — `.github/` is protected for these sessions).
+  Source policy, per pin: openshift/api via the Cincinnati graph
+  (stable-4.X channel) for the newest stable payload, resolving the
+  payload's openshift/api component commit for exact provenance —
+  never `release-4.X` branch heads, which are not stable releases —
+  reporting drift in the 18 consumed CRDs, not unrelated commits;
+  kind node image from the compatible kubernetes-sigs/kind release
+  notes (never Docker Hub's newest tag), tracking the kind library
+  alongside; OLM releases with the configmap registry image tracked
+  with its release, not independently; StackRox charts from
+  charts.stackrox.io/index.yaml; platform-objects by comparing
+  managed content (not just commit SHAs) against both pinned upstream
+  operator commits; the CO-proof pins either inventoried in full
+  (the four Quay `:master` image pins, the opm server image, the
+  pinned crane — the GHCR bundle `:latest` is a development feed,
+  not stable Red Hat CO) or excluded per source with the exclusion
+  recorded in the tool's output. Job behavior: bounded requests with
+  retries honoring rate-limit headers; every source reports current,
+  drifted, or unknown — an outage is not drift; same-tag digest
+  changes are separated from newer releases; the report is a weekly
+  summary (issue writes only once the signal proves useful, one
+  fixed serialized issue, edited only on material change, never
+  closed on partial results); bump instructions name the exact pin
+  edits — the Make targets regenerate from existing pins, they do
+  not discover new ones.
