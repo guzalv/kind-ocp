@@ -717,7 +717,7 @@ cluster (a deliberate scope cut).
 
 ## 7. Roadmap
 
-- [ ] **Consumer GitHub Actions.** Let GitHub-Actions jobs in other
+- [x] **Consumer GitHub Actions.** Let GitHub-Actions jobs in other
   repos (StackRox, Compliance Operator) stand up kind-ocp clusters
   through reusable actions. Shape: a `create`/`delete` composite pair.
   `create` takes the cluster count, profile, prefix, state root, and
