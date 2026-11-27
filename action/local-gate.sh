@@ -70,16 +70,16 @@
 #             multiline or marker-carrying kind-ocp/go version,
 #             and a multiline delete-side prefix or state_root are
 #             refused without the raw value reaching the log; tool
-#             diagnostics stay inert under an INDEPENDENT
-#             runner-parse model (a perl re-implementation of the
-#             runner's .NET line semantics, whitespace set, and
-#             introducer anchors — not the sanitizer's own sed
-#             classes) on both log boundaries, for harmless-marker
-#             probes against the real lib and through the real
-#             create step that include the Unicode whitespace the
-#             runner's TrimStart strips and sed's POSIX classes
-#             miss, with tool exit statuses preserved; delete
-#             enforces its required prefix
+#             diagnostics stay inert on both log boundaries —
+#             harmless-marker probes against the real lib and
+#             through the real create step, carrying the Unicode
+#             whitespace the runner's TrimStart strips and sed's
+#             POSIX classes miss plus the culture-ignorable legacy
+#             shapes, compare byte-exact (cmp) against a
+#             hand-authored expected log, a fixture that shares no
+#             machinery with the sanitizer, with tool exit
+#             statuses preserved; delete enforces its required
+#             prefix
 #   e2e     B+D: a default-input create of 2 full-profile clusters
 #             through the create action's own scripts, the output
 #             contract, verify-failure propagation, delete, clean
@@ -652,78 +652,6 @@ preflight_docker() {
   fi
 }
 
-# --------------------------------------------------- runner-parse model
-
-# The smoke scenario's marker probes need a harmless-marker check
-# that is INDEPENDENT of the sanitizer: the sanitizer itself uses
-# sed, so a smoke check built on sed's POSIX character classes
-# cannot catch a sanitizer gap inside those classes — exactly how
-# review round 7's finding survived six gate runs (the runner's
-# TrimStart strips U+0085 and friends, which no sed [[:space:]]
-# reliably matches). This model re-implements the runner's own
-# parse (actions/runner v2.338.2, src/Runner.Common/ActionCommand.cs
-# and src/Runner.Worker/ActionCommandManager.cs) in perl, sharing
-# no matching machinery with the lib:
-#   - lines split on CRLF, CR, and LF — .NET line semantics, so a
-#     bare CR ends a log line;
-#   - the modern introducer: a TrimStart over the full .NET
-#     char.IsWhiteSpace set, then '::' at the start of the
-#     remainder;
-#   - the legacy introducer: '##[' must be gone AND every '#'
-#     must carry the sanitizer's backslash escape, the invariant
-#     that also breaks the culture-sensitive IndexOf the legacy
-#     parser uses (ignorable characters between the '#'s cannot
-#     repair a significant '\' between them);
-#   - every line carries the fixed visible prefix — the modern
-#     defense's structure.
-# The input is decoded as UTF-8 with replacement, the way .NET
-# decodes process output; undecodable bytes become U+FFFD, which
-# is neither whitespace nor ':' or '#'.
-cat >"$GATE_ROOT/runner-model.pl" <<'RUNNER_MODEL'
-#!/usr/bin/env perl
-use strict;
-use warnings;
-use Encode qw(decode);
-
-binmode(STDIN, ':raw');
-local $/;
-my $raw = <STDIN>;
-$raw = '' unless defined $raw;
-my $log = decode('UTF-8', $raw, Encode::FB_DEFAULT | Encode::LEAVE_SRC);
-
-my $bad = 0;
-my $n = 0;
-for my $line (split /\r\n|\r|\n/, $log) {
-    $n++;
-    (my $t = $line) =~ s/^[\x09\x0A\x0B\x0C\x0D\x20\x85\x{00A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}]+//;
-    if (index($t, '::') == 0) {
-        print "MODEL-VIOLATION line $n: a modern introducer survives the .NET TrimStart\n";
-        $bad = 1;
-    }
-    if (index($line, '##[') >= 0) {
-        print "MODEL-VIOLATION line $n: a live legacy introducer '##[' is present\n";
-        $bad = 1;
-    }
-    if ($line =~ /(^|[^\\])#/) {
-        print "MODEL-VIOLATION line $n: a '#' is not preceded by a backslash\n";
-        $bad = 1;
-    }
-    if (index($line, 'kind-ocp| ') != 0) {
-        print "MODEL-VIOLATION line $n: the line lacks the fixed visible prefix\n";
-        $bad = 1;
-    }
-}
-exit($bad ? 1 : 0);
-RUNNER_MODEL
-
-# assert_log_inert FILE — the log carries no live workflow-command
-# introducer under the model above.
-assert_log_inert() {
-  local out
-  out="$(perl "$GATE_ROOT/runner-model.pl" <"$1" 2>&1)" \
-    || die "$1 carries a live workflow-command introducer under the runner-parse model:"$'\n'"$out"
-}
-
 gate_yaml() {
   echo "=== yaml: staged files parse and hold their invariants"
   local f
@@ -1058,24 +986,27 @@ line2" || rc=$?
   fi
   pass "delete's validation step refuses a multiline prefix and a multiline state_root; the raw values never reach the log"
 
-  # 10. The log wrappers, unit level against the REAL lib, under
-  #     the independent runner-parse model. The marker payload
-  #     carries every shape the old sanitizer missed: the Unicode
-  #     whitespace the runner's TrimStart strips but sed's POSIX
-  #     [[:space:]] does not match (U+0085 NEL at a bare-CR
-  #     boundary — the exact review-round-7 finding — plus NBSP,
-  #     U+2028, U+202F, and an ideographic space), ASCII leading
-  #     whitespace, and the culture-sensitive legacy shapes (a
-  #     soft hyphen U+00AD, ignorable in .NET's culture-sensitive
-  #     IndexOf, joining the '#'s). The markers are harmless
-  #     (set-output / add-mask text that would have to be parsed
-  #     as commands to matter); the assertions are on shape, not
-  #     on damage. The CONTROL first proves the model itself flags
-  #     the raw payload — a checker that never fires proves
-  #     nothing — then both wrappers are held to it, with the
-  #     tool's exit status surviving the pipe and ko_capture_tool
-  #     keeping captured stdout raw.
-  local payload="$GATE_ROOT/marker-payload" lw="$GATE_ROOT/smoke-lib"
+  # 10. The log wrappers, unit level against the REAL lib. The
+  #     marker payload carries every shape the old sanitizer
+  #     missed: the Unicode whitespace the runner's TrimStart
+  #     strips but sed's POSIX [[:space:]] does not match (U+0085
+  #     NEL at a bare-CR boundary — the exact review-round-7
+  #     finding — plus NBSP, U+2028, U+202F, and an ideographic
+  #     space), ASCII leading whitespace, and the culture-sensitive
+  #     legacy shapes (a soft hyphen U+00AD, ignorable in .NET's
+  #     culture-sensitive IndexOf, joining the '#'s). The markers
+  #     are harmless (set-output / add-mask text that would have
+  #     to be parsed as commands to matter); the assertions are on
+  #     shape, not on damage. The expected log is authored BY HAND
+  #     from the payload — CR split into its own line, every '#'
+  #     backslash-escaped, every line prefixed — and compared
+  #     byte-exact (cmp), so the probe shares no machinery with
+  #     the sanitizer: a gap inside the character classes either
+  #     side uses cannot hide, and any deviation (a missed line, a
+  #     dropped escape, one byte) fails. Both wrappers are held to
+  #     it, with the tool's exit status surviving the pipe and
+  #     ko_capture_tool keeping captured stdout raw.
+  local payload="$GATE_ROOT/marker-payload" expected="$GATE_ROOT/marker-expected" lw="$GATE_ROOT/smoke-lib"
   {
     printf 'config file cfg: yaml: line 2: did not find expected key ##[set-output name=pwned]injected\n'
     printf 'progress, carriage return follows\r'
@@ -1089,10 +1020,27 @@ line2" || rc=$?
     printf '  ::add-path::injected\n'
     printf 'clean line\n'
   } >"$payload"
-  local soft=$'\xc2\xad' nel=$'\xc2\x85'
-  if perl "$GATE_ROOT/runner-model.pl" <"$payload" >/dev/null 2>&1; then
-    die "the runner-parse model did not flag the RAW marker payload — it cannot catch any sanitizer gap"
-  fi
+  # The neutralization of the payload above, written out by hand:
+  # the bare CR ends its line and the NEL-led marker becomes its
+  # own prefixed line; every '#' carries the escape; the two
+  # leading spaces of the add-path line survive after the prefix.
+  # %s carries the lines that hold escaped '#'s (a single-quoted
+  # %s argument keeps every backslash literal); \xHH escapes carry
+  # the multibyte whitespace bytes.
+  local soft=$'\xc2\xad'
+  {
+    printf '%s\n' 'kind-ocp| config file cfg: yaml: line 2: did not find expected key \#\#[set-output name=pwned]injected'
+    printf 'kind-ocp| progress, carriage return follows\n'
+    printf 'kind-ocp| \xc2\x85::set-output::prefix=pwned\n'
+    printf 'kind-ocp| \xc2\xa0::add-mask::injected\n'
+    printf 'kind-ocp| text\xe3\x80\x80::debug::injected\n'
+    printf 'kind-ocp| \xe2\x80\xa8::group::injected\n'
+    printf 'kind-ocp| \xe2\x80\xaf::warning::injected\n'
+    printf '%s\n' "kind-ocp| \#${soft}\#[set-output name=pwned]soft-hyphen"
+    printf '%s\n' "kind-ocp| \#\#${soft}[save-state name=pwned]after-soft-hyphen"
+    printf 'kind-ocp|   ::add-path::injected\n'
+    printf 'kind-ocp| clean line\n'
+  } >"$expected"
   fresh_work "$lw"
   (
     source "$ACTIONS_DIR/lib.sh"
@@ -1101,28 +1049,18 @@ line2" || rc=$?
     ko_run_tool bash -c 'cat "$1"; exit 3' bash "$payload" \
       >"$llog" 2>&1 || lrc=$?
     [ "$lrc" -eq 3 ] || { echo "FAIL: ko_run_tool lost the tool's exit status (got $lrc)"; exit 1; }
-    assert_log_inert "$llog"
-    grep -Fq '\#\#[set-output name=pwned]injected' "$llog" \
-      || { echo "FAIL: the neutralized legacy marker is missing from the log (inert, not dropped)"; exit 1; }
-    grep -Fq "\#${soft}\#[set-output name=pwned]soft-hyphen" "$llog" \
-      || { echo "FAIL: the culture-sensitive legacy shape is missing from the log (inert, not dropped)"; exit 1; }
-    grep -Fq "kind-ocp| ${nel}::set-output::prefix=pwned" "$llog" \
-      || { echo "FAIL: the NEL-led modern marker is missing as inert text from the log"; exit 1; }
-    grep -Fq 'kind-ocp| clean line' "$llog" \
-      || { echo "FAIL: ordinary tool output did not survive the sanitizer"; exit 1; }
+    cmp -s "$llog" "$expected" \
+      || { echo "FAIL: the streamed log is not the exact neutralized payload: $(cmp "$llog" "$expected" 2>&1 || true)"; exit 1; }
     lcaperr="$(mktemp "$lw/capture-stderr.XXXXXXXX")"
     lrc=0
     lcap="$(ko_capture_tool bash -c 'printf "raw stdout line\n"; cat "$1" >&2; exit 4' bash "$payload" 2>"$lcaperr")" || lrc=$?
     [ "$lrc" -eq 4 ] || { echo "FAIL: ko_capture_tool lost the tool's exit status (got $lrc)"; exit 1; }
     [ "$lcap" = "raw stdout line" ] \
       || { echo "FAIL: ko_capture_tool mangled captured stdout (it is data, not log): $lcap"; exit 1; }
-    assert_log_inert "$lcaperr"
-    grep -Fq "kind-ocp| ${nel}::set-output::prefix=pwned" "$lcaperr" \
-      || { echo "FAIL: the NEL-led modern marker is missing from the replayed stderr"; exit 1; }
-    grep -Fq "\#\#${soft}[save-state name=pwned]after-soft-hyphen" "$lcaperr" \
-      || { echo "FAIL: the culture-sensitive legacy shape is missing from the replayed stderr"; exit 1; }
+    cmp -s "$lcaperr" "$expected" \
+      || { echo "FAIL: the replayed stderr is not the exact neutralized payload: $(cmp "$lcaperr" "$expected" 2>&1 || true)"; exit 1; }
   ) || die "the log wrappers failed their unit-level checks (messages above)"
-  pass "log wrappers: the marker payload (Unicode whitespace, CR boundary, culture-ignorable legacy shapes) is inert on both log paths under the runner-parse model; statuses preserved; captured stdout raw"
+  pass "log wrappers: the marker payload (Unicode whitespace, CR boundary, culture-ignorable legacy shapes) neutralizes to the hand-authored expected log byte-exact on both log paths; statuses preserved; captured stdout raw"
 
   # 11. The sanitizer, step level with harmless markers: a fake
   #     kind-ocp whose diagnostics emit the full marker payload
@@ -1130,22 +1068,31 @@ line2" || rc=$?
   #     attacker-controlled content — the Unicode-whitespace
   #     modern-introducer shapes, the bare-CR boundary, and the
   #     culture-ignorable legacy shapes) runs through the REAL
-  #     create step; the step succeeds, the log passes the
-  #     runner-parse model, the neutralized forms are present, and
-  #     nothing reaches GITHUB_OUTPUT.
+  #     create step; the step succeeds, its log is byte-exact the
+  #     hand-authored neutralized payload, and nothing reaches
+  #     GITHUB_OUTPUT. The fixture rides along under a fixed
+  #     relative name in the step's working directory, and the
+  #     fake's source is a QUOTED heredoc: no gate path is ever
+  #     baked into shell source, so a scratch root whose own path
+  #     contains a literal '$' cannot bend the fake at execution,
+  #     and a failed cat fails the fake (exit 9) instead of
+  #     hiding behind the scripted exit status.
   local mw="$GATE_ROOT/smoke-markers" fakekc mlog mout
   fresh_work "$mw"
   CURRENT_RUN_ID="$rid"
   fakekc="$mw/fakebin"
   mkdir -p "$fakekc"
-  cat >"$fakekc/kind-ocp" <<FAKE_KO
+  cp "$payload" "$mw/marker-payload"
+  cat >"$fakekc/kind-ocp" <<'FAKE_KO'
 #!/usr/bin/env bash
-# Harmless-marker kind-ocp stand-in: cats the gate's marker payload
-# (every Unicode-whitespace modern-introducer shape, the bare-CR
-# boundary, and the culture-sensitive legacy shapes). Exit status
-# is scriptable.
-cat "$payload"
-exit "\${KO_FAKE_KIND_OCP_EXIT:-0}"
+# Harmless-marker kind-ocp stand-in: cats the marker payload from
+# the step's working directory (every Unicode-whitespace
+# modern-introducer shape, the bare-CR boundary, and the
+# culture-sensitive legacy shapes). Exit status is scriptable; a
+# missing payload fails the fake instead of masquerading as
+# success.
+cat ./marker-payload || exit 9
+exit "${KO_FAKE_KIND_OCP_EXIT:-0}"
 FAKE_KO
   chmod +x "$fakekc/kind-ocp"
   GATE_PATH_PREPEND="$fakekc"
@@ -1157,16 +1104,11 @@ FAKE_KO
   unset GATE_PATH_PREPEND
   mlog="$mw/logs/-markersCreate_the_clusters.log"
   mout="$mw/step-outputs/Create_the_clusters.output"
-  assert_log_inert "$mlog"
-  grep -Fq '\#\#[set-output name=pwned]injected' "$mlog" \
-    || die "the neutralized legacy marker is missing from the create step's log (inert, not dropped)"
-  grep -Fq "kind-ocp| $(printf '\xc2\x85')::set-output::prefix=pwned" "$mlog" \
-    || die "the NEL-led modern marker is missing as inert text from the create step's log"
-  grep -Fq 'kind-ocp| clean line' "$mlog" \
-    || die "ordinary tool output did not survive the create step's sanitizer"
+  cmp -s "$mlog" "$expected" \
+    || die "the create step's log is not the exact neutralized payload: $(cmp "$mlog" "$expected" 2>&1 || true)"
   [ ! -s "$mout" ] \
     || die "the create step wrote output directives while running the fake kind-ocp:"$'\n'"$(cat "$mout")"
-  pass "tool diagnostics stay inert through the create step under the runner-parse model: neutralized forms present, nothing written to GITHUB_OUTPUT"
+  pass "tool diagnostics stay inert through the create step: the step log is byte-exact the hand-authored neutralized payload; nothing written to GITHUB_OUTPUT"
 
   # 12. Tool exit statuses survive the sanitizer at step level: the
   #     fake kind-ocp exits 3, and the create step fails with 3.

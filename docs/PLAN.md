@@ -824,16 +824,14 @@ Components:
   config path, a multiline or marker-carrying kind-ocp/go version,
   and a multiline delete-side prefix or state_root are refused
   without the raw value reaching the log; tool diagnostics stay
-  inert under an INDEPENDENT runner-parse model — a perl
-  re-implementation of the runner's .NET line semantics, whitespace
-  set, and introducer anchors, deliberately not the sanitizer's
-  own sed classes, because a review round found exactly that
-  blindness (the runner's TrimStart strips U+0085 and other
-  Unicode whitespace that sed's [[:space:]] misses, so a sed-based
-  check could not see the gap) — on both log boundaries, for
-  harmless-marker probes against the real lib and through the real
-  create step that include those Unicode shapes and the
-  culture-ignorable legacy shapes, with tool exit statuses
+  inert on both log boundaries — harmless-marker probes against
+  the real lib and through the real create step, carrying the
+  Unicode whitespace the runner's TrimStart strips and sed's POSIX
+  classes miss (a review round found exactly that blindness) plus
+  the culture-ignorable legacy shapes, compare byte-exact (cmp)
+  against a hand-authored expected log, a fixture that shares no
+  machinery with the sanitizer, so a gap inside the character
+  classes either side uses cannot hide, with tool exit statuses
   preserved; delete enforces its required prefix), `e2e` (default-input
   create of 2 full-profile clusters, the full output contract,
   verify-failure propagation via a sabotaged check, a
