@@ -261,12 +261,9 @@ during its own setup) and idempotent. Both actions validate their
 inputs up front and neutralize workflow-command markers in tool
 diagnostics before they reach the runner log, so caller-controlled
 values cannot inject runner commands. The pair ships in the v0.1.2
-release (`guzalv/kind-ocp/.github/actions/{create,delete}@v0.1.2`);
-until that tag is cut the actions are staged under
-[`action/`](action) in this repository, gated by
-[action/local-gate.sh](action/local-gate.sh) and an ubuntu-latest
-self-test workflow
-([action/self-test.yaml](action/self-test.yaml), dispatch + nightly).
+release (`guzalv/kind-ocp/.github/actions/{create,delete}@v0.1.2`),
+gated by [tools/local-gate.sh](tools/local-gate.sh) and an
+ubuntu-latest self-test workflow (dispatch + nightly).
 
 ```yaml
 jobs:
@@ -381,7 +378,8 @@ struct for its own.
 | StackRox charts (example only) | `stackrox-{central,secured-cluster-services} 500.0.0`, tarballs SHA-256-verified | constants in `examples/stackrox/charts.go` |
 | kind-ocp release (consumer actions) | `v0.1.1` via `go install` | `kind_ocp_version` action input |
 | Go toolchain (consumer actions) | `1.27.4` (the pinned release's go.mod minimum) | `go_version` action input |
-| actions used by the consumer actions | `actions/setup-go v7.1.0` (create + delete), `actions/checkout v7.0.1` (self-test), SHA-pinned | edit `action/` (see [docs/maintenance.md](docs/maintenance.md)) |
+| actions used by the consumer actions | `actions/setup-go v7.1.0` (create + delete), `actions/checkout v7.0.1` (self-test), SHA-pinned | edit `.github/actions/{create,delete}/action.yml` and
+  `.github/workflows/action-self-test.yaml` (see [docs/maintenance.md](docs/maintenance.md)) |
 
 Bump procedures for every pin, and the CI policy, live in
 [docs/maintenance.md](docs/maintenance.md).

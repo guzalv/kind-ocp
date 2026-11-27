@@ -59,18 +59,6 @@
 #     hex-encoded to keep the published shape
 #     `ko-<run id>-<16 lowercase hex>` — see the scope step.
 #
-# STAGED FILE — this is the complete action, byte-for-byte, but it
-# does not live at its operative path yet: the automated sessions
-# that develop this repo run under a sandbox that refuses writes to
-# `.github/` (a protected configuration path there), and evading
-# that refusal is not an option. Move it into place from a normal
-# (non-automated) session, following action/MOVE.md:
-#
-#   mkdir -p .github/actions
-#   git mv action/create .github/actions/create
-#   git mv action/lib.sh .github/actions/lib.sh
-#
-# — and delete this paragraph.
 name: 'kind-ocp create'
 description: >-
   Create N OCP-like kind clusters (default 2, profile full) with the

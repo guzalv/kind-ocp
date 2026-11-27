@@ -25,12 +25,12 @@ The pin table itself lives in the root README ("Defaults and pins").
   `https://charts.stackrox.io/index.yaml` in `examples/stackrox/charts.go`
   and run the example once.
 - **Consumer actions**: the `kind_ocp_version` input default
-  (kept identical in `action/create/action.yml` and
-  `action/delete/action.yml`), the `go_version` default (must satisfy
+  (kept identical in `.github/actions/create/action.yml` and
+  `.github/actions/delete/action.yml`), the `go_version` default (must satisfy
   the pinned release's go.mod minimum), and the SHA-pinned
   `actions/setup-go` / `actions/checkout` commits there — the same pin
   discipline as ci.yaml (commit SHA plus version comment). Both
-  actions source their shared helpers from `action/lib.sh` (each
+  actions source their shared helpers from `.github/actions/lib.sh` (each
   step's ACTION_LIB env mapping), so input validation and the tool
   log wrappers live there, not per step. Inputs
   reach the `run:` scripts only through step `env:` mappings
@@ -39,13 +39,12 @@ The pin table itself lives in the root README ("Defaults and pins").
   `key=value` directives with CR/LF inputs refused and the version
   inputs held to the single-token charset; keep those invariants
   when editing. A bump is: edit the files, run
-  `action/local-gate.sh all` (needs Docker, and network: its `yaml`
+  `tools/local-gate.sh all` (needs Docker, and network: its `yaml`
   scenario resolves every `uses:` pin against api.github.com; its
   `smoke` scenario fails if any step's env wiring drifts from the
   gate's recorded expectation — a removed mapping or a changed
-  scope reference fails with empty defaults), and — after the
-  staged move into `.github/` — dispatch the self-test workflow
-  remotely and require green.
+  scope reference fails with empty defaults), and dispatch the
+  self-test workflow remotely and require green.
 
 ## Lint toolchain
 

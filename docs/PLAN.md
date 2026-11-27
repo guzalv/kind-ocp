@@ -744,7 +744,8 @@ cluster (a deliberate scope cut).
 
   Delivered. Design record: §8 (one deviation from the sketch above:
   no buildx setup step, with evidence). The staged move into
-  `.github/` is tracked by `action/MOVE.md`.
+  `.github/` was executed per `action/MOVE.md`, removed once it
+  landed.
 
 ## 8. Consumer GitHub Actions — design record
 
@@ -752,18 +753,19 @@ The §7 roadmap item as built. Everything stages under `action/`
 because `.github/` is protected for the automated sessions that
 develop this repo; the authorized-session move (paths, the stale
 STAGED FILE block in ci.yaml, the v0.1.2 tag, the remote self-test
-dispatch) is `action/MOVE.md`.
+dispatch) was executed per `action/MOVE.md`, removed once it
+landed.
 
 Components:
 
-- `action/create/action.yml` — composite action: validate the
+- `.github/actions/create/action.yml` — composite action: validate the
   inputs → resolve the scope → set up Go → `go install` the pinned
   release → `kind-ocp create` → emit the clusters output →
   `kind-ocp verify`.
-- `action/delete/action.yml` — self-sufficient (its own setup and
+- `.github/actions/delete/action.yml` — self-sufficient (its own setup and
   install steps), idempotent `kind-ocp delete --config '' --prefix
   <p> --state-root <r>`.
-- `action/lib.sh` — the shared helper library every run step that
+- `.github/actions/lib.sh` — the shared helper library every run step that
   validates an input or runs a tool sources through its ACTION_LIB
   env mapping (the runner-resolved action path plus `../lib.sh` —
   an environment value like every input, never an expression
@@ -771,13 +773,13 @@ Components:
   and the two input validators. One implementation instead of a
   copy per step per action; the gate runs it under `bash -n` and
   exercises it directly.
-- `action/self-test.yaml` — the remote proof: dispatch + nightly,
+- `.github/workflows/action-self-test.yaml` — the remote proof: dispatch + nightly,
   ubuntu-latest, create (count 2, full profile — the webhook image
   build included) → assert the output contract → delete under
   `if: always()` fed by create's outputs → assert the cleanup. Its
   `uses:` paths are the final operative ones (`./.github/actions/…`),
   so the move needs no content edits.
-- `action/local-gate.sh` — the local gate: runs the actions' own
+- `tools/local-gate.sh` — the local gate: runs the actions' own
   `run:` scripts, called by name, with test values supplied
   explicitly. It is not a runner emulator — it never resolves a
   ${{ }} expression — after a review round found the earlier

@@ -1,7 +1,7 @@
 # kind-ocp action self-test (docs/PLAN.md §7-§8): consumes the
 # create/delete composite actions end to end on an ephemeral
 # ubuntu-latest runner — the Linux-runner proof the local gate
-# (action/local-gate.sh, macOS + Docker Desktop) cannot provide.
+# (tools/local-gate.sh, macOS + Docker Desktop) cannot provide.
 # Dispatch and nightly only: it creates two full-profile clusters
 # (the scc-admission layer's webhook image build included) and costs
 # real runner minutes.
@@ -17,17 +17,6 @@
 #   - Runners are GitHub-hosted and therefore ephemeral; the job
 #     needs nothing from this repository beyond its code.
 #
-# STAGED FILE — this is the complete workflow, byte-for-byte, but it
-# does not live at its operative path yet: the automated sessions
-# that develop this repo run under a sandbox that refuses writes to
-# `.github/` (a protected configuration path there), and evading
-# that refusal is not an option. Move it into place from a normal
-# (non-automated) session, following action/MOVE.md:
-#
-#   mkdir -p .github/workflows
-#   git mv action/self-test.yaml .github/workflows/action-self-test.yaml
-#
-# — and delete this paragraph.
 name: action-self-test
 
 on:

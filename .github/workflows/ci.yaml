@@ -20,22 +20,6 @@
 #   - Runners are GitHub-hosted and therefore ephemeral; the
 #     integration job needs nothing from this repository beyond its
 #     code.
-#
-# STAGED FILE — this is the complete workflow, byte-for-byte, but it
-# does not live at its operative path yet: the automated sessions that
-# develop this repo run under a sandbox that refuses writes to `.github/`
-# (a protected configuration path there), and evading that refusal is
-# not an option. The increment-9 release-readiness pass attempted the
-# move and was refused by the same policy. Move it into place from a
-# normal (non-automated) session —
-#
-#   mkdir -p .github/workflows
-#   git mv docs/ci-workflow.yaml .github/workflows/ci.yaml
-#
-# — and delete this paragraph. Until the repository is published the
-# file has no runner to execute it either way; the move is recorded as
-# the one remaining release-readiness action item in docs/PLAN.md's
-# increment-9 record.
 name: ci
 
 on:

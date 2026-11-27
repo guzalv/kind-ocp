@@ -25,18 +25,6 @@
 #     given a fixed visible prefix), with tool exit statuses
 #     preserved.
 #
-# STAGED FILE — this is the complete action, byte-for-byte, but it
-# does not live at its operative path yet: the automated sessions
-# that develop this repo run under a sandbox that refuses writes to
-# `.github/` (a protected configuration path there), and evading
-# that refusal is not an option. Move it into place from a normal
-# (non-automated) session, following action/MOVE.md:
-#
-#   mkdir -p .github/actions
-#   git mv action/delete .github/actions/delete
-#   git mv action/lib.sh .github/actions/lib.sh
-#
-# — and delete this paragraph.
 name: 'kind-ocp delete'
 description: >-
   Delete the kind-ocp clusters of one prefix and its state root.
