@@ -756,12 +756,21 @@ dispatch) is `action/MOVE.md`.
 
 Components:
 
-- `action/create/action.yml` — composite action: resolve the scope →
-  set up Go → `go install` the pinned release → `kind-ocp create` →
-  emit the clusters output → `kind-ocp verify`.
+- `action/create/action.yml` — composite action: validate the
+  inputs → resolve the scope → set up Go → `go install` the pinned
+  release → `kind-ocp create` → emit the clusters output →
+  `kind-ocp verify`.
 - `action/delete/action.yml` — self-sufficient (its own setup and
   install steps), idempotent `kind-ocp delete --config '' --prefix
   <p> --state-root <r>`.
+- `action/lib.sh` — the shared helper library every run step that
+  validates an input or runs a tool sources through its ACTION_LIB
+  env mapping (the runner-resolved action path plus `../lib.sh` —
+  an environment value like every input, never an expression
+  inside a run script): the log neutralizer, the two tool wrappers,
+  and the two input validators. One implementation instead of a
+  copy per step per action; the gate runs it under `bash -n` and
+  exercises it directly.
 - `action/self-test.yaml` — the remote proof: dispatch + nightly,
   ubuntu-latest, create (count 2, full profile — the webhook image
   build included) → assert the output contract → delete under
@@ -799,15 +808,25 @@ Components:
   the delete action's setup-go pin — over the two actions and the
   self-test explicitly (a directory scan would lose the self-test
   after the move), and requires one SHA per repo across them, so
-  the two setup-go pins cannot drift apart. Scenarios: `yaml`
+  the two setup-go pins cannot drift apart. Its `yaml` scenario
+  also parses the shared lib under `bash -n` and holds it to the
+  same no-`${{ }}` invariant (it is sourced into run scripts).
+  Scenarios: `yaml`
   (parse; pins resolve; injection, wiring, and step-sequence
   invariants), `smoke` (exact per-step wiring and the action
-  outputs mapping; supplied and default inputs behave, and the
-  default prefix is unique per invocation under one run id; a
-  CR/LF state_root, a multiline prefix, a multiline config path,
-  a multiline kind-ocp version, and a multiline delete-side
-  prefix or state_root are refused without the raw value reaching
-  the log; delete enforces its required prefix), `e2e` (default-input
+  outputs mapping; supplied and default inputs behave; the default
+  prefix is unique per invocation under one run id and every
+  allocation is reserved atomically; a scripted colliding draw
+  retries with a fresh one and an exhausted allocation fails
+  without publishing anything — od is PATH-shimmed, so both paths
+  are deterministic, not awaited; a CR/LF state_root, a multiline
+  prefix, a multiline config path, a multiline or marker-carrying
+  kind-ocp/go version, and a multiline delete-side prefix or
+  state_root are refused without the raw value reaching the log;
+  tool diagnostics stay inert in both workflow-command formats at
+  both log boundaries — harmless-marker probes against the real
+  lib and through the real create step — with tool exit statuses
+  preserved; delete enforces its required prefix), `e2e` (default-input
   create of 2 full-profile clusters, the full output contract,
   verify-failure propagation via a sabotaged check, a
   credential-leak grep over step logs and outputs, the planted
@@ -836,18 +855,32 @@ Contract decisions:
   (`INPUT_<NAME>: ${{ inputs.<name> }}`) and every value resolved
   by an earlier step through `env:` as well — input bytes are
   environment values, never script language, and the scripts quote
-  every expansion. `local-gate.sh yaml` enforces the no-`${{ }}`
-  invariant; the gate's `smoke` scenario fails if a mapping is
+  every expansion. ACTION_LIB follows the same rule: the
+  runner-resolved path of the bundled lib.sh crosses as an env
+  value and is sourced, never an expression inside a script.
+  `local-gate.sh yaml` enforces the no-`${{ }}`
+  invariant (over the run scripts and the lib they source); the
+  gate's `smoke` scenario fails if a mapping is
   removed or points at the wrong input.
-- The prefix default is `ko-<run id>-<random>` (the run id plus
-  two bash `RANDOM` draws — 30 bits): the run id alone is not
-  invocation-unique, and two default creates in one job would
-  share a scope — the second reusing the first's clusters, either
-  delete targeting both sets. An explicit prefix is preserved
-  verbatim; a name prefix is not isolation, and on an ephemeral
-  runner run identity plus per-invocation entropy is all the
-  uniqueness a default needs. The scope step validates it by
-  mirroring
+- The prefix default is `ko-<run id>-<16 hex>` and it is RESERVED,
+  not just drawn: the scope step draws 8 bytes from `/dev/urandom`
+  (16 hex chars, 64 bits, fixed width — two draws cannot
+  concatenate into the same suffix, the ambiguity review round 6
+  found in the two-RANDOM concatenation), then mkdir-creates a
+  directory named after the candidate under
+  `<RUNNER_TEMP>/kind-ocp-scope-reservations` (job-local; mkdir is
+  atomic, so exactly one contender wins a given candidate) and
+  publishes only the winner — a collision retries with a fresh
+  draw, five attempts, then a failure that publishes nothing.
+  Random draws alone are not a uniqueness guarantee (draws repeat),
+  and the run id alone is not invocation-unique: two default
+  creates in one job would share a scope — the second reusing the
+  first's clusters, either delete targeting both sets. An explicit
+  prefix is preserved verbatim and is not reserved — the caller
+  manages that scope; a name prefix is not isolation, and on an
+  ephemeral runner run identity plus a reserved per-invocation
+  draw is all the uniqueness a default needs. The scope step
+  validates it by mirroring
   `config.ValidatePrefix` with shell globs — not a line-oriented
   regex, which could let a value containing a newline match one
   clean line and inject arbitrary lines into GITHUB_OUTPUT.
@@ -861,19 +894,53 @@ Contract decisions:
   no value can inject extra output lines. The state-root default
   is `<RUNNER_TEMP>/kind-ocp`: runner-private, wiped between jobs,
   and a location nothing should cache.
-- Inputs whose value a tool echoes verbatim in its own
-  diagnostics are refused unless single-line, on both actions:
-  the config path (kind-ocp renders `config file <path>: …`
-  unquoted), the kind-ocp version (go renders the module@version
-  operand unquoted), and the delete-side prefix and state root
-  (kind-ocp prints `state cleared under <root>` unquoted, and os
-  errors carry paths verbatim). The runner parses `::` workflow
-  commands from the step log, so a multiline value echoed through
-  a tool's diagnostic injects exactly like a refusal echo would;
-  the refusals use fixed messages and never echo the value.
-  count, profile, and the create-side prefix need no such guard
-  because their tools quote them (%q renders a newline escaped on
-  one line).
+- Inputs whose value a tool echoes verbatim in its own diagnostics
+  are defended twice, because review round 6 established that
+  single-line refusals alone are not sufficient: the runner parses
+  workflow commands in two formats (actions/runner v2.338.2,
+  `ActionCommand.TryParse`/`TryParseV2`) — the modern `::name::`
+  at the start of a line, after leading whitespace (the parser
+  TrimStarts), and the legacy `##[name]` ANYWHERE on a line — so a
+  single-line input is not a safe input and %q quoting is not a
+  defense (an escaped-newline value arrives as one physical line,
+  exactly the shape the legacy parser accepts mid-line). The
+  defenses are the two decisions that follow: one validation point
+  per action, and inert tool diagnostics.
+- Each action validates its inputs once, in its first run step,
+  before any tool or third-party action runs — the config check
+  the Create/Emit/Verify steps each used to repeat lives only
+  there now. The config path (kind-ocp renders
+  `config file <path>: …` unquoted) and the delete-side prefix and
+  state root (kind-ocp prints `state cleared under <root>`
+  unquoted; os errors carry paths verbatim) are refused unless
+  single-line. `go_version` and `kind_ocp_version` are refused
+  unless they are one token of `[A-Za-z0-9._~^+<>/=-]`:
+  `go_version` reaches actions/setup-go through `with:` and
+  setup-go logs the spec verbatim in its own step (`Setup go
+  version spec …`, setup-go v7.1.0 src/main.ts) — output the
+  action cannot sanitize — so a charset that cannot form either
+  introducer is the defense; `kind_ocp_version` gets the same rule
+  (go renders the module@version operand unquoted). CR/LF is
+  subsumed by the charset. Refusals use fixed messages and never
+  echo the value. The prefix and state_root checks the scope step
+  always had stay there: they gate what that step publishes.
+- Every tool byte bound for the runner log passes lib.sh's
+  `ko_neutralize_log`, making both introducers inert whatever the
+  diagnostics quote — including config-file CONTENT that
+  kind-ocp's parse errors can embed, which no input rule reaches:
+  CR becomes a line break (the runner reads process output with
+  .NET line semantics, so a bare CR ends a log line and whatever
+  follows can start a modern command), `##[` becomes `##\[`
+  globally (the same backslash insertion the runner's own
+  OutputManager applies to its internal markers), and a
+  line-leading `::` becomes `: :`. Tool exit statuses are
+  preserved through the wrappers: `ko_run_tool` returns
+  `PIPESTATUS[0]` for log-bound runs; `ko_capture_tool` keeps
+  stdout raw and replays captured stderr sanitized for runs whose
+  stdout is data (kind-ocp list/kubeconfig in the clusters step).
+  Both are errexit-safe — a bare call under `set -e` fails the
+  step with the tool's own status, a checked call (`||`, `if !`)
+  sees the status and decides.
 - The install steps pin `GOBIN` to `<RUNNER_TEMP>/kind-ocp-bin`
   and publish that same directory through GITHUB_PATH: an ambient
   `GOBIN` (the calling workflow's, or the runner's) must not
@@ -909,8 +976,11 @@ Contract decisions:
   build` puts images; that is the caller's configuration, not
   something this action needs to manage.)
 - Every `run:` script sets `euo pipefail` and quotes every
-  expansion; tool exit codes propagate (the sabotage re-run in the
-  local gate proves verify's non-zero exit fails the step).
+  expansion; tool exit codes propagate through the log wrappers,
+  which return the tool's own status (the sabotage re-run in the
+  local gate proves verify's non-zero exit fails the step, and a
+  smoke probe proves a tool exiting 3 fails the create step with
+  exit 3).
 - Third-party actions are SHA-pinned with version comments —
   `actions/setup-go` v7.1.0 inside both composite actions and
   `actions/checkout` v7.0.1 in the self-test, the same commits

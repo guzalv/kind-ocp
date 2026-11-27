@@ -5,15 +5,23 @@
 # during its own setup. Idempotent: absent clusters and absent state
 # are not errors, so a re-run continues where a stopped one left off.
 #
-# Security posture: same as the create action (no `${{ }}` in `run:`,
-# `euo pipefail`, quoted expansions, ambient KIND_OCP_* neutralized)
-# plus the same single-line rule for the inputs a tool echoes
-# verbatim: kind-ocp prints the state root unquoted (`state
-# cleared under <root>`) and os errors carry paths verbatim, and
-# go renders the module@version operand unquoted, so a multiline
-# value would put its later lines at line starts in the step log,
-# where the runner parses `::` workflow commands. Refused with
-# fixed messages, never echoed.
+# Security posture: same as the create action (no `${{ }}` in
+# `run:`, `euo pipefail`, quoted expansions, ambient KIND_OCP_*
+# neutralized, shared helpers sourced from ACTION_LIB), plus:
+#   - Inputs are validated once, in the first run step, before any
+#     tool or third-party action runs: the prefix and state root
+#     are refused unless single-line (kind-ocp prints the state
+#     root unquoted — `state cleared under <root>` — and os errors
+#     carry paths verbatim), and go_version / kind_ocp_version are
+#     held to the version-token charset (setup-go logs the spec
+#     verbatim in its own step; go renders the module@version
+#     operand unquoted). Fixed messages, never the raw value.
+#   - Tool diagnostics are inert in the runner's log whatever they
+#     quote: the runner parses workflow commands in two formats
+#     (modern `::name::` at a line start, legacy `##[name]`
+#     anywhere on a line), so every kind-ocp and go byte bound for
+#     the log passes lib.sh's ko_neutralize_log, with tool exit
+#     statuses preserved.
 #
 # STAGED FILE — this is the complete action, byte-for-byte, but it
 # does not live at its operative path yet: the automated sessions
@@ -24,6 +32,7 @@
 #
 #   mkdir -p .github/actions
 #   git mv action/delete .github/actions/delete
+#   git mv action/lib.sh .github/actions/lib.sh
 #
 # — and delete this paragraph.
 name: 'kind-ocp delete'
@@ -49,17 +58,43 @@ inputs:
     description: >-
       Released kind-ocp version the action installs with go install.
       Keep aligned with the create action's input (the defaults
-      are). Must be a single line (CR/LF refused).
+      are). Must be a single token of letters, digits, and
+      . _ ~ ^ + < > / = - (CR/LF and every workflow-command byte
+      refused).
     default: 'v0.1.1'
   go_version:
     description: >-
       Go toolchain for the install; must satisfy the pinned release's
-      go.mod minimum.
+      go.mod minimum. Same single-token rule as kind_ocp_version:
+      setup-go logs the spec verbatim in its own step.
     default: '1.27.4'
 
 runs:
   using: composite
   steps:
+    - name: Validate the inputs
+      env:
+        # Composite run steps get no automatic INPUT_* variables;
+        # the env mapping is the wiring that carries each input in.
+        INPUT_PREFIX: ${{ inputs.prefix }}
+        INPUT_STATE_ROOT: ${{ inputs.state_root }}
+        INPUT_KIND_OCP_VERSION: ${{ inputs.kind_ocp_version }}
+        INPUT_GO_VERSION: ${{ inputs.go_version }}
+        ACTION_LIB: ${{ github.action_path }}/../lib.sh
+      shell: bash
+      run: |
+        set -euo pipefail
+        source "${ACTION_LIB:?ACTION_LIB is not set}"
+        # The single validation point (review round 6): what the
+        # delete step used to check inline is refused here, ahead
+        # of every tool and third-party action. The state-root
+        # check covers the caller's input; the default derived
+        # below is runner-controlled and safe by construction.
+        ko_require_single_line prefix "${INPUT_PREFIX:-}"
+        ko_require_single_line state_root "${INPUT_STATE_ROOT:-}"
+        ko_require_version_token go_version "${INPUT_GO_VERSION:?go_version input is empty}"
+        ko_require_version_token kind_ocp_version "${INPUT_KIND_OCP_VERSION:?kind_ocp_version input is empty}"
+
     - name: Set up Go
       uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
       with:
@@ -71,24 +106,19 @@ runs:
     - name: Install kind-ocp
       env:
         INPUT_KIND_OCP_VERSION: ${{ inputs.kind_ocp_version }}
+        ACTION_LIB: ${{ github.action_path }}/../lib.sh
       shell: bash
       run: |
         set -euo pipefail
-        # See the create action's install step: go renders the
-        # module@version operand unquoted in its own diagnostics,
-        # so a multiline kind_ocp_version must be refused before it
-        # can reach them. Never echo it.
-        case "${INPUT_KIND_OCP_VERSION:-}" in
-          *$'\r'*|*$'\n'*)
-            echo "kind_ocp_version must be a single line (no CR or LF)" >&2
-            exit 1 ;;
-        esac
+        source "${ACTION_LIB:?ACTION_LIB is not set}"
         # See the create action: GOBIN pinned to a runner-local
         # directory, and that same directory published below, so an
-        # ambient GOBIN cannot decide where the binary lands.
+        # ambient GOBIN cannot decide where the binary lands. go's
+        # diagnostics reach the log only through the sanitizer;
+        # go's exit status is ko_run_tool's return value.
         install_dir="${RUNNER_TEMP:?RUNNER_TEMP is not set}/kind-ocp-bin"
         mkdir -p "$install_dir"
-        GOBIN="$install_dir" go install "github.com/guzalv/kind-ocp/cmd/kind-ocp@${INPUT_KIND_OCP_VERSION:?kind_ocp_version input is empty}"
+        ko_run_tool env GOBIN="$install_dir" go install "github.com/guzalv/kind-ocp/cmd/kind-ocp@${INPUT_KIND_OCP_VERSION:?kind_ocp_version input is empty}"
         printf '%s\n' "$install_dir" >> "$GITHUB_PATH"
 
     - name: Delete the clusters
@@ -97,29 +127,19 @@ runs:
         # env mapping is the wiring that carries each input in.
         INPUT_PREFIX: ${{ inputs.prefix }}
         INPUT_STATE_ROOT: ${{ inputs.state_root }}
+        ACTION_LIB: ${{ github.action_path }}/../lib.sh
       shell: bash
       run: |
         set -euo pipefail
+        source "${ACTION_LIB:?ACTION_LIB is not set}"
         unset KIND_OCP_CONFIG KIND_OCP_PREFIX KIND_OCP_COUNT KIND_OCP_PROFILE
         # Same default the create action derives, so a same-job
         # delete cleans up a default-scope create.
         state_root="${INPUT_STATE_ROOT:-${RUNNER_TEMP:?RUNNER_TEMP is not set}/kind-ocp}"
-        # kind-ocp prints the state root unquoted (`state cleared
-        # under <root>`) and os errors carry paths verbatim, and the
-        # prefix guard mirrors the create action: a multiline value
-        # would put its later lines at line starts in this step's
-        # log — where the runner parses `::` workflow commands.
-        # Refuse the shapes; never echo them.
-        case "${INPUT_PREFIX:-}" in
-          *$'\r'*|*$'\n'*)
-            echo "prefix must be a single line (no CR or LF)" >&2
-            exit 1 ;;
-        esac
-        case "$state_root" in
-          *$'\r'*|*$'\n'*)
-            echo "state_root must be a single line (no CR or LF)" >&2
-            exit 1 ;;
-        esac
         # --config '' pins the lookup off: cleanup must not depend on
         # whatever KIND_OCP_CONFIG the calling workflow carries.
-        kind-ocp delete --config '' --prefix "${INPUT_PREFIX:?prefix input is required}" --state-root "$state_root"
+        # kind-ocp's diagnostics (the raw state root, paths in os
+        # errors) reach the log only through the sanitizer; its exit
+        # status is preserved (absent clusters and state are not
+        # errors — kind-ocp's own idempotency).
+        ko_run_tool kind-ocp delete --config '' --prefix "${INPUT_PREFIX:?prefix input is required}" --state-root "$state_root"

@@ -19,8 +19,12 @@
 # outputs feeding the later steps — is read from the scope step's
 # own GITHUB_OUTPUT file and passed on explicitly, which is what
 # the asserted `${{ steps.scope.outputs.* }}` env wiring delivers
-# on a real runner. Inputs a scenario does not pin fall back to the
-# action.yml's declared default, read straight from the YAML.
+# on a real runner. Steps that source the shared lib get ACTION_LIB
+# supplied the same way — the staged lib.sh, the gate-side
+# equivalent of the asserted `${{ github.action_path }}/../lib.sh`
+# mapping, still never a resolved expression. Inputs a scenario
+# does not pin fall back to the action.yml's declared default,
+# read straight from the YAML.
 #
 # Run steps carrying `if:`, `continue-on-error:`, or
 # `working-directory:` are refused outright: the gate executes
@@ -33,7 +37,11 @@
 # RUNNER_TEMP. The `uses:` steps are skipped (Go is provided by the
 # harness instead of actions/setup-go). Ambient KIND_OCP_* and GOBIN
 # values are planted around every step: the scripts must neutralize
-# the first and override the second.
+# the first and override the second. GATE_PATH_PREPEND (a
+# gate-internal variable, never exported into a step's env) places
+# scenario shims — a deterministic od, a marker-emitting kind-ocp —
+# ahead of a step's PATH, which is how the collision and
+# sanitizer probes stay deterministic.
 #
 # The step arrays (CREATE_RUN_STEPS / DELETE_RUN_STEPS) are the
 # single source of the gate's call sequence: the yaml scenario
@@ -43,19 +51,28 @@
 # branch (the run dies) — it cannot silently never run.
 #
 # Scenarios (argument; `all` runs them in order):
-#   yaml    A: staged YAML parses; remote pins resolve on GitHub;
-#             injection, pin-shape, and step-sequence invariants
-#             hold — over the two actions and the self-test
-#             explicitly, so nothing is lost when MOVE.md relocates
-#             them
+#   yaml    A: staged YAML parses; the shared lib parses; remote
+#             pins resolve on GitHub; injection, pin-shape, and
+#             step-sequence invariants hold — over the two actions
+#             and the self-test explicitly, so nothing is lost when
+#             MOVE.md relocates them
 #   smoke   A: exact per-step wiring (id, shell, env mapping, no
 #             conditions or overrides) and the action outputs
-#             mapping; supplied and default inputs behave, and the
+#             mapping; supplied and default inputs behave; the
 #             default prefix is unique per invocation under one
-#             run id; a CR/LF state_root, a multiline prefix, a
-#             multiline config path, a multiline kind-ocp version,
-#             and a multiline delete-side prefix or state_root are
-#             refused without the raw value reaching the log;
+#             run id, each allocation reserved atomically in
+#             RUNNER_TEMP; a colliding draw retries with a fresh
+#             one (od PATH-shimmed, so the collision is scripted,
+#             not awaited) and an exhausted allocation fails
+#             without publishing anything; a CR/LF state_root, a
+#             multiline prefix, a multiline config path, a multiline
+#             or marker-carrying kind-ocp/go version, and a
+#             multiline delete-side prefix or state_root are
+#             refused without the raw value reaching the log; tool
+#             diagnostics stay inert in both workflow-command
+#             formats at both log boundaries (harmless-marker
+#             probes against the real lib and through the real
+#             create step), with tool exit statuses preserved;
 #             delete enforces its required prefix
 #   e2e     B+D: a default-input create of 2 full-profile clusters
 #             through the create action's own scripts, the output
@@ -106,8 +123,11 @@ RUN_ID="$$${RANDOM}"
 # The PATH every step starts from: the tools the steps themselves
 # need, and deliberately NOT $(go env GOPATH)/bin — an install
 # step's GITHUB_PATH write is the only thing that puts kind-ocp on
-# it, which is exactly what the runner does.
+# it, which is exactly what the runner does. GATE_PATH_PREPEND
+# (scenario shims; see the header) is unset except where a probe
+# sets it.
 GATE_PATH_BASE="/usr/bin:/bin:/usr/sbin:/sbin"
+GATE_PATH_PREPEND=""
 for t in go docker jq yq kubectl curl; do
   command -v "$t" >/dev/null 2>&1 || die "required tool not on PATH: $t"
   GATE_PATH_BASE="$(dirname "$(command -v "$t")"):$GATE_PATH_BASE"
@@ -121,10 +141,11 @@ if [ -z "$DOCKER_HOST" ] && [ -S "$HOME/.docker/run/docker.sock" ]; then
 fi
 
 # The only expression forms the gate's recorded expectations carry
-# (checked against the declared inputs and step ids — never
-# resolved).
+# (checked against the declared inputs, step ids, and the staged
+# lib — never resolved).
 P_INPUTS='${{ inputs.'
 P_STEPS='${{ steps.'
+P_ACTION_PATH='${{ github.action_path }}'
 P_END=' }}'
 
 # The GITHUB_RUN_ID of the current action run.
@@ -135,6 +156,7 @@ CURRENT_RUN_ID="$RUN_ID"
 # yaml scenario asserts each array equals the action.yml's run
 # steps; the drivers iterate the arrays.
 CREATE_RUN_STEPS=(
+  "Validate the inputs"
   "Resolve the scope"
   "Install kind-ocp"
   "Create the clusters"
@@ -142,6 +164,7 @@ CREATE_RUN_STEPS=(
   "Verify the clusters"
 )
 DELETE_RUN_STEPS=(
+  "Validate the inputs"
   "Install kind-ocp"
   "Delete the clusters"
 )
@@ -164,9 +187,18 @@ expected_step_id() {
 # run step must declare: one KEY=VALUE line per entry, the VALUE
 # verbatim from the action.yml. The gate asserts the actions carry
 # exactly this wiring and supplies test values for exactly these
-# keys; no expression is ever resolved.
+# keys; no expression is ever resolved. ACTION_LIB is the one
+# non-input mapping: the runner-resolved path of the shared lib,
+# carried as an environment value like every input.
 expected_step_env() {
   case "$1/$2" in
+    create/"Validate the inputs")
+      printf '%s\n' \
+        'INPUT_CONFIG=${{ inputs.config }}' \
+        'INPUT_KIND_OCP_VERSION=${{ inputs.kind_ocp_version }}' \
+        'INPUT_GO_VERSION=${{ inputs.go_version }}' \
+        'ACTION_LIB=${{ github.action_path }}/../lib.sh'
+      ;;
     create/"Resolve the scope")
       printf '%s\n' \
         'INPUT_PREFIX=${{ inputs.prefix }}' \
@@ -174,7 +206,8 @@ expected_step_env() {
       ;;
     create/"Install kind-ocp" | delete/"Install kind-ocp")
       printf '%s\n' \
-        'INPUT_KIND_OCP_VERSION=${{ inputs.kind_ocp_version }}'
+        'INPUT_KIND_OCP_VERSION=${{ inputs.kind_ocp_version }}' \
+        'ACTION_LIB=${{ github.action_path }}/../lib.sh'
       ;;
     create/"Create the clusters")
       printf '%s\n' \
@@ -182,18 +215,29 @@ expected_step_env() {
         'INPUT_PROFILE=${{ inputs.profile }}' \
         'INPUT_CONFIG=${{ inputs.config }}' \
         'KIND_OCP_ACTION_PREFIX=${{ steps.scope.outputs.prefix }}' \
-        'KIND_OCP_ACTION_STATE_ROOT=${{ steps.scope.outputs.state_root }}'
+        'KIND_OCP_ACTION_STATE_ROOT=${{ steps.scope.outputs.state_root }}' \
+        'ACTION_LIB=${{ github.action_path }}/../lib.sh'
       ;;
     create/"Emit the clusters output" | create/"Verify the clusters")
       printf '%s\n' \
         'INPUT_CONFIG=${{ inputs.config }}' \
         'KIND_OCP_ACTION_PREFIX=${{ steps.scope.outputs.prefix }}' \
-        'KIND_OCP_ACTION_STATE_ROOT=${{ steps.scope.outputs.state_root }}'
+        'KIND_OCP_ACTION_STATE_ROOT=${{ steps.scope.outputs.state_root }}' \
+        'ACTION_LIB=${{ github.action_path }}/../lib.sh'
+      ;;
+    delete/"Validate the inputs")
+      printf '%s\n' \
+        'INPUT_PREFIX=${{ inputs.prefix }}' \
+        'INPUT_STATE_ROOT=${{ inputs.state_root }}' \
+        'INPUT_KIND_OCP_VERSION=${{ inputs.kind_ocp_version }}' \
+        'INPUT_GO_VERSION=${{ inputs.go_version }}' \
+        'ACTION_LIB=${{ github.action_path }}/../lib.sh'
       ;;
     delete/"Delete the clusters")
       printf '%s\n' \
         'INPUT_PREFIX=${{ inputs.prefix }}' \
-        'INPUT_STATE_ROOT=${{ inputs.state_root }}'
+        'INPUT_STATE_ROOT=${{ inputs.state_root }}' \
+        'ACTION_LIB=${{ github.action_path }}/../lib.sh'
       ;;
     *)
       die "no recorded expectation for $1 step '$2' — the gate's recorded wiring is stale"
@@ -270,8 +314,8 @@ $got"
   while read -r ref; do
     [ -n "$ref" ] || continue
     grep -Fxq "$ref" <<<"$env_keys" \
-      || die "$yml: step '$name' references \$$ref, but its recorded env maps nothing onto it — composite run steps get no automatic INPUT_* variables, so the script would never see it on a real runner"
-  done < <(jq -r '.run' <<<"$step_json" | grep -oE 'INPUT_[A-Z0-9_]+' | sort -u || true)
+      || die "$yml: step '$name' references \$$ref, but its recorded env maps nothing onto it — composite run steps get no automatic INPUT_* variables and no ACTION_LIB, so the script would never see it on a real runner"
+  done < <(jq -r '.run' <<<"$step_json" | grep -oE '(INPUT_[A-Z0-9_]+|ACTION_LIB)' | sort -u || true)
   declared_inputs="$(yq -r '.inputs // {} | keys | join("\n")' "$yml")"
   declared_ids="$(yq -r '[.runs.steps[] | select(.id != null) | .id] | join("\n")' "$yml")"
   while read -r val; do
@@ -287,8 +331,16 @@ $got"
         grep -Fxq "$sid" <<<"$declared_ids" \
           || die "$yml: the recorded env references $val, but no step declares the id '$sid'"
         ;;
+      "$P_ACTION_PATH"*)
+        # The one github.action_path-derived value: the shared lib,
+        # one sibling up from each action, and it must exist.
+        [ "$val" = "$P_ACTION_PATH/../lib.sh" ] \
+          || die "$yml: the recorded env maps '$val', but github.action_path may only reference the shared lib as ../lib.sh"
+        [ -f "$ACTIONS_DIR/lib.sh" ] \
+          || die "$yml: ACTION_LIB points at the shared lib, but $ACTIONS_DIR/lib.sh does not exist"
+        ;;
       *)
-        die "internal: recorded env value is neither an inputs nor a steps reference: $val"
+        die "internal: recorded env value is neither an inputs, steps, nor action_path reference: $val"
         ;;
     esac
   done < <(expected_step_env "$action" "$name" | sed 's/^[^=]*=//')
@@ -402,8 +454,11 @@ run_step() {
   # The supplied values must cover exactly the recorded key set.
   # Keys are taken per argument (values may span lines — the CR/LF
   # probe supplies one), so a missing or extra mapping is a gate-side
-  # bug, not a silent empty.
-  expected_keys="$(expected_step_env "$action" "$want" | sed 's/=.*//' | LC_ALL=C sort)"
+  # bug, not a silent empty. ACTION_LIB is recorded wiring but is
+  # supplied by the harness itself (the staged lib's path — the
+  # gate-side equivalent of the runner-resolved mapping), never by
+  # the scenario, so it is not part of the caller-supplied set.
+  expected_keys="$(expected_step_env "$action" "$want" | sed 's/=.*//' | grep -v '^ACTION_LIB$' | LC_ALL=C sort)"
   supplied_keys="$(for kv in "$@"; do printf '%s\n' "${kv%%=*}"; done | LC_ALL=C sort)"
   [ "$expected_keys" = "$supplied_keys" ] \
     || die "run_step '$want': the supplied values must cover exactly the recorded env keys
@@ -420,6 +475,13 @@ $supplied_keys"
     done
     export GITHUB_OUTPUT="$out" GITHUB_PATH="$work/github-path"
     export GITHUB_RUN_ID="${CURRENT_RUN_ID:?CURRENT_RUN_ID is not set}" RUNNER_TEMP="$work/runner-temp"
+    # ACTION_LIB is supplied only when the step's recorded wiring
+    # maps it: a script that references it without the mapping must
+    # fail under set -u here exactly as it would on a real runner —
+    # an unconditional export would mask that bug.
+    case "$(expected_step_env "$action" "$want")" in
+      *ACTION_LIB=*) export ACTION_LIB="$ACTIONS_DIR/lib.sh" ;;
+    esac
     # One shared GOPATH so the pinned-release download happens once.
     # GOBIN points at a directory the install steps must override
     # (they pin their own under RUNNER_TEMP); scenarios assert this
@@ -431,7 +493,7 @@ $supplied_keys"
     export KIND_OCP_PREFIX=ambient-prefix-junk
     export KIND_OCP_CONFIG=/nonexistent/ambient-config.yaml
     export KIND_OCP_COUNT=7 KIND_OCP_PROFILE=minimal
-    export PATH="$(gate_path "$work")"
+    export PATH="${GATE_PATH_PREPEND:+${GATE_PATH_PREPEND}:}$(gate_path "$work")"
     cd "$work" || exit 1
     bash -c "$script"
   ) >"$log" 2>&1 || rc=$?
@@ -458,16 +520,22 @@ run_create_action() {
   CURRENT_RUN_ID="$2"
   shift 2
   fresh_work "$work"
-  local prefix state_root count profile config version
+  local prefix state_root count profile config version go_version
   prefix="$(with_input "$yml" prefix "$@")" || return 1
   state_root="$(with_input "$yml" state_root "$@")" || return 1
   count="$(with_input "$yml" count "$@")" || return 1
   profile="$(with_input "$yml" profile "$@")" || return 1
   config="$(with_input "$yml" config "$@")" || return 1
   version="$(with_input "$yml" kind_ocp_version "$@")" || return 1
+  go_version="$(with_input "$yml" go_version "$@")" || return 1
   local scope_prefix scope_root scope_env
   for step in "${CREATE_RUN_STEPS[@]}"; do
     case "$step" in
+      "Validate the inputs")
+        run_step create "$step" "$work" "" \
+          "INPUT_CONFIG=$config" "INPUT_KIND_OCP_VERSION=$version" \
+          "INPUT_GO_VERSION=$go_version" || return $?
+        ;;
       "Resolve the scope")
         run_step create "$step" "$work" "" \
           "INPUT_PREFIX=$prefix" "INPUT_STATE_ROOT=$state_root" || return $?
@@ -507,12 +575,19 @@ run_create_action() {
 # the delete action's own install step), fed like the consumer's
 # if: always() pattern: create's outputs as inputs.
 run_delete_action() {
-  local work="$1" prefix="$2" state_root="$3" yml="$DELETE_YML" version step
+  local work="$1" prefix="$2" state_root="$3" yml="$DELETE_YML" version go_version step
   CURRENT_RUN_ID="${RUN_ID}9"
   fresh_work "$work"
   version="$(declared_default "$yml" kind_ocp_version)" || return 1
+  go_version="$(declared_default "$yml" go_version)" || return 1
   for step in "${DELETE_RUN_STEPS[@]}"; do
     case "$step" in
+      "Validate the inputs")
+        run_step delete "$step" "$work" "" \
+          "INPUT_PREFIX=$prefix" "INPUT_STATE_ROOT=$state_root" \
+          "INPUT_KIND_OCP_VERSION=$version" "INPUT_GO_VERSION=$go_version" \
+          || die "the delete action failed at '$step' (see the step log above)"
+        ;;
       "Install kind-ocp")
         run_step delete "$step" "$work" "" "INPUT_KIND_OCP_VERSION=$version" \
           || die "the delete action failed at '$step' (see the step log above)"
@@ -590,6 +665,15 @@ gate_yaml() {
     die "the self-test carries a \${{ }} expression inside a run: script"
   fi
   pass "no \${{ }} expressions inside run: scripts"
+  # The shared lib both actions source through ACTION_LIB: present,
+  # parseable, and carrying no ${{ }} either — it is sourced into
+  # run: scripts, so the same rule covers it.
+  [ -f "$ACTIONS_DIR/lib.sh" ] || die "the shared lib $ACTIONS_DIR/lib.sh is missing — both actions source it through ACTION_LIB"
+  bash -n "$ACTIONS_DIR/lib.sh" || die "$ACTIONS_DIR/lib.sh does not parse under bash -n"
+  if grep -Fq '${{' "$ACTIONS_DIR/lib.sh"; then
+    die "$ACTIONS_DIR/lib.sh carries a \${{ }} expression — it is sourced into run: scripts"
+  fi
+  pass "the shared lib is present, parses, and holds the no-\${{ }} invariant"
   # The trigger and pin checks below run over the two actions and
   # the self-test EXPLICITLY: a directory scan of ACTIONS_DIR would
   # lose the self-test once the MOVE.md handoff moves it to
@@ -655,16 +739,16 @@ $declared"
 }
 
 gate_smoke() {
-  echo "=== smoke: exact step wiring; supplied/default inputs; invocation-unique default; multiline-input refusals"
+  echo "=== smoke: exact step wiring; supplied/default inputs; reserved default prefix; input refusals; inert tool diagnostics"
   local create_yml="$CREATE_YML" delete_yml="$DELETE_YML"
 
   # 1. Static wiring, per step and per action — purely structural,
   #    it fails with empty default inputs and nothing supplied:
   #    every run step must carry exactly the gate's recorded wiring
   #    (shell, no if:/continue-on-error:/working-directory:, id, the
-  #    whole env mapping, every INPUT_* the script references
-  #    covered), and the action-level outputs must map exactly as
-  #    recorded.
+  #    whole env mapping, every INPUT_* and ACTION_LIB the script
+  #    references covered), and the action-level outputs must map
+  #    exactly as recorded.
   local action yml n i
   for action in create delete; do
     yml="$ACTIONS_DIR/$action/action.yml"
@@ -694,7 +778,10 @@ gate_smoke() {
   #    two resolutions under the same run id (two default creates
   #    in one job) must not share a scope — the second would reuse
   #    the first's clusters, and either delete would target both
-  #    sets. The state-root default stays deterministic (the
+  #    sets. Uniqueness is enforced by RESERVATION, not by entropy:
+  #    each derived prefix owns a directory in the job-local
+  #    reservation root (mkdir is atomic), so a repeat draw cannot
+  #    publish. The state-root default stays deterministic (the
   #    delete action derives the same one, and the state store
   #    isolates scopes in per-prefix directories under it).
   local dw="$GATE_ROOT/smoke-default" rid="${RUN_ID}6" pa pb p
@@ -709,20 +796,101 @@ gate_smoke() {
     || die "the scope step failed under empty inputs (second resolution)"
   pb="$(github_output_get "$dw/step-outputs/scope.output" prefix)"
   for p in "$pa" "$pb"; do
-    [[ "$p" =~ ^ko-$rid-[0-9]+$ ]] \
-      || die "default prefix not derived from the run id plus a per-invocation component: '$p'"
+    [[ "$p" =~ ^ko-$rid-[0-9a-f]+$ ]] \
+      || die "default prefix not derived from the run id plus a 16-hex-char draw: '$p'"
   done
   [ "$pa" != "$pb" ] \
     || die "two scope resolutions under run id $rid derived the same prefix ($pa) — the default is not invocation-unique"
+  for p in "$pa" "$pb"; do
+    [ -d "$dw/runner-temp/kind-ocp-scope-reservations/$p" ] \
+      || die "the published default prefix '$p' has no reservation directory — it was not reserved atomically"
+  done
   [ "$(github_output_get "$dw/step-outputs/scope.output" state_root)" = "$dw/runner-temp/kind-ocp" ] \
     || die "default state_root not derived from RUNNER_TEMP"
-  pass "empty inputs derive ko-<run id>-<random> per invocation (two resolutions differ) and the state root from RUNNER_TEMP"
+  pass "empty inputs derive ko-<run id>-<16 hex> per invocation, each reserved atomically; the state root from RUNNER_TEMP"
 
-  # 4. Negative: a state_root carrying a newline is refused before
+  # 4. Deterministic collision: the first draw hits an existing
+  #    reservation, the step retries with a fresh draw and
+  #    publishes the second one. od — the step's only random
+  #    source — is PATH-shimmed, so the collision is scripted, not
+  #    awaited; the call count proves exactly one retry happened.
+  local cw="$GATE_ROOT/smoke-collision" fakes count_file
+  fresh_work "$cw"
+  CURRENT_RUN_ID="$rid"
+  fakes="$cw/fakebin" count_file="$cw/od-calls"
+  mkdir -p "$fakes"
+  cat >"$fakes/od" <<'FAKE_OD'
+#!/usr/bin/env bash
+# Deterministic od stand-in: emits a scripted 8-byte hex row per
+# call (the scope step's tr strips the whitespace), counting calls
+# in a file so the gate can assert how many draws happened.
+set -u
+count_file="${KO_FAKE_OD_COUNT:?}"
+mode="${KO_FAKE_OD_MODE:?}"
+n=0
+[ -s "$count_file" ] && n="$(cat "$count_file")"
+n=$((n + 1))
+printf '%s\n' "$n" >"$count_file"
+case "$mode:$n" in
+  sequence:1) printf ' aa bb cc dd ee ff 00 11\n' ;;
+  sequence:*) printf ' 11 22 33 44 55 66 77 88\n' ;;
+  constant:*) printf ' aa bb cc dd ee ff 00 11\n' ;;
+esac
+FAKE_OD
+  chmod +x "$fakes/od"
+  mkdir -p "$cw/runner-temp/kind-ocp-scope-reservations/ko-$rid-aabbccddeeff0011"
+  KO_FAKE_OD_COUNT="$count_file"
+  KO_FAKE_OD_MODE=sequence
+  export KO_FAKE_OD_COUNT KO_FAKE_OD_MODE
+  GATE_PATH_PREPEND="$fakes"
+  run_step create "Resolve the scope" "$cw" "-collide" \
+    "INPUT_PREFIX=" "INPUT_STATE_ROOT=" \
+    || die "the scope step failed on a scripted collision (see the step log above)"
+  unset GATE_PATH_PREPEND
+  [ "$(cat "$count_file")" = 2 ] \
+    || die "expected exactly 2 draws on a single scripted collision, saw $(cat "$count_file")"
+  [ "$(github_output_get "$cw/step-outputs/scope.output" prefix)" = "ko-$rid-1122334455667788" ] \
+    || die "the retried (second) draw was not the published prefix: $(github_output_get "$cw/step-outputs/scope.output" prefix)"
+  [ -d "$cw/runner-temp/kind-ocp-scope-reservations/ko-$rid-aabbccddeeff0011" ] \
+    || die "the pre-existing reservation is gone (the step must not delete reservations)"
+  [ -d "$cw/runner-temp/kind-ocp-scope-reservations/ko-$rid-1122334455667788" ] \
+    || die "the published prefix has no reservation of its own"
+  pass "a colliding default-prefix draw is retried with a fresh draw; only the reserved prefix is published"
+
+  # 5. Deterministic exhaustion: every draw collides with the same
+  #    reservation; the step fails with the fixed message and
+  #    publishes NOTHING (no half-published scope for an if:
+  #    always() delete to act on).
+  local ew="$GATE_ROOT/smoke-exhaust" ecount rc=0
+  fresh_work "$ew"
+  CURRENT_RUN_ID="$rid"
+  ecount="$ew/od-calls"
+  mkdir -p "$ew/runner-temp/kind-ocp-scope-reservations/ko-$rid-aabbccddeeff0011"
+  KO_FAKE_OD_COUNT="$ecount"
+  KO_FAKE_OD_MODE=constant
+  GATE_PATH_PREPEND="$fakes"
+  run_step create "Resolve the scope" "$ew" "-exhaust" \
+    "INPUT_PREFIX=" "INPUT_STATE_ROOT=" || rc=$?
+  unset GATE_PATH_PREPEND
+  [ "$rc" -ne 0 ] || die "the scope step survived exhausting its reservation attempts"
+  [ "$(cat "$ecount")" = 5 ] \
+    || die "expected exactly 5 draws before giving up, saw $(cat "$ecount")"
+  grep -q 'could not reserve a unique default prefix' "$ew/logs/"*exhaust*Resolve*.log \
+    || die "exhaustion failed without the fixed message (see $ew/logs)"
+  [ ! -s "$ew/step-outputs/scope.output" ] \
+    || die "the exhausted scope step still published output directives:"$'\n'"$(cat "$ew/step-outputs/scope.output")"
+  if grep -q 'aabbccddeeff0011' "$ew/logs/"*exhaust*Resolve*.log; then
+    die "the exhausted step echoed the colliding value — a workflow-command injection surface:"$'\n'"$(cat "$ew/logs/"*exhaust*Resolve*.log)"
+  fi
+  unset KO_FAKE_OD_COUNT KO_FAKE_OD_MODE
+  pass "an exhausted default-prefix allocation fails after 5 draws with a fixed message and publishes nothing"
+
+  # 6. Negative: a state_root carrying a newline is refused before
   #    any output directive is written (output injection).
-  local nw="$GATE_ROOT/smoke-newline" rc=0
+  local nw="$GATE_ROOT/smoke-newline"
   fresh_work "$nw"
   CURRENT_RUN_ID="$rid"
+  rc=0
   run_step create "Resolve the scope" "$nw" "-newline" \
     "INPUT_PREFIX=" "INPUT_STATE_ROOT=$nw/line1
 line2" || rc=$?
@@ -733,7 +901,7 @@ line2" || rc=$?
     || die "the refused scope step still wrote output directives:"$'\n'"$(cat "$nw/step-outputs/scope.output")"
   pass "state_root containing a newline is refused; no output directives are written"
 
-  # 5. Negative: a prefix carrying a newline is refused the same
+  # 7. Negative: a prefix carrying a newline is refused the same
   #    way — and the refusal never echoes the raw value. The runner
   #    parses :: workflow commands from stderr too, so a rejected
   #    multiline prefix echoed back could inject a set-output past
@@ -755,79 +923,203 @@ line2" || rc=$?
   fi
   pass "prefix containing a newline is refused; no directives; the raw value never reaches the log"
 
-  # 6. Negative: a multiline config path is refused before kind-ocp
-  #    runs. kind-ocp renders the config path unquoted in its own
-  #    diagnostic (`config file <path>: …`), so on the pre-guard
-  #    code the rejected value's second line landed at a line start
-  #    in the step log — where the runner parses `::` workflow
-  #    commands. The binary is installed first (this work's own
-  #    GITHUB_PATH) so the refusal is proven to fire before the
-  #    tool runs, not because kind-ocp is missing from PATH.
+  # 8. Negative: a multiline config path is refused by the create
+  #    action's validation step — the single validation point that
+  #    replaced the guards the Create/Emit/Verify steps each used
+  #    to repeat (review round 6). kind-ocp renders the config path
+  #    unquoted in its own diagnostics, so the refusal stays as
+  #    defense in depth on top of the log sanitizer.
   local tw="$GATE_ROOT/smoke-toolguards"
   fresh_work "$tw"
   CURRENT_RUN_ID="$rid"
-  run_step create "Install kind-ocp" "$tw" "" \
-    "INPUT_KIND_OCP_VERSION=$(declared_default "$create_yml" kind_ocp_version)" \
-    || die "the install step failed ahead of the config guard probe"
   rc=0
-  run_step create "Create the clusters" "$tw" "-cfg" \
-    "INPUT_COUNT=" "INPUT_PROFILE=" "INPUT_CONFIG=cfg-missing
+  run_step create "Validate the inputs" "$tw" "-cfg" \
+    "INPUT_CONFIG=cfg-missing
 ::set-output::prefix=pwned" \
-    "KIND_OCP_ACTION_PREFIX=cfgguard" \
-    "KIND_OCP_ACTION_STATE_ROOT=$tw/runner-temp/kind-ocp" || rc=$?
+    "INPUT_KIND_OCP_VERSION=$(declared_default "$create_yml" kind_ocp_version)" \
+    "INPUT_GO_VERSION=$(declared_default "$create_yml" go_version)" || rc=$?
   [ "$rc" -ne 0 ] || die "a config containing a newline was accepted"
-  grep -q 'config must be a single line' "$tw/logs/"*cfg*Create*.log \
-    || die "the create step failed without the expected config refusal (see $tw/logs)"
-  if grep -q 'pwned' "$tw/logs/"*cfg*Create*.log || grep -q 'cfg-missing' "$tw/logs/"*cfg*Create*.log; then
-    die "the refused config path was echoed to the log — a workflow-command injection surface:"$'\n'"$(cat "$tw/logs/"*cfg*Create*.log)"
+  grep -q 'config must be a single line' "$tw/logs/"*cfg*Validate*.log \
+    || die "the validation step failed without the expected config refusal (see $tw/logs)"
+  if grep -q 'pwned' "$tw/logs/"*cfg*Validate*.log || grep -q 'cfg-missing' "$tw/logs/"*cfg*Validate*.log; then
+    die "the refused config path was echoed to the log — a workflow-command injection surface:"$'\n'"$(cat "$tw/logs/"*cfg*Validate*.log)"
   fi
-  pass "config containing a newline is refused; the failure propagates; the raw value never reaches the log"
+  pass "config containing a newline is refused by the validation step; the raw value never reaches the log"
 
-  # 7. Negative: a multiline kind-ocp version is refused by the
-  #    install step the same way (go renders the module@version
-  #    operand unquoted in its diagnostics).
+  # 9. Negative: the version inputs are held to the version-token
+  #    charset — go_version because setup-go logs the spec
+  #    verbatim in its own (unsanitizable) step, kind_ocp_version
+  #    because go renders the module@version operand unquoted. A
+  #    CR/LF value and a value carrying the legacy mid-line
+  #    introducer are both refused, with fixed messages that never
+  #    echo the raw value.
   rc=0
-  run_step create "Install kind-ocp" "$tw" "-ver" \
+  run_step create "Validate the inputs" "$tw" "-ver" \
+    "INPUT_CONFIG=" \
     "INPUT_KIND_OCP_VERSION=v0.1.1
-::set-output::prefix=pwned" || rc=$?
+::set-output::prefix=pwned" \
+    "INPUT_GO_VERSION=$(declared_default "$create_yml" go_version)" || rc=$?
   [ "$rc" -ne 0 ] || die "a kind_ocp_version containing a newline was accepted"
-  grep -q 'kind_ocp_version must be a single line' "$tw/logs/"*ver*Install*.log \
-    || die "the install step failed without the expected version refusal (see $tw/logs)"
-  if grep -q 'pwned' "$tw/logs/"*ver*Install*.log || grep -q 'v0.1.1' "$tw/logs/"*ver*Install*.log; then
-    die "the refused kind-ocp version was echoed to the log — a workflow-command injection surface:"$'\n'"$(cat "$tw/logs/"*ver*Install*.log)"
+  grep -q 'kind_ocp_version may contain only' "$tw/logs/"*ver*Validate*.log \
+    || die "the validation step failed without the expected kind_ocp_version refusal (see $tw/logs)"
+  if grep -q 'pwned' "$tw/logs/"*ver*Validate*.log || grep -q 'v0.1.1' "$tw/logs/"*ver*Validate*.log; then
+    die "the refused kind-ocp version was echoed to the log — a workflow-command injection surface:"$'\n'"$(cat "$tw/logs/"*ver*Validate*.log)"
   fi
-  pass "kind_ocp_version containing a newline is refused; the raw value never reaches the log"
-
-  # 8. Negative: delete refuses a multiline prefix and a multiline
-  #    state_root before kind-ocp runs. kind-ocp prints the state
-  #    root unquoted (`state cleared under <root>`) and os errors
-  #    carry paths verbatim, so on the pre-guard code the rejected
-  #    state_root landed at a line start in the step log. kind-ocp
-  #    is on PATH here (probe 6's install), so both refusals are
-  #    proven to fire before the tool runs.
   rc=0
-  run_step delete "Delete the clusters" "$tw" "-delpfx" \
+  run_step create "Validate the inputs" "$tw" "-gover" \
+    "INPUT_CONFIG=" \
+    "INPUT_KIND_OCP_VERSION=$(declared_default "$create_yml" kind_ocp_version)" \
+    "INPUT_GO_VERSION=1.27.4 ##[set-output name=pwned]x" || rc=$?
+  [ "$rc" -ne 0 ] || die "a go_version carrying the legacy workflow-command introducer was accepted"
+  grep -q 'go_version may contain only' "$tw/logs/"*gover*Validate*.log \
+    || die "the validation step failed without the expected go_version refusal (see $tw/logs)"
+  if grep -q 'pwned' "$tw/logs/"*gover*Validate*.log || grep -q '1.27.4' "$tw/logs/"*gover*Validate*.log; then
+    die "the refused go_version was echoed to the log — a workflow-command injection surface:"$'\n'"$(cat "$tw/logs/"*gover*Validate*.log)"
+  fi
+  pass "kind_ocp_version and go_version are refused unless single tokens of the safe charset; the raw values never reach the log"
+
+  # 10. Negative: delete's validation step refuses a multiline
+  #     prefix and a multiline state_root before kind-ocp runs.
+  #     kind-ocp prints the state root unquoted (`state cleared
+  #     under <root>`) and os errors carry paths verbatim.
+  rc=0
+  run_step delete "Validate the inputs" "$tw" "-delpfx" \
     "INPUT_PREFIX=ko-inject
-::set-output::prefix=pwned" "INPUT_STATE_ROOT=" || rc=$?
+::set-output::prefix=pwned" "INPUT_STATE_ROOT=" \
+    "INPUT_KIND_OCP_VERSION=$(declared_default "$delete_yml" kind_ocp_version)" \
+    "INPUT_GO_VERSION=$(declared_default "$delete_yml" go_version)" || rc=$?
   [ "$rc" -ne 0 ] || die "delete accepted a prefix containing a newline"
-  grep -q 'prefix must be a single line' "$tw/logs/"*delpfx*Delete*.log \
+  grep -q 'prefix must be a single line' "$tw/logs/"*delpfx*Validate*.log \
     || die "delete failed without the expected prefix refusal (see $tw/logs)"
-  if grep -q 'pwned' "$tw/logs/"*delpfx*Delete*.log || grep -q 'ko-inject' "$tw/logs/"*delpfx*Delete*.log; then
-    die "the refused delete prefix was echoed to the log — a workflow-command injection surface:"$'\n'"$(cat "$tw/logs/"*delpfx*Delete*.log)"
+  if grep -q 'pwned' "$tw/logs/"*delpfx*Validate*.log || grep -q 'ko-inject' "$tw/logs/"*delpfx*Validate*.log; then
+    die "the refused delete prefix was echoed to the log — a workflow-command injection surface:"$'\n'"$(cat "$tw/logs/"*delpfx*Validate*.log)"
   fi
   rc=0
-  run_step delete "Delete the clusters" "$tw" "-delroot" \
+  run_step delete "Validate the inputs" "$tw" "-delroot" \
     "INPUT_PREFIX=delguard" "INPUT_STATE_ROOT=$tw/root-a
-::set-output::state_root=pwned" || rc=$?
+::set-output::state_root=pwned" \
+    "INPUT_KIND_OCP_VERSION=$(declared_default "$delete_yml" kind_ocp_version)" \
+    "INPUT_GO_VERSION=$(declared_default "$delete_yml" go_version)" || rc=$?
   [ "$rc" -ne 0 ] || die "delete accepted a state_root containing a newline"
-  grep -q 'state_root must be a single line' "$tw/logs/"*delroot*Delete*.log \
+  grep -q 'state_root must be a single line' "$tw/logs/"*delroot*Validate*.log \
     || die "delete failed without the expected state_root refusal (see $tw/logs)"
-  if grep -q 'pwned' "$tw/logs/"*delroot*Delete*.log || grep -q 'root-a' "$tw/logs/"*delroot*Delete*.log; then
-    die "the refused delete state_root was echoed to the log — a workflow-command injection surface:"$'\n'"$(cat "$tw/logs/"*delroot*Delete*.log)"
+  if grep -q 'pwned' "$tw/logs/"*delroot*Validate*.log || grep -q 'root-a' "$tw/logs/"*delroot*Validate*.log; then
+    die "the refused delete state_root was echoed to the log — a workflow-command injection surface:"$'\n'"$(cat "$tw/logs/"*delroot*Validate*.log)"
   fi
-  pass "delete refuses a multiline prefix and a multiline state_root; the raw values never reach the log"
+  pass "delete's validation step refuses a multiline prefix and a multiline state_root; the raw values never reach the log"
 
-  # 9. delete enforces its required prefix through its own mapping.
+  # 11. The log wrappers, unit level against the REAL lib: both
+  #     workflow-command formats are made inert at both log
+  #     boundaries, the tool's exit status survives the pipe, and
+  #     ko_capture_tool keeps captured stdout raw while its stderr
+  #     is sanitized. The markers are harmless (set-output /
+  #     add-mask text that would have to be parsed as commands to
+  #     matter); the assertions are on shape, not on damage.
+  local lw="$GATE_ROOT/smoke-lib"
+  fresh_work "$lw"
+  (
+    source "$ACTIONS_DIR/lib.sh"
+    llog="$(mktemp "$lw/wrapped.XXXXXXXX")"
+    lrc=0
+    ko_run_tool bash -c 'printf "line1 ##[set-output name=pwned]mid\n"; printf "pre\r::set-output::prefix=pwned\n"; printf "  ::add-mask::pwned\n"; printf "clean line\n"; exit 3' \
+      >"$llog" 2>&1 || lrc=$?
+    [ "$lrc" -eq 3 ] || { echo "FAIL: ko_run_tool lost the tool's exit status (got $lrc)"; exit 1; }
+    if grep -Fq '##[set-output name=pwned]' "$llog"; then
+      echo "FAIL: a live legacy introducer reached the log"; exit 1
+    fi
+    grep -Fq '##\[set-output name=pwned]mid' "$llog" \
+      || { echo "FAIL: the neutralized legacy marker is missing from the log (inert, not dropped)"; exit 1; }
+    if grep -Eq '^[[:space:]]*::' "$llog"; then
+      echo "FAIL: a live modern introducer reached a line start"; exit 1
+    fi
+    grep -Fq ': :set-output::prefix=pwned' "$llog" \
+      || { echo "FAIL: the CR-boundary modern marker is missing from the log (inert, not dropped)"; exit 1; }
+    grep -Fq '  : :add-mask::pwned' "$llog" \
+      || { echo "FAIL: the leading-whitespace modern marker is missing from the log"; exit 1; }
+    grep -Fq 'clean line' "$llog" \
+      || { echo "FAIL: ordinary tool output did not survive the sanitizer"; exit 1; }
+    lcaperr="$(mktemp "$lw/capture-stderr.XXXXXXXX")"
+    lrc=0
+    lcap="$(ko_capture_tool bash -c 'printf "raw ##[x] stdout\n"; printf "err ##[y] line\n" >&2; exit 4' 2>"$lcaperr")" || lrc=$?
+    [ "$lrc" -eq 4 ] || { echo "FAIL: ko_capture_tool lost the tool's exit status (got $lrc)"; exit 1; }
+    [ "$lcap" = "raw ##[x] stdout" ] \
+      || { echo "FAIL: ko_capture_tool mangled captured stdout (it is data, not log): $lcap"; exit 1; }
+    if grep -Fq '##[y]' "$lcaperr"; then
+      echo "FAIL: a live legacy introducer reached the log through captured stderr"; exit 1
+    fi
+    grep -Fq '##\[y] line' "$lcaperr" \
+      || { echo "FAIL: the neutralized stderr marker is missing"; exit 1; }
+  ) || die "the log wrappers failed their unit-level checks (messages above)"
+  pass "log wrappers: both introducer formats inert at both boundaries, statuses preserved, captured stdout raw"
+
+  # 12. The sanitizer, step level with harmless markers: a fake
+  #     kind-ocp whose diagnostics embed both command formats at
+  #     both log boundaries (modeling a config-file parse error
+  #     quoting attacker content) runs through the REAL create
+  #     step; the step succeeds, the log keeps the neutralized
+  #     markers, and nothing reaches GITHUB_OUTPUT.
+  local mw="$GATE_ROOT/smoke-markers" fakekc mlog mout
+  fresh_work "$mw"
+  CURRENT_RUN_ID="$rid"
+  fakekc="$mw/fakebin"
+  mkdir -p "$fakekc"
+  cat >"$fakekc/kind-ocp" <<'FAKE_KO'
+#!/usr/bin/env bash
+# Harmless-marker kind-ocp stand-in: models the diagnostics a real
+# kind-ocp emits when a config-file parse error quotes
+# attacker-controlled content — the legacy mid-line introducer, a
+# bare-CR line boundary feeding a modern line-leading introducer,
+# and leading whitespace before a modern introducer (which the
+# modern parser TrimStarts away). Exit status is scriptable.
+printf 'config file cfg: yaml: line 2: did not find expected key ##[set-output name=pwned]injected\n'
+printf 'progress, carriage return follows\r'
+printf '::set-output::prefix=pwned\n'
+printf '  ::add-mask::injected\n'
+printf 'done\n'
+exit "${KO_FAKE_KIND_OCP_EXIT:-0}"
+FAKE_KO
+  chmod +x "$fakekc/kind-ocp"
+  GATE_PATH_PREPEND="$fakekc"
+  run_step create "Create the clusters" "$mw" "-markers" \
+    "INPUT_COUNT=" "INPUT_PROFILE=" "INPUT_CONFIG=" \
+    "KIND_OCP_ACTION_PREFIX=markerprobe" \
+    "KIND_OCP_ACTION_STATE_ROOT=$mw/runner-temp/kind-ocp" \
+    || die "the create step failed while running the marker-emitting fake kind-ocp (see the step log above)"
+  unset GATE_PATH_PREPEND
+  mlog="$mw/logs/-markersCreate_the_clusters.log"
+  mout="$mw/step-outputs/Create_the_clusters.output"
+  if grep -Fq '##[set-output name=pwned]' "$mlog"; then
+    die "a live legacy workflow-command introducer reached the create step's log"
+  fi
+  grep -Fq '##\[set-output name=pwned]injected' "$mlog" \
+    || die "the neutralized legacy marker is missing from the create step's log (inert, not dropped)"
+  if grep -Eq '^[[:space:]]*::' "$mlog"; then
+    die "a live modern workflow-command introducer reached a line start in the create step's log"
+  fi
+  grep -Fq ': :set-output::prefix=pwned' "$mlog" \
+    || die "the CR-boundary modern marker is missing from the create step's log"
+  grep -Fq '  : :add-mask::injected' "$mlog" \
+    || die "the leading-whitespace modern marker is missing from the create step's log"
+  [ ! -s "$mout" ] \
+    || die "the create step wrote output directives while running the fake kind-ocp:"$'\n'"$(cat "$mout")"
+  pass "tool diagnostics stay inert through the create step: both formats neutralized at both boundaries, nothing written to GITHUB_OUTPUT"
+
+  # 13. Tool exit statuses survive the sanitizer at step level: the
+  #     fake kind-ocp exits 3, and the create step fails with 3.
+  rc=0
+  KO_FAKE_KIND_OCP_EXIT=3
+  export KO_FAKE_KIND_OCP_EXIT
+  GATE_PATH_PREPEND="$fakekc"
+  run_step create "Create the clusters" "$mw" "-status" \
+    "INPUT_COUNT=" "INPUT_PROFILE=" "INPUT_CONFIG=" \
+    "KIND_OCP_ACTION_PREFIX=markerprobe" \
+    "KIND_OCP_ACTION_STATE_ROOT=$mw/runner-temp/kind-ocp" || rc=$?
+  unset GATE_PATH_PREPEND KO_FAKE_KIND_OCP_EXIT
+  [ "$rc" -eq 3 ] \
+    || die "the create step reported exit $rc for a tool exiting 3 — the sanitizer pipe swallowed the status"
+  pass "a tool's non-zero exit survives the sanitizer (step exit 3 for a tool exiting 3)"
+
+  # 14. delete enforces its required prefix through its own mapping.
   local dlw="$GATE_ROOT/smoke-delete"
   fresh_work "$dlw"
   CURRENT_RUN_ID="$rid"
@@ -861,7 +1153,7 @@ gate_e2e() {
   # state_root into ITS OWN output file — exactly what a consumer's
   # steps.scope.outputs.* reads — and clusters exists only in the
   # clusters step's file.
-  [[ "$prefix" =~ ^ko-$rid-[0-9]+$ ]] \
+  [[ "$prefix" =~ ^ko-$rid-[0-9a-f]+$ ]] \
     || die "default prefix not derived from the run id plus a per-invocation component: '$prefix'"
   [ "$state_root" = "$work/runner-temp/kind-ocp" ] || die "unexpected default state root: '$state_root'"
   [ -z "$(github_output_get "$work/step-outputs/scope.output" clusters)" ] \
@@ -981,7 +1273,7 @@ gate_failure() {
   # scope step's OWN file, which is what a consumer's
   # steps.scope.outputs.* reads — and clusters was never emitted,
   # because the clusters step never ran.
-  [[ "$prefix" =~ ^ko-$rid-[0-9]+$ ]] \
+  [[ "$prefix" =~ ^ko-$rid-[0-9a-f]+$ ]] \
     || die "prefix missing (or wrong shape) in the scope step's outputs of the killed run: '$prefix'"
   [ "$(github_output_get "$work/step-outputs/scope.output" state_root)" = "$work/runner-temp/kind-ocp" ] \
     || die "state_root missing (or wrong) in the scope step's outputs of the killed run"
@@ -1009,7 +1301,7 @@ gate_spaced() {
   local prefix clusters name kc
   prefix="$(github_output_get "$work/step-outputs/scope.output" prefix)"
   clusters="$(github_output_get "$work/step-outputs/clusters.output" clusters)"
-  [[ "$prefix" =~ ^ko-$rid-[0-9]+$ ]] \
+  [[ "$prefix" =~ ^ko-$rid-[0-9a-f]+$ ]] \
     || die "default prefix not derived from the run id plus a per-invocation component: '$prefix'"
   jq -e . >/dev/null <<<"$clusters" || die "spaced state root broke the clusters JSON"
   [ "$(jq 'length' <<<"$clusters")" = 2 ] || die "expected 2 clusters under the spaced state root"
@@ -1027,7 +1319,7 @@ gate_spaced() {
 }
 
 usage() {
-  sed -n '2,74p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,91p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-}" in

@@ -11,29 +11,48 @@
 #     mapping (`INPUT_<NAME>: ${{ inputs.<name> }}`) and every value
 #     resolved by an earlier step through `env:` as well: input bytes
 #     are environment values, never script language, and the scripts
-#     quote every expansion.
+#     quote every expansion. ACTION_LIB is the one non-input mapping:
+#     the runner-resolved path of this action's own bundled lib.sh,
+#     which the scripts source for the shared helpers instead of
+#     inlining one copy per step.
 #   - Every `run:` script sets `euo pipefail`; kind-ocp's and the
-#     tools' exit codes propagate.
+#     tools' exit codes propagate through the log wrappers
+#     (lib.sh's ko_run_tool / ko_capture_tool return the tool's own
+#     status).
+#   - Inputs are validated once per action, in the first run step,
+#     before any tool or third-party action runs: go_version and
+#     kind_ocp_version must be single tokens of a charset that
+#     cannot form a workflow command (setup-go logs the version
+#     spec verbatim in its own step — output this action cannot
+#     sanitize — and go renders the module@version operand
+#     unquoted), and the config path must be a single line. The
+#     guards the Create/Emit/Verify steps used to repeat live only
+#     there now. Refusals use fixed messages that never echo the
+#     raw value: the runner parses workflow commands from stderr
+#     too.
+#   - Tool diagnostics are inert in the runner's log whatever they
+#     quote — including config-file CONTENT that kind-ocp's parse
+#     errors can embed. The runner parses workflow commands in two
+#     formats (actions/runner v2.338.2): the modern `::name::` at
+#     the start of a line (after leading whitespace) and the legacy
+#     `##[name]` ANYWHERE on a line, so a single-line input is not
+#     a safe input and %q quoting is not a defense. Every tool byte
+#     bound for the log passes ko_neutralize_log (CR becomes a line
+#     break, `##[` becomes `##\[` — the same backslash insertion
+#     the runner's own OutputManager uses — and a line-leading `::`
+#     becomes `: :`), with tool exit statuses preserved.
 #   - The prefix is validated with shell globs, not a line-oriented
 #     regex: a value containing a newline must not slip a
 #     line-oriented match through into GITHUB_OUTPUT.
-#   - Refusals never echo the raw input: the runner parses `::`
-#     workflow commands from stderr too, so a rejected multiline
-#     prefix echoed back could inject one (a legacy set-output
-#     writing the prefix output the always() delete consumes).
-#   - The same rule covers tool diagnostics that embed an input
-#     verbatim: kind-ocp renders the config path unquoted
-#     (`config file <path>: …`) and go renders the module@version
-#     operand unquoted, so a multiline value would put its later
-#     lines at line starts in the step log, where the runner
-#     parses `::` workflow commands. Both inputs are refused
-#     unless single-line, with the same fixed messages. count,
-#     profile, and the prefix need no such guard: their tools
-#     quote them (%q), which renders a newline escaped on one
-#     line.
-#   - Outputs are single-line `key=value` directives. A state_root
-#     carrying CR or LF is refused outright (spaces stay supported),
-#     so no value can inject extra output lines.
+#   - Outputs are single-line `key=value` directives written to
+#     GITHUB_OUTPUT, never echoed as `::set-output::` log text. A
+#     state_root carrying CR or LF is refused outright (spaces stay
+#     supported), so no value can inject extra output lines.
+#   - The default prefix is not merely random, it is RESERVED: one
+#     8-byte /dev/urandom draw (16 hex chars) is mkdir-reserved in
+#     a job-local directory before it is published, a collision
+#     retries with a fresh draw, and exhaustion fails without
+#     publishing anything — see the scope step.
 #
 # STAGED FILE — this is the complete action, byte-for-byte, but it
 # does not live at its operative path yet: the automated sessions
@@ -44,6 +63,7 @@
 #
 #   mkdir -p .github/actions
 #   git mv action/create .github/actions/create
+#   git mv action/lib.sh .github/actions/lib.sh
 #
 # — and delete this paragraph.
 name: 'kind-ocp create'
@@ -67,10 +87,10 @@ inputs:
   prefix:
     description: >-
       Cluster name prefix; clusters are <prefix>-<i>. Empty derives
-      ko-<run id>-<random>, unique per invocation, so two default
-      creates in one job never share a scope. Must satisfy
-      kind-ocp's prefix rules: lowercase alphanumeric and '-',
-      1-40 chars.
+      ko-<run id>-<random>, atomically reserved per invocation, so
+      two default creates in one job never share a scope. Must
+      satisfy kind-ocp's prefix rules: lowercase alphanumeric and
+      '-', 1-40 chars.
     default: ''
   state_root:
     description: >-
@@ -90,12 +110,15 @@ inputs:
   kind_ocp_version:
     description: >-
       Released kind-ocp version the action installs with go install.
-      Must be a single line (CR/LF refused).
+      Must be a single token of letters, digits, and
+      . _ ~ ^ + < > / = - (CR/LF and every workflow-command byte
+      refused).
     default: 'v0.1.1'
   go_version:
     description: >-
       Go toolchain for the install; must satisfy the pinned release's
-      go.mod minimum.
+      go.mod minimum. Same single-token rule as kind_ocp_version:
+      setup-go logs the spec verbatim in its own step.
     default: '1.27.4'
 
 outputs:
@@ -116,6 +139,34 @@ outputs:
 runs:
   using: composite
   steps:
+    - name: Validate the inputs
+      env:
+        INPUT_CONFIG: ${{ inputs.config }}
+        INPUT_KIND_OCP_VERSION: ${{ inputs.kind_ocp_version }}
+        INPUT_GO_VERSION: ${{ inputs.go_version }}
+        ACTION_LIB: ${{ github.action_path }}/../lib.sh
+      shell: bash
+      run: |
+        set -euo pipefail
+        source "${ACTION_LIB:?ACTION_LIB is not set}"
+        # The single validation point (review round 6): the guards
+        # the Create/Emit/Verify steps each used to repeat live
+        # here, ahead of every tool and third-party action, so the
+        # later steps trust the inputs.
+        # The config path is freeform (spaces are legal), so it is
+        # held to the single-line rule only; the raw config
+        # diagnostics kind-ocp can emit are made inert downstream
+        # by the log wrappers.
+        ko_require_single_line config "${INPUT_CONFIG:-}"
+        # go_version reaches actions/setup-go through `with:` and
+        # setup-go logs the spec verbatim in its own step — output
+        # this action cannot sanitize — so the token charset is the
+        # defense: it cannot form `::` or `##[`. kind_ocp_version
+        # gets the same rule (go renders the module@version operand
+        # unquoted). Fixed refusals, never the raw value.
+        ko_require_version_token go_version "${INPUT_GO_VERSION:?go_version input is empty}"
+        ko_require_version_token kind_ocp_version "${INPUT_KIND_OCP_VERSION:?kind_ocp_version input is empty}"
+
     - name: Resolve the scope
       id: scope
       env:
@@ -129,14 +180,51 @@ runs:
         # The default prefix must be unique per invocation, not per
         # run: two default creates in one job share GITHUB_RUN_ID,
         # and a shared prefix would let the second reuse the first's
-        # clusters and either delete target both sets. Two bash
-        # RANDOM draws (30 bits) per resolution keep them distinct;
-        # an explicit prefix is preserved verbatim (deterministic,
-        # caller-chosen). The delete action requires create's
-        # prefix output instead of deriving one, so this stays
-        # local to create.
-        prefix="${INPUT_PREFIX:-ko-${GITHUB_RUN_ID:?GITHUB_RUN_ID is not set}-${RANDOM}${RANDOM}}"
+        # clusters and either delete target both sets. Uniqueness is
+        # RESERVED, not just drawn: one 8-byte draw from
+        # /dev/urandom (16 hex chars, 64 bits, fixed width — two
+        # draws cannot concatenate into the same suffix) is
+        # mkdir-reserved in a job-local directory (mkdir succeeds
+        # for exactly one contender) before it is published; a
+        # collision retries with a fresh draw, and exhaustion fails
+        # the step without publishing anything. An explicit prefix
+        # is preserved verbatim and is not reserved — the caller
+        # manages that scope. The delete action requires create's
+        # prefix output instead of deriving one, so reservation
+        # stays local to create.
+        prefix="${INPUT_PREFIX:-}"
         state_root="${INPUT_STATE_ROOT:-${RUNNER_TEMP:?RUNNER_TEMP is not set}/kind-ocp}"
+        if [ -z "$prefix" ]; then
+          reservations="${RUNNER_TEMP}/kind-ocp-scope-reservations"
+          mkdir -p "$reservations"
+          attempt=0
+          while [ "$attempt" -lt 5 ]; do
+            # od resolves through PATH; the draw must be exactly 16
+            # lowercase hex chars or nothing is published.
+            draw="$(od -An -N8 -tx1 /dev/urandom | tr -d '[:space:]')"
+            if [ "${#draw}" -ne 16 ]; then
+              echo "internal error: the default-prefix draw was not 16 hex characters" >&2
+              exit 1
+            fi
+            case "$draw" in
+              *[!0-9a-f]*)
+                echo "internal error: the default-prefix draw was not 16 hex characters" >&2
+                exit 1 ;;
+            esac
+            if mkdir "$reservations/ko-${GITHUB_RUN_ID:?GITHUB_RUN_ID is not set}-$draw" 2>/dev/null; then
+              prefix="ko-${GITHUB_RUN_ID}-$draw"
+              break
+            fi
+            attempt=$((attempt + 1))
+          done
+          if [ -z "$prefix" ]; then
+            # Fixed message, never the value: a failed allocation
+            # publishes nothing, so an if: always() delete has no
+            # half-published scope to act on (nothing was created).
+            echo "internal error: could not reserve a unique default prefix (5 collisions)" >&2
+            exit 1
+          fi
+        fi
 
         # Mirror config.ValidatePrefix (^[a-z0-9]([-a-z0-9]*[a-z0-9])?$,
         # 1-40 chars). Shell globs, not grep: grep matches line by
@@ -169,9 +257,11 @@ runs:
             exit 1 ;;
         esac
 
-        # Emitted before anything that can fail, so an if: always()
-        # delete can clean up a half-created prefix even when this
-        # action dies during setup.
+        # Emitted only once the scope above is fully resolved and
+        # validated — a failed allocation publishes nothing — and
+        # still before install/create, so an if: always() delete
+        # can clean up a half-created prefix when this action dies
+        # during setup.
         {
           printf 'prefix=%s\n' "$prefix"
           printf 'state_root=%s\n' "$state_root"
@@ -190,26 +280,20 @@ runs:
     - name: Install kind-ocp
       env:
         INPUT_KIND_OCP_VERSION: ${{ inputs.kind_ocp_version }}
+        ACTION_LIB: ${{ github.action_path }}/../lib.sh
       shell: bash
       run: |
         set -euo pipefail
-        # go renders the module@version operand unquoted in its own
-        # diagnostics, so a multiline kind_ocp_version would put its
-        # later lines at line starts in this step's log — where the
-        # runner parses `::` workflow commands. Refuse the shape;
-        # never echo it.
-        case "${INPUT_KIND_OCP_VERSION:-}" in
-          *$'\r'*|*$'\n'*)
-            echo "kind_ocp_version must be a single line (no CR or LF)" >&2
-            exit 1 ;;
-        esac
+        source "${ACTION_LIB:?ACTION_LIB is not set}"
         # GOBIN pinned to a runner-local directory, and that same
         # directory published below: an ambient GOBIN (a calling
         # workflow's, or the runner's) must not decide where the
-        # binary lands or which one runs.
+        # binary lands or which one runs. go's diagnostics (the raw
+        # module@version operand) reach the log only through the
+        # sanitizer; go's exit status is ko_run_tool's return value.
         install_dir="${RUNNER_TEMP:?RUNNER_TEMP is not set}/kind-ocp-bin"
         mkdir -p "$install_dir"
-        GOBIN="$install_dir" go install "github.com/guzalv/kind-ocp/cmd/kind-ocp@${INPUT_KIND_OCP_VERSION:?kind_ocp_version input is empty}"
+        ko_run_tool env GOBIN="$install_dir" go install "github.com/guzalv/kind-ocp/cmd/kind-ocp@${INPUT_KIND_OCP_VERSION:?kind_ocp_version input is empty}"
         printf '%s\n' "$install_dir" >> "$GITHUB_PATH"
 
     - name: Create the clusters
@@ -219,19 +303,11 @@ runs:
         INPUT_CONFIG: ${{ inputs.config }}
         KIND_OCP_ACTION_PREFIX: ${{ steps.scope.outputs.prefix }}
         KIND_OCP_ACTION_STATE_ROOT: ${{ steps.scope.outputs.state_root }}
+        ACTION_LIB: ${{ github.action_path }}/../lib.sh
       shell: bash
       run: |
         set -euo pipefail
-        # kind-ocp renders the config path unquoted in its own
-        # diagnostic (`config file <path>: …`), so a multiline
-        # value would put its later lines at line starts in this
-        # step's log — where the runner parses `::` workflow
-        # commands. Refuse the shape; never echo it.
-        case "${INPUT_CONFIG:-}" in
-          *$'\r'*|*$'\n'*)
-            echo "config must be a single line (no CR or LF)" >&2
-            exit 1 ;;
-        esac
+        source "${ACTION_LIB:?ACTION_LIB is not set}"
         # The action's contract is its inputs, not the runner's
         # ambient environment: neutralize any KIND_OCP_* the calling
         # workflow carries.
@@ -239,7 +315,10 @@ runs:
         args=(--config "${INPUT_CONFIG:-}" --prefix "$KIND_OCP_ACTION_PREFIX" --state-root "$KIND_OCP_ACTION_STATE_ROOT")
         if [ -n "${INPUT_COUNT:-}" ]; then args+=(--count "$INPUT_COUNT"); fi
         if [ -n "${INPUT_PROFILE:-}" ]; then args+=(--profile "$INPUT_PROFILE"); fi
-        kind-ocp create "${args[@]}"
+        # kind-ocp's diagnostics (raw config paths, config-file
+        # content quoted by parse errors) reach the runner log only
+        # through the sanitizer; its exit status is preserved.
+        ko_run_tool kind-ocp create "${args[@]}"
 
     - name: Emit the clusters output
       id: clusters
@@ -247,29 +326,27 @@ runs:
         INPUT_CONFIG: ${{ inputs.config }}
         KIND_OCP_ACTION_PREFIX: ${{ steps.scope.outputs.prefix }}
         KIND_OCP_ACTION_STATE_ROOT: ${{ steps.scope.outputs.state_root }}
+        ACTION_LIB: ${{ github.action_path }}/../lib.sh
       shell: bash
       run: |
         set -euo pipefail
-        # See "Create the clusters": a multiline config path must
-        # be refused before it can reach kind-ocp's diagnostics.
-        case "${INPUT_CONFIG:-}" in
-          *$'\r'*|*$'\n'*)
-            echo "config must be a single line (no CR or LF)" >&2
-            exit 1 ;;
-        esac
+        source "${ACTION_LIB:?ACTION_LIB is not set}"
         unset KIND_OCP_CONFIG KIND_OCP_PREFIX KIND_OCP_COUNT KIND_OCP_PROFILE
         command -v jq >/dev/null 2>&1 || {
           echo "jq is required to compose the clusters output (preinstalled on GitHub-hosted runners)" >&2
           exit 1
         }
         args=(--config "${INPUT_CONFIG:-}" --prefix "$KIND_OCP_ACTION_PREFIX" --state-root "$KIND_OCP_ACTION_STATE_ROOT")
-        # Captured before the loop (not piped into it): a list
-        # failure must stay fatal under set -e and pipefail.
-        listing="$(kind-ocp list "${args[@]}")"
+        # kind-ocp list/kubeconfig stdout is DATA here (cluster
+        # names, kubeconfig paths), so ko_capture_tool keeps it raw;
+        # their stderr is log-bound and sanitized. Captured before
+        # the loop (not piped into it): a list failure must stay
+        # fatal under set -e and pipefail, with the tool's status.
+        listing="$(ko_capture_tool kind-ocp list "${args[@]}")"
         json='{}'
         while read -r name; do
           [ -n "$name" ] || continue
-          kubeconfig="$(kind-ocp kubeconfig "${args[@]}" "$name")"
+          kubeconfig="$(ko_capture_tool kind-ocp kubeconfig "${args[@]}" "$name")"
           # context is kind's own naming invariant for a cluster
           # name; the self-test asserts it against a live cluster.
           json="$(jq -c --arg name "$name" --arg kubeconfig "$kubeconfig" --arg context "kind-$name" \
@@ -290,17 +367,13 @@ runs:
         INPUT_CONFIG: ${{ inputs.config }}
         KIND_OCP_ACTION_PREFIX: ${{ steps.scope.outputs.prefix }}
         KIND_OCP_ACTION_STATE_ROOT: ${{ steps.scope.outputs.state_root }}
+        ACTION_LIB: ${{ github.action_path }}/../lib.sh
       shell: bash
       run: |
         set -euo pipefail
-        # See "Create the clusters": a multiline config path must
-        # be refused before it can reach kind-ocp's diagnostics.
-        case "${INPUT_CONFIG:-}" in
-          *$'\r'*|*$'\n'*)
-            echo "config must be a single line (no CR or LF)" >&2
-            exit 1 ;;
-        esac
+        source "${ACTION_LIB:?ACTION_LIB is not set}"
         unset KIND_OCP_CONFIG KIND_OCP_PREFIX KIND_OCP_COUNT KIND_OCP_PROFILE
         args=(--config "${INPUT_CONFIG:-}" --prefix "$KIND_OCP_ACTION_PREFIX" --state-root "$KIND_OCP_ACTION_STATE_ROOT")
-        # Any FAIL exits non-zero and fails the step.
-        kind-ocp verify "${args[@]}"
+        # Any FAIL exits non-zero and fails the step, with the
+        # tool's own status preserved through the sanitizer.
+        ko_run_tool kind-ocp verify "${args[@]}"

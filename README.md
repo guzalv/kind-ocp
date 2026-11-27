@@ -257,7 +257,10 @@ kind-ocp release with `go install`, creates the clusters, verifies
 them, and emits per-cluster kubeconfig paths and contexts — never
 credential content. `delete` is self-sufficient (it installs kind-ocp
 itself, so it works under `if: always()` even when create failed
-during its own setup) and idempotent. The pair ships in the v0.1.2
+during its own setup) and idempotent. Both actions validate their
+inputs up front and neutralize workflow-command markers in tool
+diagnostics before they reach the runner log, so caller-controlled
+values cannot inject runner commands. The pair ships in the v0.1.2
 release (`guzalv/kind-ocp/.github/actions/{create,delete}@v0.1.2`);
 until that tag is cut the actions are staged under
 [`action/`](action) in this repository, gated by
@@ -310,11 +313,11 @@ jobs:
 |---|---|---|
 | `count` | `''` | Empty passes no `--count`; the config file or the built-in default (2) governs. |
 | `profile` | `''` | Empty passes no `--profile` (default `full`). |
-| `prefix` | `''` | Empty derives `ko-<run id>-<random>`, unique per invocation. Lowercase alphanumeric and `-`, 1-40 chars. |
+| `prefix` | `''` | Empty derives `ko-<run id>-<16 hex>`, atomically reserved per invocation (two default creates in one job never share a scope). Lowercase alphanumeric and `-`, 1-40 chars. |
 | `state_root` | `''` | Empty derives `<RUNNER_TEMP>/kind-ocp`. Always wins over the config file. Must be a single line (CR/LF refused). |
 | `config` | `''` | Path to a kind-ocp config file, resolved against the GitHub workspace — the directory composite-action steps run in; a job-level `defaults.run.working-directory` does not reach them. Empty disables file lookup. Must be a single line (CR/LF refused). |
-| `kind_ocp_version` | `v0.1.1` | The released version `go install` builds. Must be a single line (CR/LF refused). |
-| `go_version` | `1.27.4` | Must satisfy the release's go.mod minimum. |
+| `kind_ocp_version` | `v0.1.1` | The released version `go install` builds. Must be a single token of letters, digits, and `. _ ~ ^ + < > / = -` (CR/LF and every workflow-command byte refused). |
+| `go_version` | `1.27.4` | Must satisfy the release's go.mod minimum. Same single-token rule as `kind_ocp_version`: setup-go logs the spec verbatim in its own step. |
 
 | Output | Value |
 |---|---|
@@ -323,9 +326,10 @@ jobs:
 | `clusters` | Single-line JSON keyed by cluster name: `{"<name>": {"kubeconfig": <path>, "context": <name>}}`. Emitted after create succeeds, before verify runs. |
 
 `delete` takes `prefix` (required), `state_root`, `kind_ocp_version`,
-and `go_version` (same defaults), and produces no outputs. `prefix`,
-`state_root`, and `kind_ocp_version` must be single lines (CR/LF
-refused), like their create-side counterparts.
+and `go_version` (same defaults), and produces no outputs. `prefix`
+and `state_root` must be single lines (CR/LF refused); the two
+version inputs follow the same single-token rule as their
+create-side counterparts.
 
 ### Caveats
 

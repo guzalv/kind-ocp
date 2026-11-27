@@ -22,8 +22,13 @@ code review, security review) have passed:
    mkdir -p .github/actions .github/workflows
    git mv action/create .github/actions/create
    git mv action/delete .github/actions/delete
+   git mv action/lib.sh .github/actions/lib.sh
    git mv action/self-test.yaml .github/workflows/action-self-test.yaml
    ```
+
+   The two actions reference the shared lib as `../lib.sh` from
+   their own directories, so it must land as their sibling — which
+   this ordering does.
 
 2. Delete the `STAGED FILE` paragraph (the whole comment block that
    carries it) from `.github/workflows/action-self-test.yaml`,
